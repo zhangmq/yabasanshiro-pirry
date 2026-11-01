@@ -97,3 +97,7 @@ int CartSaveState(FILE *fp);
 int CartLoadState(FILE *fp, int version, int size);
 
 #endif
+
+/* ST-V (Sega Titan Video): the game is a ROM board, not a CD. */
+#define CART_ROMSTV            12
+#define CART_ROMSTV_SIZE       0x3000000 /* 48 MiB, matches Kronos CART_ROMSTV */

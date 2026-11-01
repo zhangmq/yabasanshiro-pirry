@@ -327,3 +327,24 @@ void PlayRecorder_setPlayMode( const char * dir, yabauseinit_struct *init  );
 #endif
 
 #endif
+
+/* ST-V JAMMA cabinet inputs (ported from libretro/yabause@kronos, as in our
+ * fork): the libretro glue maps the frontend's pads/keys onto these. */
+#define PERJAMMA_COIN1 29
+#define PERJAMMA_COIN2 30
+#define PERJAMMA_TEST 31
+#define PERJAMMA_SERVICE 32
+#define PERJAMMA_START1 33
+#define PERJAMMA_START2 34
+#define PERJAMMA_MULTICART 35
+#define PERJAMMA_PAUSE 36
+#define PERJAMMA_P2_UP 37
+#define PERJAMMA_P2_RIGHT 38
+#define PERJAMMA_P2_DOWN 39
+#define PERJAMMA_P2_LEFT 40
+#define PERJAMMA_P2_BUTTON1 41
+#define PERJAMMA_P2_BUTTON2 42
+#define PERJAMMA_P2_BUTTON3 43
+#define PERJAMMA_P2_BUTTON4 44
+#define PERJAMMA_P2_BUTTON5 45
+#define PERJAMMA_P2_BUTTON6 46

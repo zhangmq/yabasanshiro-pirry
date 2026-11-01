@@ -95,6 +95,14 @@ writelongfunc WriteLongList[0x1000];
 
 readbytefunc ReadByteList[0x1000];
 readwordfunc ReadWordList[0x1000];
+
+/* Same as ReadWordList[..](addr) but readable from decrypt.c / stv.c, which
+ * reach it without the SH-2 cache bookkeeping (equivalent of Kronos'
+ * DMAMappedMemoryReadWord; our fork has it in memory.c:92). */
+u16 FASTCALL DMAMappedMemoryReadWord(u32 addr)
+{
+   return ReadWordList[(addr >> 16) & 0xFFF](addr);
+}
 readlongfunc ReadLongList[0x1000];
 
 u8 *HighWram;
