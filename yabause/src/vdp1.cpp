@@ -635,6 +635,19 @@ extern "C" void FASTCALL Vdp1WriteLong(u32 addr, UNUSED u32 val) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* A/B knob, default OFF: YAB_V1BUDGET=1 makes the VDP1 walk spend a per-line
+ * cycle budget like hardware instead of walking the whole list instantly.  The
+ * renderer here is fast enough that the instant walk lets the VDP1 status go
+ * IDLE early, so games run their double buffering at 60 changes/s instead of
+ * ~20 -- which changes pictures.  Kept (default off) so the pacing can be A/B'd
+ * without a rebuild; the port itself does not depend on it. */
+static int yab_v1_budget_on(void)
+{
+   static int v = -1;
+   if (v < 0) { const char *e = getenv("YAB_V1BUDGET"); v = (e && *e) ? atoi(e) : 0; }
+   return v;
+}
+
 extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 {
   std::unique_lock<std::mutex> lk(vdp1_clock_mtx);
@@ -669,6 +682,16 @@ extern "C" void Vdp1DrawCommands(u8 * ram, Vdp1 * regs, u8* back_framebuffer)
 #endif
       vdp1_clock -= 10;
 #endif
+      /* With YAB_V1BUDGET=1: charge the hardware budget (10 units per command,
+       * 100 added per line in Vdp1_onHblank) and stop the walk when it is
+       * exhausted.  pirry's tree has this block disabled, i.e. the whole
+       * command list is walked and drawn instantly. */
+      if (yab_v1_budget_on()) {
+         vdp1_clock -= 10;
+         if (vdp1_clock <= 0) {
+            return;          /* budget exhausted: the walk resumes next line/field */
+         }
+      }
       /* Sprite types 2-7 without sprite window: if SDCTL[5:0] is 0 no layer
          accepts shadow, so a command whose every pixel carries the shadow bit
          (CMDPMOD "MSB on") has no visible effect on hardware. Drawing it

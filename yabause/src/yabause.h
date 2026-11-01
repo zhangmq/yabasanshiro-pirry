@@ -100,6 +100,20 @@ void print_usage(const char *program_name);
 #endif
 
 void YabauseChangeTiming(int freqtype);
+
+/* Our fork's debug stage markers (libretro.c uses them); empty unless a
+ * HANGDBG build defines them. */
+#define YABEMU(s)  ((void)0)
+#define YABFRONT(s) ((void)0)
+
+
+/* --- libretro port (PORT-TO-PIRRY-2026-11-01.md §1): platform globals that the
+ * glue references.  The renderer always runs on the VdpProc thread here, so
+ * g_vdp_async is 1; the readback subsystem and CPU clock option are not ported. */
+extern int g_vdp_async;
+extern int yab_vdp1_fb_readback;
+extern int yab_cpu_clock_pct;
+extern int yab_cpu_clock_env;
 int YabauseInit(yabauseinit_struct *init);
 void YabFlushBackups(void);
 void YabauseDeInit(void);

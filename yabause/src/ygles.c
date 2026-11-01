@@ -4599,6 +4599,16 @@ void YglRender(void)
   GLuint cprg = 0;
   int from = 0;
   int to = 0;
+#ifdef __LIBRETRO__
+  /* PORT: the frontend rotates its hw-render ring once per presented frame and
+   * may recreate its textures on a resolution change, so the mirror FBO (core
+   * context) has to be re-pointed at the frontend's current colour texture
+   * before anything is drawn. */
+  {
+    extern void YuiRetargetFB(void);
+    YuiRetargetFB();
+  }
+#endif
   YglMatrix mtx;
   YglMatrix dmtx;
   unsigned int i, j;

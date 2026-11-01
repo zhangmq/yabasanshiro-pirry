@@ -70,6 +70,10 @@ int checkCHD(const char *filename );
 #endif
 
 #if defined(ANDROID)
+extern const char * GetFileDescriptorPath( const char * fileName );
+#endif
+
+#if defined(ANDROID)
 // Android 11 does not allow access file directory
 #include <unistd.h> // for dup()
 FILE* idiocy_fopen_fd(const char* fname, const char * mode) {
@@ -514,6 +518,17 @@ static FILE* OpenFile(char* buffer, const char* cue) {
    char *path;
    int tmp;
    FILE *ret_file = NULL;
+
+#if defined(ANDROID)
+  if (strstr(cue, "/proc/self/fd/") == cue) {
+     char * fdname = GetFileDescriptorPath(buffer);
+     if( fdname == NULL ){
+      YabSetError(YAB_ERR_FILENOTFOUND, buffer);
+      return -1;
+     }
+     ret_file = fopen(fdname, "rb");
+  }else{
+#endif
    // Now go and open up the image file, figure out its size, etc.
    if ((ret_file = fopen(buffer, "rb")) == NULL)
    {
@@ -551,8 +566,12 @@ static FILE* OpenFile(char* buffer, const char* cue) {
          YabSetError(YAB_ERR_FILENOTFOUND, buffer);
       }
    }
+#if defined(ANDROID)
+  }
+#endif
    return ret_file;
 }
+
 
 static int LoadBinCue(const char *cuefilename, FILE *iso_file)
 {
@@ -669,6 +688,20 @@ static int LoadBinCue(const char *cuefilename, FILE *iso_file)
   fseek(iso_file, 0, SEEK_SET);
   matched = fscanf(iso_file, "FILE \"%[^\"]\" %*s\r\n", temp_buffer);
 
+
+  // check if File deskmode or not
+#if defined(ANDROID)
+  if (strstr(cuefilename, "/proc/self/fd/") == cuefilename) {
+     char * fdname = GetFileDescriptorPath(temp_buffer);
+     if( fdname == NULL ){
+      YabSetError(YAB_ERR_FILENOTFOUND, temp_buffer);
+      free(temp_buffer);
+      return -1;
+     }
+
+     bin_file = fopen(fdname, "rb");
+  }else{
+#endif
   // Now go and open up the image file, figure out its size, etc.
   if ((bin_file = fopen(temp_buffer, "rb")) == NULL)
   {
@@ -726,6 +759,9 @@ static int LoadBinCue(const char *cuefilename, FILE *iso_file)
       return -1;
     }
   }
+#if defined(ANDROID)
+  }
+#endif
 
   fseek(bin_file, 0, SEEK_END);
   file_size = ftell(bin_file);
@@ -1351,11 +1387,36 @@ static int LoadCCD(const char *ccd_filename, FILE *iso_file)
       return -1;
    }
 
+#if defined(ANDROID)
+  if (strstr(ccd_filename, "/proc/self/fd/") == ccd_filename) {
+    char * p  = strstr(ccd_filename, ";");
+    if( p != NULL){
+  	  strcpy(img_filename, p + 1);
+	    ext = strrchr(img_filename, '.');
+	    strcpy(ext, ".img");
+      const char * fdname = GetFileDescriptorPath(img_filename);
+      if( fdname == NULL ){
+
+        ext = strrchr(img_filename, '.');
+        strcpy(ext, ".iso");
+        const char * fdname = GetFileDescriptorPath(img_filename);
+        if( fdname == NULL ){
+          YabSetError(YAB_ERR_FILENOTFOUND, img_filename);
+          return -1;
+        }
+
+      }
+      fp = fopen(fdname, "rb");
+    }else{
+        YabSetError(YAB_ERR_FILENOTFOUND, ccd_filename);
+        return -1;
+    }
+  }else{
+#endif
 	strcpy(img_filename, ccd_filename);
 	ext = strrchr(img_filename, '.');
 	strcpy(ext, ".img");
 	fp = fopen(img_filename, "rb");
-
 	if (fp == NULL)
 	{
 		ext = strrchr(img_filename, '.');
@@ -1366,7 +1427,9 @@ static int LoadCCD(const char *ccd_filename, FILE *iso_file)
 			return -1;
 		}
 	}
-
+#if defined(ANDROID)
+  }
+#endif
 	fseek(iso_file, 0, SEEK_SET);
 
 	// Load CCD file as dictionary
@@ -1752,6 +1815,14 @@ static void ISOCDReadAheadFAD(UNUSED u32 FAD)
 //////////////////////////////////////////////////////////////////////////////
 
 #include "chd.h"
+/* The standalone libchdr's coretypes.h pulls in libretro-common's
+ * streams/file_stream_transforms.h, which #defines FILE as RFILE (the
+ * filestream type).  cdbase.c talks plain stdio FILE everywhere else, so undo
+ * that mapping here: the libchdr translation units keep their own, and our
+ * forward declarations (LoadCHD etc.) then agree with the definitions. */
+#ifdef FILE
+#undef FILE
+#endif
 
 #define CD_MAX_SECTOR_DATA      (2352)
 #define CD_MAX_SUBCODE_DATA     (96)
@@ -1781,6 +1852,195 @@ int checkCHD(const char *filename ) {
 
 }
 
+/* --- early IP.BIN probe (libretro video format auto-detection) -------------
+ * These helpers intentionally do not touch the global CD state: they open the
+ * image, read only the first sector's 16-byte region field, and close it.  The
+ * real CD block is initialised later by Cs2Init(), as before. */
+
+static int iso_read_region_from_file(const char *path, char *region, size_t region_size)
+{
+   FILE *fp;
+   unsigned char buf[2352];
+   size_t n;
+   int dataoff = 0;
+   int i;
+
+   if (region_size < 17)
+      return -1;
+   fp = fopen(path, "rb");
+   if (!fp)
+      return -1;
+   n = fread(buf, 1, sizeof(buf), fp);
+   fclose(fp);
+   if (n < 0x50)
+      return -1;
+
+   /* A raw 2352-byte sector starts with the 12-byte sync pattern; the mode byte
+      is at offset 15.  A 2048-byte ISO has no sync and starts at user data. */
+   if (n >= 16 && buf[0] == 0x00 && buf[11] == 0x00)
+   {
+      int sync = 1;
+      for (i = 1; i <= 10; i++)
+         if (buf[i] != 0xFF) { sync = 0; break; }
+      if (sync)
+         dataoff = (buf[15] == 2) ? 24 : 16;
+   }
+   if (n < (size_t)dataoff + 0x40 + 16)
+      return -1;
+   memcpy(region, buf + dataoff + 0x40, 16);
+   region[16] = '\0';
+   return 0;
+}
+
+static int iso_cue_first_file(const char *cue_path, char *bin_path, size_t bin_path_size)
+{
+   FILE *fp;
+   char line[1024];
+   char file[1024] = "";
+   const char *slash;
+
+   fp = fopen(cue_path, "r");
+   if (!fp)
+      return -1;
+   while (fgets(line, sizeof(line), fp))
+   {
+      char *p = line;
+      while (*p == ' ' || *p == '\t') p++;
+      if (strncmp(p, "FILE", 4) == 0 && (p[4] == ' ' || p[4] == '\t'))
+      {
+         p += 5;
+         while (*p == ' ' || *p == '\t') p++;
+         if (*p == '"')
+         {
+            char *q;
+            p++;
+            q = strchr(p, '"');
+            if (!q)
+               continue;
+            *q = '\0';
+            snprintf(file, sizeof(file), "%s", p);
+         }
+         else if (sscanf(p, "%1023s", file) != 1)
+            continue;
+         break;
+      }
+   }
+   fclose(fp);
+   if (!file[0])
+      return -1;
+
+   if (file[0] == '/')
+      snprintf(bin_path, bin_path_size, "%s", file);
+   else
+   {
+      slash = strrchr(cue_path, '/');
+      if (slash)
+         snprintf(bin_path, bin_path_size, "%.*s/%s",
+                  (int)(slash - cue_path), cue_path, file);
+      else
+         snprintf(bin_path, bin_path_size, "%s", file);
+   }
+   return 0;
+}
+
+static int iso_read_region_from_chd(const char *path, char *region, size_t region_size)
+{
+   chd_file *chd = NULL;
+   const chd_header *hdr;
+   char meta[512];
+   UINT32 resultlen = 0, resulttag = 0;
+   UINT8 resultflags = 0;
+   int trk = 0, frames = 0, pregap = 0, postgap = 0;
+   char type[64] = "", subtype[64] = "", pgtype[64] = "", pgsub[64] = "";
+   unsigned char *hunk = NULL;
+   int dataoff = -1;
+   chd_error err;
+
+   if (region_size < 17)
+      return -1;
+   err = chd_open(path, CHD_OPEN_READ, NULL, &chd);
+   if (err != CHDERR_NONE)
+      return -1;
+   hdr = chd_get_header(chd);
+   if (!hdr)
+      goto fail;
+   memset(meta, 0, sizeof(meta));
+   err = chd_get_metadata(chd, 0, 0, meta, sizeof(meta),
+                          &resultlen, &resulttag, &resultflags);
+   if (err != CHDERR_NONE)
+      goto fail;
+
+   if (resulttag == CDROM_TRACK_METADATA2_TAG)
+      sscanf(meta, CDROM_TRACK_METADATA2_FORMAT, &trk, type, subtype,
+             &frames, &pregap, pgtype, pgsub, &postgap);
+   else if (resulttag == CDROM_TRACK_METADATA_TAG)
+      sscanf(meta, CDROM_TRACK_METADATA_FORMAT, &trk, type, subtype, &frames);
+   else
+      goto fail;
+
+   (void)trk; (void)frames; (void)pregap; (void)postgap;
+   (void)subtype; (void)pgtype; (void)pgsub;
+
+   if (!strcmp(type, "MODE1") || !strcmp(type, "MODE1/2048") ||
+       !strcmp(type, "MODE2_FORM1") || !strcmp(type, "MODE2/2048"))
+      dataoff = 0;
+   else if (!strcmp(type, "MODE1_RAW") || !strcmp(type, "MODE1/2352"))
+      dataoff = 16;
+   else if (!strcmp(type, "MODE2_RAW") || !strcmp(type, "MODE2/2352"))
+      dataoff = 24;
+   else if (!strcmp(type, "MODE2") || !strcmp(type, "MODE2/2336") ||
+            !strcmp(type, "MODE2_FORM_MIX"))
+      dataoff = 8;
+   else
+      goto fail;
+
+   if (hdr->hunkbytes < (UINT32)dataoff + 0x40 + 16)
+      goto fail;
+   hunk = (unsigned char *)malloc(hdr->hunkbytes);
+   if (!hunk)
+      goto fail;
+   err = chd_read(chd, 0, hunk);
+   if (err != CHDERR_NONE)
+      goto fail;
+
+   memcpy(region, hunk + dataoff + 0x40, 16);
+   region[16] = '\0';
+   free(hunk);
+   chd_close(chd);
+   return 0;
+
+fail:
+   if (hunk)
+      free(hunk);
+   chd_close(chd);
+   return -1;
+}
+
+int ISOCDReadRegionCode(const char *image_path, char *region, size_t region_size)
+{
+   const char *ext;
+   char binpath[1024];
+
+   if (!image_path || !region || region_size < 17)
+      return -1;
+   ext = strrchr(image_path, '.');
+   if (ext && !stricmp(ext, ".cue"))
+   {
+      if (iso_cue_first_file(image_path, binpath, sizeof(binpath)) != 0)
+         return -1;
+      return iso_read_region_from_file(binpath, region, region_size);
+   }
+   if (ext && !stricmp(ext, ".chd"))
+      return iso_read_region_from_chd(image_path, region, region_size);
+   if (ext && (!stricmp(ext, ".iso") || !stricmp(ext, ".bin")))
+      return iso_read_region_from_file(image_path, region, region_size);
+
+   /* No/unknown extension: follow the same detection order as ISOCDInit(). */
+   if (checkCHD(image_path) == 0)
+      return iso_read_region_from_chd(image_path, region, region_size);
+   return iso_read_region_from_file(image_path, region, region_size);
+}
+
 static int LoadCHD(const char *chd_filename, FILE *iso_file)
 {
   int trak_number;
@@ -1807,8 +2067,6 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
 
   track_info_struct trk[100];
   memset(trk, 0, sizeof(trk));
-  int chd_pg_in_data[100];                  /* pregap in data stream (PGTYPE 'V...')? */
-  memset(chd_pg_in_data, 0, sizeof(chd_pg_in_data));
 
   int num_tracks = 0;
 
@@ -1840,7 +2098,6 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
 
     trk[num_tracks].pregap = pregap;
     trk[num_tracks].postgap = postgap;
-    chd_pg_in_data[num_tracks] = (pg_type[0] == 'V');
 
     trk[num_tracks].frames = frame;
     int padded = (frame + CD_TRACK_PADDING - 1) / CD_TRACK_PADDING;
@@ -1941,19 +2198,7 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
   int i;
   for (i = 0; i < num_tracks; i++)
   {
-    /* If the pregap is not part of the data stream (PGTYPE without 'V', e.g.
-       a cue PREGAP), the logical address still advances across it (as in MAME
-       cdrom.cpp: if (!pgdatasize) logofs += pregap). Otherwise every sector of
-       the track would be 'pregap' sectors too early (seen with Last Bronx,
-       track 2 PREGAP 225 MODE1). Default 0 = old behaviour. logframeofs below
-       picks up the increased logofs. */
-    {
-      const int chdpg_new = trk[i].pregap > 0 && !chd_pg_in_data[i];
-      const u32 logofs_old = logofs;
-      if (chdpg_new)
-        logofs += trk[i].pregap;
-      trk[i].fad_start = chdpg_new ? logofs : logofs_old + trk[i].pregap;
-    }
+    trk[i].fad_start = logofs + trk[i].pregap;
     
     trk[i].physframeofs = physofs;
     trk[i].chdframeofs = chdofs;
@@ -2015,20 +2260,19 @@ static int ISOCDReadSectorFADFromCHD(u32 FAD, void *buffer) {
   chdlba = loglba;
   for (i = 0; i < disc.session_num; i++)
   {
-    // All tracks including the last one of the session: track[j].fad_end
-    // bounds every track, while comparing against track[j+1].logframeofs
-    // could never match the last track (single-track sessions, e.g.
-    // Crime Patrol (USA) (Proto), were never found).
-    for (j = 0; j < disc.session[i].track_num; j++)
+    for (j = 0; j < disc.session[i].track_num-1; j++)
     {
-      if (loglba < disc.session[i].track[j].fad_end) {
-        /* FAD lies in a gap of a pregap that is not stored in the image
-           and is returned as an empty sector. */
-        if (loglba < disc.session[i].track[j].logframeofs) {
-          memset(buffer, 0, 2352);
-          return 1;
-        }
+      //if (j == 1) {
+      //  int a = 0;
+      //}
+      if (loglba < disc.session[i].track[j+1].logframeofs) {
+        //if ((loglba > disc.session[i].track[j].pregap)) {
+       //   loglba -= disc.session[i].track[j].pregap;
+       // }
         physlba = disc.session[i].track[j].physframeofs + (loglba - disc.session[i].track[j].logframeofs);
+        //if (disc.session[i].track[j].ctl_addr == 0x01) {
+        //  physlba += disc.session[i].track[j].pregap;
+        //}
         chdlba = physlba - disc.session[i].track[j].physframeofs + disc.session[i].track[j].chdframeofs;
         track = &disc.session[i].track[j];
         break;

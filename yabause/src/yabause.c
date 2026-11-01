@@ -194,9 +194,11 @@ int YabauseInit(yabauseinit_struct *init)
   q_scsp_finish = YabThreadCreateQueue(1);
   setM68kCounter(0);
 
+  #if !(defined(__LIBRETRO__))
   if( init->playRecordPath && strlen(init->playRecordPath) != 0) {
     PlayRecorder_setPlayMode(init->playRecordPath,init);
   }
+  #endif
 
    yabsys.frame_count = 0;
    yabsys.sync_shift = init->sync_shift;
@@ -678,7 +680,11 @@ int g_perline_parts = 2;   /* SH2Exec slices per line in the per-line path */
 int YabauseEmulate(void) {
    int oneframeexec = 0;
    yabsys.frame_count++;
+   /* The replay recorder is a standalone feature (it needs jsoncpp); the
+      libretro build does not have it. */
+   #if !(defined(__LIBRETRO__))
    PlayRecorder_proc(yabsys.frame_count);
+   #endif
 
    const u32 cyclesinc =
       yabsys.DecilineMode ? yabsys.DecilineStop : yabsys.DecilineStop * 10;

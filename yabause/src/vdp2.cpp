@@ -280,6 +280,25 @@ static void Vdp1JoinPendingRenders(void) {
 
 extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
 
+/* PORT: the libretro frontend thread waits for "the worker retired a field"
+ * (retro_run -> video_cb); the counter itself stays private. */
+extern "C" int YabVdp1RetiredCount(void) {
+   return vdp1_ev_retired.load(std::memory_order_acquire);
+}
+
+/* PORT: stop the VDP worker before the frontend destroys its GL context
+ * (libretro calls this from context_destroy, before VIDCore->DeInit()). */
+extern "C" void Vdp2StopRenderThread(void) {
+#if defined(YAB_ASYNC_RENDERING)
+   if (vdp_proc_running == 1) {
+      Vdp2JoinPendingVIN();
+      YabAddEventQueue(evqueue, VDPEV_FINSH);
+      YabThreadWait(YAB_THREAD_VDP);
+      vdp_proc_running = 0;
+   }
+#endif
+}
+
 //---------------------------------------------------------------------------------------
 
 extern "C" void * VdpProc(void *arg);      // rendering thread.

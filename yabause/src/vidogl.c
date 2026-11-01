@@ -8962,6 +8962,18 @@ void VIDOGLVdp2SetResolution(u16 TVMD)
     break;
   }
 
+  /* PORT (libretro): the frontend-facing frame size is the emulated mode x scale
+     factor, not a fixed window, so SetSaturnResolution() must see the NEW size
+     before it derives GlWidth/GlHeight -- otherwise the field that changes the
+     mode is rendered with the previous mode's viewport.  The standalone never
+     hits this because its window (720x480) is constant.  Weak on purpose: only
+     the libretro glue defines it; the standalone build leaves it NULL. */
+  {
+    extern void YabVdp2ModeChanged(int w, int h) __attribute__((weak));
+    if (YabVdp2ModeChanged)
+      YabVdp2ModeChanged(width, height);
+  }
+
   SetSaturnResolution(width, height);
   Vdp1SetTextureRatio(wratio, hratio);
 }
