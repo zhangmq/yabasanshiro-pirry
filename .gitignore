@@ -18,3 +18,13 @@ yabause/src/android/app/.settings/*
 # Local build directories and binaries
 build*/
 yaba-*
+
+# h700 port: local build artifacts / logs
+*.o
+*.log
+host/
+yabause/src/libretro/.yab_trace_level
+
+# Local agent instructions and notes (never part of the fork)
+/AGENTS.md
+/.notes/

@@ -96,13 +96,56 @@ else ifeq ($(platform), arm64)
 	TARGET := $(TARGET_NAME)_libretro.so
 	fpic := -fPIC
 	SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T
-	LDFLAGS += -lpthread -lGL
-	FLAGS +=  -DAARCH64
+	LDFLAGS += -lpthread
+	FLAGS += -DAARCH64 -march=armv8-a+crc+fp+simd -mcpu=cortex-a53 -mtune=cortex-a53
 	ARCH_IS_LINUX = 1
 	HAVE_SSE = 0
+	FORCE_GLES = 1
 	USE_AARCH64_DRC = 1
 	DYNAREC_DEVMIYAX = 1
 	ALLOW_POLYGON_MODE = 0
+
+# H700 (Allwinner, 4x Cortex-A53, Mali-G31 through libmali, glibc 2.35) -- the
+# baseOS-class handhelds.  Same compiler flags as arm64; the cross toolchain and
+# the device's GL/EGL headers are build parameters, not paths baked into this
+# file:
+#     make platform=h700 H700_TOOLCHAIN=/path/to/toolchain H700_DEPS=/path/to/deps
+else ifeq ($(platform), h700)
+	override platform += unix
+  # The cross toolchain and the device GL/EGL headers live outside this tree, so
+  # they are required parameters (no hard-coded paths):
+  #   make platform=h700 H700_TOOLCHAIN=/path/to/h700-toolchain H700_DEPS=/path/to/h700-deps
+  ifeq ($(H700_TOOLCHAIN),)
+  $(error platform=h700 requires H700_TOOLCHAIN=/path/to/h700-toolchain (with root/ = sysroot))
+  endif
+  ifeq ($(H700_DEPS),)
+  $(error platform=h700 requires H700_DEPS=/path/to/h700-deps (with include/ and lib/))
+  endif
+	H700_SYSROOT := $(H700_TOOLCHAIN)/root
+	CC := $(H700_SYSROOT)/usr/bin/aarch64-linux-gnu-gcc-12
+	CXX := $(H700_SYSROOT)/usr/bin/aarch64-linux-gnu-g++-12
+	# CC_AS is defaulted from CC at the top of this file, i.e. before this
+	# block runs; point it at the cross compiler as well.
+	CC_AS := $(CC)
+	AR := $(H700_SYSROOT)/usr/bin/aarch64-linux-gnu-ar
+	RANLIB := $(H700_SYSROOT)/usr/bin/aarch64-linux-gnu-ranlib
+	TARGET := $(TARGET_NAME)_libretro.so
+	fpic := -fPIC
+	SHARED := -shared -Wl,--no-undefined -Wl,--version-script=link.T
+	CFLAGS += --sysroot=$(H700_SYSROOT) -B$(H700_TOOLCHAIN)/bin -I$(H700_DEPS)/include
+	CXXFLAGS += --sysroot=$(H700_SYSROOT) -B$(H700_TOOLCHAIN)/bin -I$(H700_DEPS)/include
+	LDFLAGS += -lpthread --sysroot=$(H700_SYSROOT) -B$(H700_TOOLCHAIN)/bin \
+	           -L$(H700_DEPS)/lib -l:libmali.so.0 -Wl,--allow-shlib-undefined
+	FLAGS += -DAARCH64 -march=armv8-a+crc+fp+simd -mcpu=cortex-a53 -mtune=cortex-a53
+	ARCH_IS_LINUX = 1
+	HAVE_SSE = 0
+	FORCE_GLES = 1
+	USE_AARCH64_DRC = 1
+	DYNAREC_DEVMIYAX = 1
+	ALLOW_POLYGON_MODE = 0
+	# The device build is aligned with the standalone, which is compiled
+	# without -ffast-math; the global default above is 1.
+	FASTMATH = 0
 
 # Amlogic S922X Odroid-N2 / A311D Khadas VIM3 (AMLG12B) - 32-bit userspace
 else ifneq (,$(findstring AMLG12B,$(platform)))
@@ -393,6 +436,7 @@ endif
 
 OBJECTS += $(OBJECTS_C) $(OBJECTS_CXX) $(OBJECTS_S)
 
+
 LDFLAGS += $(fpic) $(SHARED)
 FLAGS += $(fpic)
 
@@ -451,3 +495,11 @@ clean:
 	rm -f $(TARGET) $(OBJECTS) $(SOURCE_DIR)/musashi/$(M68KMAKE_EXE) $(SOURCE_DIR)/c68k/$(GEN68K_EXE)
 
 .PHONY: clean
+
+# The probe level (YAB_TRACE) is a compile-time switch, so every object has to
+# be rebuilt when it changes.  Make cannot see a command-line variable change;
+# Makefile.common records the level in a stamp file and we depend on it here.
+# This sits at the very end of the file on purpose: a rule that mentions
+# $(OBJECTS) before "all" would become make's default goal and turn a plain
+# "make" into "rebuild one object".
+$(OBJECTS): $(YAB_TRACE_STAMP)

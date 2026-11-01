@@ -2,6 +2,10 @@ project(yabause-retro-arena)
 
 add_definitions( -D__RETORO_ARENA__ )
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/nanogui-sdl/cmake")
+# The frontend includes "../config.h" (generated into <build>/src by the parent
+# directory); that path only resolves if this binary dir is on the include path.
+include_directories(${CMAKE_CURRENT_BINARY_DIR})
 yab_port_start()
 
 
@@ -15,7 +19,9 @@ if (NOT OPENGLES2_FOUND)
 	return()
 endif (NOT OPENGLES2_FOUND)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
+# The frontend uses std::filesystem (needs C++17); with C++17 there is no
+# separate stdc++fs library to link.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=gnu++17")
 
 add_subdirectory(pugixml)
 add_subdirectory(nanogui-sdl)
@@ -94,10 +100,12 @@ set(yabause_ra_SOURCES
 link_directories( ${link_directories} ${LIBCHDR_LIB_DIR} )
 include_directories( ${PORT_INCLUDE_DIRS} "nanogui-sdl/include" "nanogui-sdl/ext/eigen" "rcheevos/include" "rcheevos/src" )
 add_executable(yabause-retro-arena ${yabause_ra_SOURCES})
-target_link_libraries(yabause-retro-arena yabause  pugixml ${YABAUSE_LIBRARIES} ${PORT_LIBRARIES} nanogui stdc++fs  ${LIBCHDR_LIBRARIES} )
+target_link_libraries(yabause-retro-arena yabause  pugixml ${YABAUSE_LIBRARIES} ${PORT_LIBRARIES} nanogui ${LIBCHDR_LIBRARIES} )
 target_link_libraries( yabause-retro-arena ${LIBCHDR_LIBRARIES} )
 target_link_libraries( yabause-retro-arena ${zlib_STATIC_LIBRARIES} )
-target_link_libraries( yabause-retro-arena dl pthread )   # RetroAchievements: libcurl via dlopen, login thread
+target_link_libraries( yabause-retro-arena dl pthread m )   # RetroAchievements: libcurl via dlopen, login thread
+# The device runs the binary from its own directory with the bundled libs.
+set_target_properties(yabause-retro-arena PROPERTIES INSTALL_RPATH "$ORIGIN" BUILD_WITH_INSTALL_RPATH TRUE)
 add_dependencies(yabause-retro-arena Json png zlib libchdr )
 yab_port_success(yabause-retro-arena)
 set_target_properties(yabause-retro-arena PROPERTIES OUTPUT_NAME yabasanshiro)

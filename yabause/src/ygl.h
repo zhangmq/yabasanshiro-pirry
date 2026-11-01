@@ -262,6 +262,19 @@ typedef struct {
 
 #define HASHSIZE  (0xFFFF)
 
+/* glMemoryBarrier bits that the active GL header branch may not declare (the
+   GLES3/gl31 header path used on the H700 build). The renderer's compute path
+   uses them by name. */
+#ifndef GL_PIXEL_BUFFER_BARRIER_BIT
+#define GL_PIXEL_BUFFER_BARRIER_BIT       0x00000080
+#endif
+#ifndef GL_BUFFER_UPDATE_BARRIER_BIT
+#define GL_BUFFER_UPDATE_BARRIER_BIT      0x00000200
+#endif
+#ifndef GL_SHADER_STORAGE_BARRIER_BIT
+#define GL_SHADER_STORAGE_BARRIER_BIT     0x00002000
+#endif
+
 // Texture cache persistence: source unit of an entry, used for stamp validation
 // (yglcache.c). NONE = no validation, VDP1/VDP2 = checked against v1_/v2_page_seq,
 // SLOT = reusable fixed-size slot (RBG/line textures; srclen holds (w<<16)|h).

@@ -1,10 +1,69 @@
 SOURCE_DIR := $(CORE_DIR)/..
 LIBRETRO_COMM_DIR := $(CORE_DIR)/libretro-common
+LIBCHDR_DIR := $(SOURCE_DIR)/libchdr
+LZMA_DIR := $(LIBCHDR_DIR)/deps/lzma-19.00
+FLAC_DIR := $(LIBCHDR_DIR)/deps/flac-1.3.3
+ZLIB_DIR := $(LIBCHDR_DIR)/deps/zlib-1.2.11
 
 INCLUDE_DIRS := $(CORE_DIR) \
 	$(SOURCE_DIR) \
+	$(LIBCHDR_DIR)/include \
+	$(LIBCHDR_DIR)/include/libchdr \
 	$(LIBRETRO_COMM_DIR)/include \
+	$(LZMA_DIR)/include \
+	$(FLAC_DIR)/include \
+	$(FLAC_DIR)/src/include \
+	$(ZLIB_DIR) \
 	$(SOURCE_DIR)/musashi
+
+# Defines the libretro port and the vendored FLAC/LZMA/zlib need (this
+# Makefile.common had none; the CMake/standalone build supplies its own).
+FLAGS += -D__LIBRETRO__ -DHAVE_LIBGL -DVERSION=\"3.4.2\" -DHAVE_LROUND -D_7ZIP_ST -DFLAC__HAS_OGG=0 -DFLAC__NO_DLL \
+	-DNO_CLI -DHAVE_BUILTIN_BSWAP16=1 -DHAVE_BUILTIN_BSWAP32=1 -DHAVE_C99_VARIADIC_MACROS=1 -DHAVE_FLOORF=1 \
+	-DHAVE_GETTIMEOFDAY=1 -DHAVE_STDINT_H=1 -DHAVE_SYS_TIME_H=1 -DIMPROVED_SAVESTATES -DPACKAGE_VERSION=\"1.3.3\"
+# Turn off yabause's light profiler.  Without this the PROFILE_START/STOP macros
+# expand to ProfileStart/ProfileStop, which do a tag lookup (linear scan + strcmp)
+# and a clock() on every call, and they wrap the per-line paths in yabause.c
+# (hblankin / hblankout / SCSP / vblankin): ~700-900 clock() calls per frame whose
+# results are never printed (PROFILE_PRINT() has no caller).
+# Measured on the device with a 4000-frame window, governor pinned to performance,
+# frameskip disabled, two interleaved passes on an otherwise idle device:
+#   Daytona USA  44.1 / 44.0 fps  ->  44.4 / 44.4 fps   (+0.8 %)
+#   Golden Axe   vsync-capped at 60.4 fps either way, CPU 1.72 -> 1.72
+# (A first A/B showed +6-8 %, but it was run while a game was also being played
+#  on the device: the *baseline* was the part that moved, 40.9/41.9 -> 44.0/44.1
+#  once the device was idle.  Timing numbers are only worth what the idle state
+#  behind them is worth -- check `top`/`/proc/loadavg` first.)
+FLAGS += -DDONT_PROFILE
+# TODO(2026-10-31): YAB_ASYNC_RENDERING no longer selects anything in this tree.
+# The renderer model is fixed: the machine thread dispatches a field and the
+# frontend's retro_run renders it (PROMPT-THREADMODEL-2026-10-31.md §2).  The
+# macro stays defined so the standalone ports keep building; vdp2.cpp has no
+# #if on it any more, and the two #if blocks left in vdp1.cpp are dead (#if 0).
+# The previous wording here ("a runtime setting, both paths isolated, the core
+# option latches one") described the pre-f34f0ddc model; that option was
+# deleted in 76ca714b.  The synchronous path may be restored later (user
+# decision, 2026-10-31): read .notes/fork-lineage/SYNCPATH-STATUS-2026-10-31.md
+# before deleting or re-adding anything gated by this macro.
+#
+# Measured on the device, 2400-frame windows, governor pinned at
+# performance/1512000, frameskip disabled -- async vs inline:
+#   cotton2     56.1 -> 46.5 fps   Golden Axe  60.5 -> 55.1 fps
+#   Daytona     47.2 -> 44.1 fps   (batmanfr is vsync-capped either way)
+FLAGS += -DYAB_ASYNC_RENDERING -DYAB_CORE_SHARED_CONTEXT
+# Probe levels (see yab_trace.h): 0 = all probes compiled out (default),
+# 1 = state changes, 2 = ~1/s summaries, 3 = per frame, 4 = hot paths.
+#   make platform=arm64 FASTMATH=0 YAB_TRACE=2
+YAB_TRACE ?= 0
+FLAGS += -DYAB_TRACE_LEVEL=$(YAB_TRACE)
+# The probe level is a compile-time switch, so the objects must be rebuilt when
+# it changes.  Make cannot see a command-line variable change, so remember the
+# last value in a stamp file and make every object depend on it.
+YAB_TRACE_STAMP := $(CURDIR)/.yab_trace_level
+$(shell [ "$$(cat $(YAB_TRACE_STAMP) 2>/dev/null)" = "$(YAB_TRACE)" ] || echo "$(YAB_TRACE)" > $(YAB_TRACE_STAMP))
+FLAGS += -include $(CORE_DIR)/gl_compat_extra.h
+# Windows-ism used by cdbase.c; POSIX spelling exists in glibc/strings.h
+FLAGS += -Dstricmp=strcasecmp -Dstrnicmp=strncasecmp
 
 SOURCES_S :=
 
@@ -17,6 +76,8 @@ SOURCES_C := $(SOURCE_DIR)/osdcore.c \
 	$(SOURCE_DIR)/cs1.c \
 	$(SOURCE_DIR)/cs2.c \
 	$(SOURCE_DIR)/debug.c \
+	$(CORE_DIR)/glue_core_globals.c \
+	$(CORE_DIR)/port_stubs.c \
 	$(SOURCE_DIR)/error.c \
 	$(SOURCE_DIR)/gameinfo.c \
 	$(SOURCE_DIR)/japmodem.c \
@@ -41,8 +102,6 @@ SOURCES_C := $(SOURCE_DIR)/osdcore.c \
 	$(SOURCE_DIR)/ygles.c \
 	$(SOURCE_DIR)/yglshaderes.c \
 	$(SOURCE_DIR)/snddummy.c \
-	$(SOURCE_DIR)/vdp1.c \
-	$(SOURCE_DIR)/vdp2.c \
 	$(SOURCE_DIR)/vidshared.c \
 	$(SOURCE_DIR)/vidsoft.c \
 	$(SOURCE_DIR)/titan/titan.c \
@@ -54,6 +113,31 @@ SOURCES_C := $(SOURCE_DIR)/osdcore.c \
 	$(LIBRETRO_COMM_DIR)/file/file_path.c \
 	$(LIBRETRO_COMM_DIR)/compat/compat_strcasestr.c \
 	$(LIBRETRO_COMM_DIR)/vfs/vfs_implementation.c \
+	$(LIBCHDR_DIR)/src/libchdr_chd.c \
+	$(LIBCHDR_DIR)/src/libchdr_bitstream.c \
+	$(LIBCHDR_DIR)/src/libchdr_huffman.c \
+	$(LIBCHDR_DIR)/src/libchdr_flac.c \
+	$(LIBCHDR_DIR)/src/libchdr_cdrom.c \
+	$(FLAC_DIR)/src/stream_decoder.c \
+	$(FLAC_DIR)/src/format.c \
+	$(FLAC_DIR)/src/bitreader.c \
+	$(FLAC_DIR)/src/crc.c \
+	$(FLAC_DIR)/src/memory.c \
+	$(FLAC_DIR)/src/lpc.c \
+	$(FLAC_DIR)/src/cpu.c \
+	$(FLAC_DIR)/src/md5.c \
+	$(FLAC_DIR)/src/fixed.c \
+	$(LZMA_DIR)/src/LzmaEnc.c \
+	$(LZMA_DIR)/src/LzFind.c \
+	$(LZMA_DIR)/src/LzmaDec.c \
+	$(ZLIB_DIR)/adler32.c \
+	$(ZLIB_DIR)/crc32.c \
+	$(ZLIB_DIR)/inffast.c \
+	$(ZLIB_DIR)/inflate.c \
+	$(ZLIB_DIR)/inftrees.c \
+	$(ZLIB_DIR)/zutil.c \
+	$(LIBRETRO_COMM_DIR)/streams/file_stream.c \
+	$(LIBRETRO_COMM_DIR)/streams/file_stream_transforms.c \
 	$(CORE_DIR)/libretro.c
 
 ifeq ($(FORCE_GLEW), 1)
@@ -71,7 +155,10 @@ else
 endif
 
 SOURCES_CXX := $(SOURCE_DIR)/Counter.cpp \
-	$(SOURCE_DIR)/ygl_texture.cpp
+	$(SOURCE_DIR)/ygl_texture.cpp \
+	$(SOURCE_DIR)/vdp1.cpp \
+	$(SOURCE_DIR)/vdp2.cpp \
+
 
 ifeq ($(HAVE_MUSASHI), 1)
 	SOURCES_C += $(SOURCE_DIR)/musashi/m68kcpu.c \

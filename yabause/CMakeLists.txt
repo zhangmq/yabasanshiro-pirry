@@ -1,5 +1,17 @@
 project(YabaSanshiro)
 
+# Cross build: make the engine headers reachable from subdirectories (e.g.
+# src/vulkan/VIDVulkanCInterface.h includes "vdp1.h" from src/).
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/src/nanovg)
+# The frontend selects std::filesystem vs std::experimental::filesystem with
+# "#if GCC_VERSION < 9"; define it from the compiler in use (the C++17
+# implementation needs no extra library, the experimental one needs libstdc++fs).
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+  string(REGEX MATCH "^[0-9]+" YAB_GCC_MAJOR "${CMAKE_CXX_COMPILER_VERSION}")
+  add_definitions(-DGCC_VERSION=${YAB_GCC_MAJOR})
+endif()
+
+
 cmake_minimum_required(VERSION 2.8)
 
 #-------------------------------------------------------------------------------

@@ -3,7 +3,10 @@ cmake_minimum_required (VERSION 2.8.3)
 project("NanoGUI-SDL")
 
 if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    set(CMAKE_CXX_FLAGS "-std=c++11")
+    # Append, do not replace: replacing drops the flags a cross toolchain file
+    # puts in CMAKE_CXX_FLAGS (--sysroot / -B <toolchain bin>, without which gcc
+    # picks up the host assembler and fails on -EL).
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 endif()
 
 if(NOT IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ext/eigen/Eigen")
@@ -116,21 +119,45 @@ endif()
 
 include_directories(ext ext/eigen include ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR})
 
-# Run simple C converter to put font files into the data segment
-add_executable(bin2c resources/bin2c.c)
-set(bin2c_cmdline nanogui_resources.cpp nanogui_resources.h)
-file(GLOB resources "${CMAKE_CURRENT_SOURCE_DIR}/resources/*.ttf")
-foreach(file ${resources})
-  list(APPEND bin2c_cmdline ${file})
-endforeach()
+# Run simple C converter to put font files into the data segment.
+# bin2c is a host tool: under cross compilation it would be built for the
+# target and could not be run, so a pre-generated pair is used instead
+# (YAB_NANOGUI_RESOURCES, see the build notes).
+if (CMAKE_CROSSCOMPILING)
+  # bin2c is a host tool: compile it with the host compiler (YAB_HOST_CC, a
+  # parameter, default "cc") and run that, instead of building it for the
+  # target and failing to execute it.
+  if (NOT YAB_HOST_CC)
+    set(YAB_HOST_CC cc)
+  endif()
+  set(bin2c_cmdline nanogui_resources.cpp nanogui_resources.h)
+  file(GLOB resources "${CMAKE_CURRENT_SOURCE_DIR}/resources/*.ttf")
+  foreach(file ${resources})
+    list(APPEND bin2c_cmdline ${file})
+  endforeach()
 
-# Run bin2c on resource files
-add_custom_command(
-  OUTPUT nanogui_resources.cpp nanogui_resources.h
-  COMMAND ./bin2c ARGS ${bin2c_cmdline}
-  DEPENDS bin2c ${resources}
-  COMMENT "Running bin2c"
-  PRE_BUILD VERBATIM)
+  add_custom_command(
+    OUTPUT nanogui_resources.cpp nanogui_resources.h
+    COMMAND ${YAB_HOST_CC} -O2 -o ${CMAKE_CURRENT_BINARY_DIR}/bin2c-host ${CMAKE_CURRENT_SOURCE_DIR}/resources/bin2c.c
+    COMMAND ${CMAKE_CURRENT_BINARY_DIR}/bin2c-host ARGS ${bin2c_cmdline}
+    DEPENDS ${resources} ${CMAKE_CURRENT_SOURCE_DIR}/resources/bin2c.c
+    COMMENT "Generating nanogui resources with the host bin2c (${YAB_HOST_CC})"
+    VERBATIM)
+else()
+  add_executable(bin2c resources/bin2c.c)
+  set(bin2c_cmdline nanogui_resources.cpp nanogui_resources.h)
+  file(GLOB resources "${CMAKE_CURRENT_SOURCE_DIR}/resources/*.ttf")
+  foreach(file ${resources})
+    list(APPEND bin2c_cmdline ${file})
+  endforeach()
+
+  add_custom_command(
+    OUTPUT nanogui_resources.cpp nanogui_resources.h
+    COMMAND ./bin2c ARGS ${bin2c_cmdline}
+    DEPENDS bin2c ${resources}
+    COMMENT "Running bin2c"
+    PRE_BUILD VERBATIM)
+endif()
 
 # Needed to generated files
 include_directories(${CMAKE_CURRENT_BINARY_DIR})

@@ -92,6 +92,10 @@ add_definitions(-DYAB_PORT_OSD)
 add_definitions(-D_OGLES3_)
 #add_definitions(-DYAB_ASYNC_RENDERING)
 add_definitions(-DYAB_PORT_OSD)
+# The engine's own directory must be an explicit -I: headers such as
+# src/vulkan/VIDVulkanCInterface.h include "vdp1.h" from src/, and a relative
+# "./" is not emitted for every generator/toolchain combination.
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(./ ./nanovg)		
 set(yabause_SOURCES
 	${yabause_SOURCES}
@@ -333,11 +337,19 @@ endif ()
 option(YAB_WANT_OPENGL "use OpenGL for video output (most ports require it)" ON)
 if (YAB_WANT_OPENGL AND (YAB_RGB STREQUAL ""))
 	include(FindOpenGL)
-	if (OPENGL_FOUND )
+	# Cross builds have no desktop OpenGL; USE_EGL selects the GLES3 path.
+	if (OPENGL_FOUND OR USE_EGL)
 		add_definitions(-DHAVE_LIBGL=1)
 		if( USE_EGL )
 			add_definitions(-D_OGLES3_)
-			set(YABAUSE_LIBRARIES ${YABAUSE_LIBRARIES} EGL GLESv2)
+			# The device's libEGL.so.1 / libGLESv2.so.2 are link shims; the
+			# real entry points live in libmali.so.0, so link those directly
+			# when the deps directory is provided by the toolchain file.
+			if(DEPS)
+				set(YABAUSE_LIBRARIES ${YABAUSE_LIBRARIES} ${DEPS}/lib/libEGL.so.1 ${DEPS}/lib/libmali.so.0)
+			else()
+				set(YABAUSE_LIBRARIES ${YABAUSE_LIBRARIES} EGL GLESv2)
+			endif()
 			add_definitions(-DYAB_ASYNC_RENDERING)
 		else()
 			add_definitions(-D_OGL3_)
@@ -429,8 +441,12 @@ if (YAB_WANT_SDL)
 		endif()
 	endif()
 
-	if (SDL_FOUND OR SDL2_FOUND)
-		add_definitions(-DHAVE_LIBSDL=1)
+	# Cross builds pass SDL2 explicitly (-DSDL2_LIBRARY/-DSDL2_INCLUDE_DIR);
+	# the bundled FindSDL2 does not run its detection path in that case.
+	if (SDL_FOUND OR SDL2_FOUND OR SDL2_LIBRARY)
+		add_definitions(-DHAVE_LIBSDL=1 -DHAVE_LIBSDL2=1)
+		include_directories(${SDL2_INCLUDE_DIR})
+		set(YABAUSE_LIBRARIES ${YABAUSE_LIBRARIES} ${SDL2_LIBRARY})
 		set(yabause_SOURCES ${yabause_SOURCES} persdljoy.c sndsdl.c)
 		set(yabause_HEADERS ${yabause_HEADERS} persdljoy.h sndsdl.h)
 	endif()
@@ -717,23 +733,37 @@ option(YAB_WANT_MUSASHI "Enable musashi 68k" ON)
 #TODO cross compile builds m68kmake for the target platform instead
 #of the native one, making it impossible to generate the core
 if (YAB_WANT_MUSASHI)
-    set (MUSASHI_GENERATED_SOURCES 
-        ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kopac.c
-        ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kopdm.c
-        ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kopnz.c
-        ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kops.c)
+    if (CMAKE_CROSSCOMPILING)
+        # m68kmake is a host tool: under cross compilation it would be built
+        # for the target and could not be run to generate the opcode tables.
+        # The generated files are shipped in the source tree, so use them.
+        set (MUSASHI_GENERATED_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/musashi/m68kopac.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/musashi/m68kopdm.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/musashi/m68kopnz.c
+            ${CMAKE_CURRENT_SOURCE_DIR}/musashi/m68kops.c)
 
-    set (MUSASHI_GENERATED_HEADERS
-        ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kops.h)
+        set (MUSASHI_GENERATED_HEADERS
+            ${CMAKE_CURRENT_SOURCE_DIR}/musashi/m68kops.h)
+    else()
+        set (MUSASHI_GENERATED_SOURCES 
+            ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kopac.c
+            ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kopdm.c
+            ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kopnz.c
+            ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kops.c)
 
-    include(ExternalProject)
-    ExternalProject_Add(m68kmake
-        DOWNLOAD_COMMAND ""
-        SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/musashi
-        CMAKE_GENERATOR "${CMAKE_GENERATOR}"
-        INSTALL_COMMAND ""
-        BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/musashi
-    )
+        set (MUSASHI_GENERATED_HEADERS
+            ${CMAKE_CURRENT_BINARY_DIR}/musashi/m68kops.h)
+
+        include(ExternalProject)
+        ExternalProject_Add(m68kmake
+            DOWNLOAD_COMMAND ""
+            SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/musashi
+            CMAKE_GENERATOR "${CMAKE_GENERATOR}"
+            INSTALL_COMMAND ""
+            BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/musashi
+        )
+    endif()
 
     add_definitions(-DHAVE_MUSASHI=1)
 
@@ -757,7 +787,9 @@ if (YAB_WANT_MUSASHI)
       m68kmusashi.h
       )
 
-    set_property(SOURCE ${MUSASHI_GENERATED_SOURCES} ${MUSASHI_GENERATED_HEADERS} PROPERTY GENERATED ON)
+    if (NOT CMAKE_CROSSCOMPILING)
+        set_property(SOURCE ${MUSASHI_GENERATED_SOURCES} ${MUSASHI_GENERATED_HEADERS} PROPERTY GENERATED ON)
+    endif()
 endif(YAB_WANT_MUSASHI)
 
 
@@ -1040,21 +1072,23 @@ endif(YAB_WANT_VULKAN)
 # libCHD
 include( ${CMAKE_SOURCE_DIR}/CMake/Packages/external_libchdr.cmake )
 include( ${CMAKE_SOURCE_DIR}/CMake/Packages/external_zlib.cmake )
-#include_directories(${zlib_INCLUDE_DIR})
+# zlib is either found on the system (ZLIB_INCLUDE_DIRS, above) or built by
+# external_zlib.cmake; in the latter case its include dir must be on the path.
+include_directories(${zlib_INCLUDE_DIR})
 add_dependencies(yabause libchdr)
 #add_dependencies(yabause zlib)
 
-if(WIN32)
-	# Windows need to build zlib
-	add_dependencies(yabause zlib)
-	include_directories(${zlib_INCLUDE_DIR})
-endif()
+# The engine includes zlib.h, and the include dir only exists once the
+# ExternalProject has installed it, so the ordering matters on every platform
+# (not just Windows).
+add_dependencies(yabause zlib)
+include_directories(${zlib_INCLUDE_DIR})
 
 if (YAB_WANT_C68K)
 	add_dependencies(yabause c68kinc)
 endif(YAB_WANT_C68K)
 
-if (YAB_WANT_MUSASHI)
+if (YAB_WANT_MUSASHI AND NOT CMAKE_CROSSCOMPILING)
 	add_dependencies(yabause m68kmake)
 endif(YAB_WANT_MUSASHI)
 

@@ -285,3 +285,39 @@ YabMutex * YabThreadCreateMutex()
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+//////////////////////////////////////////////////////////////////////////////
+/* libretro port: vdp2.cpp uses these two, which only the standalone's
+ * thr-linux.cpp/thr-windows.c provide.  Bodies are ours (same semantics as
+ * those, see our repo's thr-rthreads.c). */
+
+/* Non-blocking variant: drop the event when the queue is full.  The VDP worker
+ * uses it to post "one VDP1 draw finished" -- a coalescing notification, not
+ * data -- so a full queue must never stall the worker. */
+int YabAddEventQueueNonBlocking( YabEventQueue * queue_t, int evcode )
+{
+	YabEventQueue_rthreads * queue = (YabEventQueue_rthreads*)queue_t;
+	int added = 0;
+	slock_lock(queue->mutex);
+	if (queue->size != queue->capacity) {
+		queue->buffer[queue->in] = evcode;
+		++ queue->size;
+		++ queue->in;
+		queue->in %= queue->capacity;
+		added = 1;
+	}
+	slock_unlock(queue->mutex);
+	if (added)
+		scond_broadcast(queue->cond_empty);
+	return added;
+}
+
+/* Sleep, in microseconds (the name is historical: callers pass e.g. 100000 for
+ * 100 ms). */
+int YabNanosleep(u64 ns) {
+  struct timespec ts;
+  ts.tv_sec = 0;
+  ts.tv_nsec = ns*1000;
+  nanosleep(&ts,NULL);
+  return 0;
+}
