@@ -41,13 +41,18 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 // used by the "Next Disc" button; defined further down, after ends_with()
 static std::vector<std::string> disc_list(const std::string & base_path);
 
+#if GCC_VERSION < 9
 #include <experimental/filesystem>
 #include <ctime>
 #include <iomanip>
 
 #include <nanogui/imageview.h>
 
-namespace fs = std::experimental::filesystem ;
+namespace fs = std::experimental::filesystem;
+#else
+#include <filesystem>
+namespace fs = std::filesystem;
+#endif
 
 using namespace std;
 

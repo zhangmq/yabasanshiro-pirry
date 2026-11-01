@@ -236,8 +236,15 @@ static InputType jsonTypeToInputType( const std::string & t ){
 static void syncMenuInputNames( int deviceId, const json & dev ){
   InputConfig * cfg = InputManager::getInstance()->getInputConfigByDevice(deviceId);
   if( cfg == NULL ) return;
-  // "up"/"down"/"left"/"right" are mirrored too, so menu navigation works.
-  static const char * kMenuNames[] = { "select", "start", "up", "down", "left", "right" };
+  /* Mirror every action the menu itself understands into the device's name map:
+     "up"/"down"/"left"/"right" for navigation and "a"/"b" for confirm/back
+     (MenuScreen::keyboardEvent and onBackButtonPressed).  getMappedTo() only
+     reports names that are in this map, so without "a"/"b" no face button can
+     ever confirm or leave a menu item -- only the fixed
+     g_menu_confirm_btn/g_menu_back_btn indices would work, and those are
+     joydev button numbers, i.e. device specific (on a pad whose joydev button
+     list starts with KEY_ESC/VOL- they are not game buttons at all). */
+  static const char * kMenuNames[] = { "select", "start", "up", "down", "left", "right", "a", "b" };
   for( auto name : kMenuNames ){
     if( dev.find(name) == dev.end() ) continue;
     json f = dev[name];
@@ -599,6 +606,21 @@ void InputManager::saveInputConfig( const std::string & guid , const std::string
   std::ofstream out( config_fname_ );
   out << j.dump(2);
   out.close();
+}
+
+/* EmuELEC/ArkOS style installs keep the EmulationStation-style input.cfg next
+ * to the emulator binary (e.g. /emuelec/saturn/input.cfg) and have no
+ * ~/.emulationstation directory.  Returning that path lets such a setup run
+ * with the stock key configuration, without a keymapv2.json of its own. */
+static std::string exeDirInputCfg( void ){
+  char buf[4096];
+  ssize_t n = readlink( "/proc/self/exe", buf, sizeof(buf) - 1 );
+  if( n <= 0 ) return std::string();
+  buf[n] = '\0';
+  std::string p( buf );
+  size_t pos = p.find_last_of( '/' );
+  if( pos == std::string::npos ) return std::string();
+  return p.substr( 0, pos + 1 ) + "input.cfg";
 }
 
 int InputManager::convertFromEmustationFile( const std::string & fname ){
@@ -1277,7 +1299,8 @@ bool InputManager::loadInputConfig(InputConfig* config)
        /etc/emulationstation/es_input.cfg. The GUID there lacks the SDL checksum,
        so devices match by name. */
     if (!fs::exists(es_path)) es_path = "/etc/emulationstation/es_input.cfg";
-    if (fs::exists(es_path)) {
+    if (!fs::exists(es_path)) es_path = exeDirInputCfg();
+    if (!es_path.empty() && fs::exists(es_path)) {
       path = es_path;
     }
   }
