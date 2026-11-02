@@ -530,16 +530,19 @@ static u8 FASTCALL BupRamMemoryReadByte(u32 addr)
 
 static u16 FASTCALL BupRamMemoryReadWord(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read word - %08X\n", addr);
-   return 0;
+   /* The backup RAM is a 16-bit device with only its high byte wired up, so a
+      word read is the byte at addr|1 in bits 8-15 (Kronos memory.c).  This
+      used to be a stub returning 0: an ST-V title that checks its card with
+      word reads saw an empty/corrupt card and never left its boot code. */
+   return (u16)(BupRamMemoryReadByte(addr | 0x1) << 8);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static u32 FASTCALL BupRamMemoryReadLong(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read long - %08X\n", addr);
-   return 0;
+   return (u32)((BupRamMemoryReadByte(addr | 0x1) << 8) |
+                (BupRamMemoryReadByte(addr | 0x3) << 16));
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -580,14 +583,15 @@ static void FASTCALL BupRamMemoryWriteByte(u32 addr, u8 val)
 
 static void FASTCALL BupRamMemoryWriteWord(USED_IF_DEBUG u32 addr, UNUSED u16 val)
 {
-   LOG("bup\t: BackupRam write word - %08X\n", addr);
+   BupRamMemoryWriteByte(addr | 0x1, (val >> 8) & 0xFF);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void FASTCALL BupRamMemoryWriteLong(USED_IF_DEBUG u32 addr, UNUSED u32 val)
 {
-   LOG("bup\t: BackupRam write long - %08X\n", addr);
+   BupRamMemoryWriteByte(addr | 0x1, (val >> 8) & 0xFF);
+   BupRamMemoryWriteByte(addr | 0x3, (val >> 24) & 0xFF);
 }
 
 //////////////////////////////////////////////////////////////////////////////
