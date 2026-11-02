@@ -1,15 +1,13 @@
 /* PORT-TO-PIRRY-2026-11-01.md §5: platform helpers of our fork that have no
  * counterpart in pirry's core (yet).  Everything here is deliberately a no-op:
- *  - the frame/pause protocol (our seq/J1/J2 + frontend heartbeat) is replaced by
- *    pirry's own Vdp1JoinPendingRenders/Vdp1MarkRenderRetired; the pause-on-menu
- *    behaviour is not ported yet, so the machine keeps running while the
- *    frontend is away (pirry's standalone does the same until VdpRevoke);
+ *  - the frame protocol of our fork (seq/J1/J2) is replaced by pirry's own
+ *    Vdp1JoinPendingRenders/Vdp1MarkRenderRetired; the frontend heartbeat lives
+ *    in libretro.c (yab_front_beat, pause-on-menu watchdog);
  *  - VDP1 framebuffer readback and the CPU-clock option are not ported. */
 #include "yabause.h"
 
 void yab_frame_abort(void) {}
 void yab_frame_resume(void) {}
-void yab_front_beat(void) {}
 void YabSetRenderThread(void) {}
 void YabauseApplyCpuClock(void) {}
 

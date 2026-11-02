@@ -3725,6 +3725,84 @@ static volatile int yab_emu_running = 0;
 static volatile int yab_emu_paused = 0;
 static volatile int yab_emu_parked = 1;
 
+/* ---------------------------------------------------------------------------
+ * Frontend pause (menu).
+ *
+ * libretro has no pause event: a frontend pauses content by not calling
+ * retro_run() at all (minarch-gl blocks its main loop while its menu is up, see
+ * minarch-gl/minarch.c:415-432, because it does not composite the game frame
+ * under the menu).  With only yab_emu_paused -- which save/reset/resize set
+ * explicitly -- the machine thread kept running through that: the game advanced
+ * behind the menu, the SCSP kept producing and the CPU stayed busy, and coming
+ * back from the menu jumped the game forward.
+ *
+ * Detection is a heartbeat: retro_run() stamps yab_front_beat_ms every frame.
+ * Once the stamp is older than YAB_PAUSE_MS (default 150) the machine parks at
+ * its safe point and the sound thread is parked too, through the same
+ * ScspMuteAudio()/g_scsp_lock handshake pirry's own menu uses
+ * (retro_arena/main.cpp:768).  The next beat resumes: the audio queued before
+ * the pause is dropped (it belongs to the old timeline) and the frameskip debt
+ * is cleared, so the pause is not paid back in skipped fields.
+ * ------------------------------------------------------------------------- */
+static volatile unsigned long long yab_front_beat_ms = 0;
+static volatile int yab_front_paused = 0;
+static int yab_front_pause_logs = 0;
+
+static unsigned long long yab_now_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)(ts.tv_nsec / 1000000L);
+}
+
+static int yab_pause_ms(void)
+{
+   static int ms = -1;
+   if (ms < 0)
+   {
+      const char *e = getenv("YAB_PAUSE_MS");
+      ms = (e && *e) ? atoi(e) : 150;
+      if (ms < 20) ms = 20;      /* never trip on a single heavy field */
+   }
+   return ms;
+}
+
+/* retro_run() and the sim hook below: the frontend is alive. */
+void yab_front_beat(void)
+{
+   __atomic_store_n(&yab_front_beat_ms, yab_now_ms(), __ATOMIC_RELEASE);
+   if (__atomic_exchange_n(&yab_front_paused, 0, __ATOMIC_ACQ_REL))
+   {
+      yab_audio_drop_pending();                 /* pre-pause audio is stale */
+      ScspUnMuteAudio(SCSP_MUTE_SYSTEM);        /* unparks the sound thread */
+      if (g_frameskip) EnableAutoFrameSkip();   /* the pause is not paid in skips */
+      if (yab_front_pause_logs < 8)
+      {
+         yab_front_pause_logs++;
+         YAB_TR_L1("[PAUSE] frontend resumed: sound unparked, frameskip debt cleared\n");
+      }
+   }
+}
+
+/* Machine safe point: returns 1 while the frontend is away, parking on entry. */
+static int yab_front_pause_poll(void)
+{
+   unsigned long long beat = __atomic_load_n(&yab_front_beat_ms, __ATOMIC_ACQUIRE);
+   if (!__atomic_load_n(&yab_front_paused, __ATOMIC_ACQUIRE) && beat &&
+       (yab_now_ms() - beat) > (unsigned long long)yab_pause_ms())
+   {
+      __atomic_store_n(&yab_front_paused, 1, __ATOMIC_RELEASE);
+      ScspMuteAudio(SCSP_MUTE_SYSTEM);          /* parks the sound thread */
+      if (yab_front_pause_logs < 8)
+      {
+         yab_front_pause_logs++;
+         YAB_TR_L1("[PAUSE] frontend paused (%llu ms without retro_run): machine parked, sound parked\n",
+                   yab_now_ms() - beat);
+      }
+   }
+   return __atomic_load_n(&yab_front_paused, __ATOMIC_ACQUIRE);
+}
+
 /* L2 probe [FT] (+[MW]): per-frame cost split, printed every <n> frames.
  * n defaults to 60 at level 2 and 1 at level 3; YAB_FT=<n> overrides it.
  *
@@ -3830,10 +3908,13 @@ static void *yab_emu_main(void *arg)
        * J1a/J1b/J2 joins and the direct-draw ring) is abortable, so a pause
        * requested mid-frame also lands here within one frame. */
       yab_emu_parked = 1;
-      while (yab_emu_paused)
+      for (;;)
       {
          if (!yab_emu_running) break;
-         usleep(500);
+         if (yab_emu_paused) { usleep(500); continue; }
+         /* Frontend away (menu): park the machine, not just this thread's cycle. */
+         if (yab_front_pause_poll()) { usleep(1000); continue; }
+         break;
       }
       if (!yab_emu_running) break;
       yab_emu_parked = 0;
@@ -4009,6 +4090,7 @@ static void yab_emu_resume(void)
 void retro_run(void)
 {
    bool updated  = false;
+
    one_frame_rendered = false;
    yab_in_run = 1;          /* SET_GEOMETRY is legal only while this is set */
 
