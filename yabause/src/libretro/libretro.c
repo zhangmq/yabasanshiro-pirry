@@ -2557,7 +2557,7 @@ void retro_get_system_av_info(struct retro_system_av_info *info)
       for flycast rotated games is 0.75"), and Kronos, where this ST-V support
       came from, does the same in its av_info path. */
    {
-      unsigned rotation = 0;   /* yabsys.isRotated comes with the ST-V port */
+      unsigned rotation = (unsigned)yabsys.isRotated;
       environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
       if (rotation != 0)
          info->geometry.aspect_ratio = 1.0f / info->geometry.aspect_ratio;
@@ -3571,6 +3571,9 @@ bool retro_load_game(const struct retro_game_info *info)
       yinit.biospath         = (hle_bios_force ? NULL : bios_path);
       yinit.carttype         = addon_cart_type;
       yinit.cartpath         = "\0";
+      /* A vertical ST-V title (shienryu) leaves yabsys.isRotated set; a Saturn
+         game must report rotation 0 to the frontend. */
+      yabsys.isRotated       = 0;
    }
 
    return retro_load_game_common();
