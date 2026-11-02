@@ -6597,9 +6597,11 @@ SoundSaveState (FILE *fp)
   u8 nextphase;
   IOCheck_struct check = { 0, 0 };
 
-  /* State version 4 contains the real 68000 state (D0-D7, A0-A7, PC, SR, USP, ISP, see m68kmusashi.c
-     M68KMusashiSaveState). Older (v3) states stay loadable; SoundLoadState skips the 68k part for them. */
-  offset = StateWriteHeader (fp, "SCSP", 4);
+  /* Version 5 contains the full 68000 state: D0-D7, A0-A7, USP, ISP, MSP, PC, SR, stopped and
+     int_cycles (23 words, see m68kmusashi.c M68KMusashiSaveState). Version 4 carried the older
+     20-word block without MSP/stopped/int_cycles and is still loadable (M68KMusashiLoadStateV4);
+     version 3 and older states have no 68k state at all and skip it. */
+  offset = StateWriteHeader (fp, "SCSP", 5);
 
   // Save 68k registers first
   ywrite (&check, (void *)&IsM68KRunning, 1, 1, fp);
@@ -6912,8 +6914,12 @@ SoundLoadState (FILE *fp, int version, int size)
   /* The 68k state exists only from v4 on. M68KMusashiSaveState wrote nothing in v3, so reading it there would shift
      the whole data stream and corrupt the rest of the block (slots, DSP, sound RAM). For v3 states the 68k keeps its
      running state while the sound RAM is replaced, so a fresh (v4) state is the clean way. */
-  if (version >= 4) {
+  if (version >= 5) {
     M68K->LoadState(fp);
+  } else if (version >= 4) {
+    /* Version 4: the 20-word block without MSP/stopped/int_cycles. */
+    extern void M68KMusashiLoadStateV4(FILE *fp);
+    M68KMusashiLoadStateV4(fp);
   }
 #else
   for (i = 0; i < 8; i++)

@@ -2666,6 +2666,8 @@ bool retro_serialize(void *data, size_t size)
    memcpy(data, buffer, out_size);
    if (out_size < size)
       memset((unsigned char *)data + out_size, 0, size - out_size);
+   YAB_TR_L1("[STATE] save %lu bytes (buffer %lu)\n",
+             (unsigned long)out_size, (unsigned long)size);
    free(buffer);
    return true;
 }
@@ -2678,18 +2680,17 @@ bool retro_serialize(void *data, size_t size)
  * retro_run() once the machine was warm, because loading it cold left the sound
  * path silent for the rest of the session.
  *
- * That was a workaround for a real bug in the SCSP savestate, fixed at the
- * source: the sound CPU (68k) register block was delegated to M68K->SaveState()
- * / M68K->LoadState(), which the Musashi interface implemented as empty stubs,
- * so no state file carried any 68k state; and restoring the stack pointers
- * before writing SR made Musashi swap them whenever the live mode differed from
- * the saved one.  With both fixed a state loads correctly at any frame (verified
- * on device: a load at frame 1 now matches a plain boot sample for sample), so
- * the gate is gone.  See .notes/audio-ab/STATE-68K-ROOTCAUSE.md.
+ * The cause was the sound CPU's state block.  SCSP chunk version 4 carried the
+ * 68k register file only (D0-D7/A0-A7/PC/SR/USP/ISP) and restored SR through
+ * m68k_set_reg(), whose m68ki_set_sr() backs the current SP up into the slot of
+ * the mode it is leaving and loads the new mode's SP.  On a cold start the 68k
+ * is still in user mode, so the saved pointers were swapped and interrupts ended
+ * up masked: the SCSP stopped producing samples and the game froze.
  *
- * Caveat: state files written before that fix (SCSP chunk version < 5) contain
- * no 68k state at all and still cannot be replayed correctly from a cold start;
- * re-save them with this build.
+ * Version 5 (m68kmusashi.c) adds MSP, stopped and int_cycles and restores SR
+ * with m68ki_set_sr_noint_nosp() before writing the pointers; version 4 files
+ * still load through M68KMusashiLoadStateV4().  With that in place a state loads
+ * correctly at any frame, so the gate is gone.
  * ------------------------------------------------------------------------- */
 static int apply_state_buffer(const void *data, size_t size)
 {
@@ -2724,6 +2725,11 @@ bool retro_unserialize(const void *data, size_t size)
     * Pointers only -- the full bind would zero the live VDP1 handshake, the same
     * way it did on the save path. */
    ok = apply_state_buffer(data, size) == 0;
+   /* The sound CPU's PC/SR are the cheapest proof that the 68k block really
+    * landed (the SH2s are not usable here: the dynarec keeps its own copy). */
+   YAB_TR_L1("[STATE] load %lu bytes -> %s (68k PC=%08X SR=%04X)\n",
+             (unsigned long)size, ok ? "ok" : "FAILED",
+             (unsigned)(M68K->GetPC()), (unsigned)(M68K->GetSR()));
    Vdp2AfterLoadState();      /* PORT: pirry's reset of Vdp1External/waits after a load */
    /* Audio queued before the load belongs to the old timeline (the sound thread
     * keeps producing while the frontend is busy loading); handing it over after

@@ -1740,12 +1740,19 @@ int YabLoadStateStream(FILE *fp)
       return -3;
    }
 
-   // Make sure size variable matches actual size minus header
+   /* The declared size must fit, but it does not have to equal the file length:
+      a frontend allocates retro_get_serialize_size() bytes and hands that whole
+      buffer back on load (minarch does exactly that), so a state file saved
+      through it is padded with zeros past the real end -- 4.3 MB of padding in
+      the measured case.  Reject truncation, accept trailing bytes. */
    fseek(fp, 0, SEEK_END);
 
-   if (size != (ftell(fp) - headersize))
    {
-      return -2;
+      long actual = ftell(fp) - headersize;
+      if (actual < 0 || size > actual)
+      {
+         return -2;
+      }
    }
    fseek(fp, headersize, SEEK_SET);
 

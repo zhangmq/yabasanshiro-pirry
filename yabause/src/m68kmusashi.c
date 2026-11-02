@@ -169,42 +169,89 @@ static void M68KMusashiSetWriteW(M68K_WRITE *Func) {
    The sound RAM is replaced on load, so the CPU registers must be restored with it.
    Part of the SCSP state block (version 4); older states carry nothing here and
    the caller's version check skips this. */
-static void M68KMusashiSaveState(FILE *fp) {
-   IOCheck_struct check = { 0, 0 };
+/* The sound CPU's state block.  The register file alone is not enough: MSP (the
+ * supervisor stack the 68k switches to on an interrupt), the stopped flag and
+ * the pending interrupt cycle budget decide what the 68k does next, and a state
+ * that drops them resumes on the wrong stack or forgets that it was halted.
+ *
+ * 23 words, written under SCSP chunk version 5 (see SoundSaveState).  Files from
+ * version 4 carry the older 20-word block and are mapped by
+ * M68KMusashiLoadStateV4(). */
+#define M68K_STATE_WORDS 23
+
+static void apply_m68k_state(const u32 *w, int legacy)
+{
    int i;
-   u32 v;
-   for (i = 0; i < 8; i++) {
-      v = m68k_get_reg(NULL, M68K_REG_D0 + i);
-      ywrite(&check, (void *)&v, sizeof(u32), 1, fp);
+
+   /* SR first, and *without* touching the stack pointer: m68ki_set_sr() goes
+    * through m68ki_set_sm_flag(), which backs the current SP up into the slot of
+    * the mode it is leaving and loads the new mode's SP.  Doing that while the
+    * saved pointers are already in place swaps them whenever the live mode
+    * differs from the saved one -- exactly the cold-start case, where the 68k
+    * still sits in user mode after reset.  It would then run off with a bogus
+    * stack and interrupt mask 7 (everything blocked), so the SCSP never
+    * produced another sample and the game froze. */
+   m68ki_set_sr_noint_nosp(legacy ? w[17] : w[20]);
+
+   for (i = 0; i < 16; i++)
+      m68ki_cpu.dar[i] = w[i];
+
+   if (legacy)
+   {
+      /* version 4 layout: D0-D7, A0-A7, PC, SR, USP, ISP */
+      m68ki_cpu.pc  = w[16];
+      m68ki_cpu.ppc = w[16];
+      m68ki_cpu.sp[0] = w[18];   /* USP */
+      m68ki_cpu.sp[4] = w[19];   /* ISP */
+      /* No MSP / stopped / int_cycles in those files: MSP keeps its current
+       * value and a state saved mid-halt resumes unhalted. */
    }
-   for (i = 0; i < 8; i++) {
-      v = m68k_get_reg(NULL, M68K_REG_A0 + i);
-      ywrite(&check, (void *)&v, sizeof(u32), 1, fp);
+   else
+   {
+      m68ki_cpu.sp[0] = w[16];   /* USP */
+      m68ki_cpu.sp[4] = w[17];   /* ISP */
+      m68ki_cpu.sp[6] = w[18];   /* MSP */
+      m68ki_cpu.pc    = w[19];
+      m68ki_cpu.ppc   = w[19];
+      m68ki_cpu.stopped    = w[21];
+      m68ki_cpu.int_cycles = w[22];
    }
-   v = m68k_get_reg(NULL, M68K_REG_PC);  ywrite(&check, (void *)&v, sizeof(u32), 1, fp);
-   v = m68k_get_reg(NULL, M68K_REG_SR);  ywrite(&check, (void *)&v, sizeof(u32), 1, fp);
-   v = m68k_get_reg(NULL, M68K_REG_USP); ywrite(&check, (void *)&v, sizeof(u32), 1, fp);
-   v = m68k_get_reg(NULL, M68K_REG_ISP); ywrite(&check, (void *)&v, sizeof(u32), 1, fp);
+}
+
+static void M68KMusashiSaveState(FILE *fp) {
+   u32 w[M68K_STATE_WORDS];
+   int i;
+
+   for (i = 0; i < 16; i++)
+      w[i] = m68ki_cpu.dar[i];
+   w[16] = m68ki_cpu.sp[0];    /* USP */
+   w[17] = m68ki_cpu.sp[4];    /* ISP */
+   w[18] = m68ki_cpu.sp[6];    /* MSP */
+   w[19] = m68ki_cpu.pc;
+   w[20] = m68ki_get_sr();     /* packs the condition codes too */
+   w[21] = m68ki_cpu.stopped;
+   w[22] = m68ki_cpu.int_cycles;
+
+   fwrite(w, sizeof(u32), M68K_STATE_WORDS, fp);
 }
 
 static void M68KMusashiLoadState(FILE *fp) {
-   IOCheck_struct check = { 0, 0 };
-   int i;
-   u32 v;
-   for (i = 0; i < 8; i++) {
-      yread(&check, (void *)&v, sizeof(u32), 1, fp);
-      m68k_set_reg(M68K_REG_D0 + i, v);
-   }
-   for (i = 0; i < 8; i++) {
-      yread(&check, (void *)&v, sizeof(u32), 1, fp);
-      m68k_set_reg(M68K_REG_A0 + i, v);
-   }
-   /* Order matters: set SR before the stack pointers. The S bit in SR selects
-      whether A7 is the user or supervisor stack. */
-   yread(&check, (void *)&v, sizeof(u32), 1, fp); m68k_set_reg(M68K_REG_PC, v);
-   yread(&check, (void *)&v, sizeof(u32), 1, fp); m68k_set_reg(M68K_REG_SR, v);
-   yread(&check, (void *)&v, sizeof(u32), 1, fp); m68k_set_reg(M68K_REG_USP, v);
-   yread(&check, (void *)&v, sizeof(u32), 1, fp); m68k_set_reg(M68K_REG_ISP, v);
+   u32 w[M68K_STATE_WORDS];
+
+   if (fread(w, sizeof(u32), M68K_STATE_WORDS, fp) != M68K_STATE_WORDS)
+      return;
+   apply_m68k_state(w, 0);
+}
+
+/* Loads the 20-word 68k block of an SCSP chunk version 4 state file (written
+ * before the block above gained MSP/stopped/int_cycles).  Called from
+ * SoundLoadState() for version 4. */
+void M68KMusashiLoadStateV4(FILE *fp) {
+   u32 w[20];
+
+   if (fread(w, sizeof(u32), 20, fp) != 20)
+      return;
+   apply_m68k_state(w, 1);
 }
 
 M68K_struct M68KMusashi = {
