@@ -46,6 +46,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "cs0.h"
 #ifdef __LIBRETRO__
 #include "decrypt.h"
+#include "stvcomp.h"
 #endif
 #include "error.h"
 #include "japmodem.h"
@@ -1056,6 +1057,16 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 static u8 decryptOn = 0;
 
 
+#ifdef __LIBRETRO__
+/* 315-5838 board: the chip pulls its encrypted source words straight from the
+   cart image of the bank the SH-2 selected (MAME stv.cpp sega5838_source_r). */
+static u16 STVCompSourceRead(u32 word_addr)
+{
+   u32 logical = ((u32)STVCompGetBank() << 23) | (((u32)word_addr << 1) & 0x7FFFFF);
+   return T1ReadWord(CartridgeArea->rom, logical);
+}
+#endif
+
 static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr)
 {
    return T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF);
@@ -1068,21 +1079,89 @@ static u16 FASTCALL ROMSTVCs0ReadWord(u32 addr)
 
 static u32 FASTCALL ROMSTVCs0ReadLong(u32 addr)
 {
+#ifdef __LIBRETRO__
+   /* DecAthlete's 315-5838 decodes on the fly: 0x027FFFF8 + bank*8 MiB
+      returns two decompressed bytes (MAME sega5838_r). */
+   if (STVCompIsEnabled()) {
+      u32 off = addr & 0x1FFFFFF;
+      if (off < 0x1800000 && (off & 0x7FFFFF) == 0x7FFFF8) {
+         int bank = (off >> 23) & 3;
+         if (STVCompDecodeEnabled())
+            return ((u32)STVCompDataRead() << 16) | STVCompDataRead();
+         return T1ReadLong(CartridgeArea->rom, (bank << 23) | 0x7FFFF8);
+      }
+   }
+#endif
    return T1ReadLong(CartridgeArea->rom, addr & 0x1FFFFFF);
 }
 
 static void FASTCALL ROMSTVCs0WriteByte(u32 addr, u8 val)
 {
+#ifdef __LIBRETRO__
+   if (STVCompIsEnabled() && (addr & 0x1FFFFFF) < 0x1800000)
+      return;
+#endif
    T1WriteByte(CartridgeArea->rom, addr & 0x1FFFFFF, val);
 }
 
 static void FASTCALL ROMSTVCs0WriteWord(u32 addr, u16 val)
 {
+#ifdef __LIBRETRO__
+   /* The SH-2 writes the 5838 registers as two 16-bit halves as well (MAME's
+      32-bit handler receives them with a mem_mask): 0x...FFF0/FFF2 are the
+      source address, 0x...FFF4/FFF6 the tree/dictionary upload. */
+   if (STVCompIsEnabled()) {
+      u32 off = addr & 0x1FFFFFF;
+      if (off < 0x1800000) {
+         STVCompSetBank((off >> 23) & 3);
+         switch (off & 0x7FFFFF) {
+         case 0x7FFFF0:
+            STVCompSourceWrite((u32)val << 16, 0xFFFF0000);
+            break;
+         case 0x7FFFF2:
+            STVCompSourceWrite((u32)val, 0x0000FFFF);
+            break;
+         case 0x7FFFF4:
+            STVCompTableWrite(0, val);
+            break;
+         case 0x7FFFF6:
+            STVCompTableWrite(1, val);
+            break;
+         default:
+            break;
+         }
+         return;
+      }
+   }
+#endif
    T1WriteWord(CartridgeArea->rom, addr & 0x1FFFFFF, val);
 }
 
 static void FASTCALL ROMSTVCs0WriteLong(u32 addr, u32 val)
 {
+#ifdef __LIBRETRO__
+   /* 315-5838: every 32-bit write in the 24 MiB window selects the source
+      bank; 0x...7FFFF0 feeds an encrypted source word and 0x...7FFFF4 the
+      dictionary/tree upload (MAME sega5838_w). */
+   if (STVCompIsEnabled()) {
+      u32 off = addr & 0x1FFFFFF;
+      if (off < 0x1800000) {
+         STVCompSetBank((off >> 23) & 3);
+         switch (off & 0x7FFFFF) {
+         case 0x7FFFF0:
+            STVCompSourceWrite(val, 0xFFFFFFFF);
+            break;
+         case 0x7FFFF4:
+            STVCompTableWrite(0, (u16)(val >> 16));
+            STVCompTableWrite(1, (u16)(val & 0xFFFF));
+            break;
+         default:
+            break;
+         }
+         return;
+      }
+   }
+#endif
    T1WriteLong(CartridgeArea->rom, addr & 0x1FFFFFF, val);
 }
 
@@ -1137,6 +1216,13 @@ static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val)
 
 static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
 {
+#ifdef __LIBRETRO__
+   /* 315-5838 control register at 0x04200000 (bit 1 = decoder output). */
+   if (STVCompIsEnabled() && (addr & 0xFFFFFF) == 0x200000) {
+      STVCompSetControl(val);
+      return;
+   }
+#endif
 #ifdef YAB_STV_DEBUG
 #endif
    u8 decryptCmd = addr & 0xF;
@@ -1382,6 +1468,8 @@ int CartInit(const char * filename, int type)
          CartridgeArea->Cs1WriteByte = &ROMSTVCs1WriteByte;
          CartridgeArea->Cs1WriteWord = &ROMSTVCs1WriteWord;
          CartridgeArea->Cs1WriteLong = &ROMSTVCs1WriteLong;
+
+         STVCompSetSourceReader(STVCompSourceRead);
          break;
       }
 #endif

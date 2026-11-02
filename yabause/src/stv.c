@@ -17,6 +17,7 @@
 
 
 #include "stv.h"
+#include "stvcomp.h"
 #include "cs0.h"
 #include "junzip.h"
 #include "yabause.h"
@@ -3135,6 +3136,11 @@ int STVSingleInit(const char *gamepath, const char *biospath, const char *eeprom
     char eeprom_path[4096];
     snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
     eeprom_init(eeprom_path);
+    /* DecAthlete's cart carries the 315-5838 compression/encryption chip. */
+    if (strcmp(romset, "decathlt") == 0 || strcmp(romset, "decathlto") == 0)
+      STVCompEnable(STVCOMP_315_5838);
+    else
+      STVCompDisable();
     yabsys.isSTV = 1;
     return 0;
   }
@@ -3158,6 +3164,11 @@ int STVInit(const char* romset, const char *path, const char *eepromdir, int fav
     char eeprom_path[4096];
     snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
     eeprom_init(eeprom_path);
+    /* DecAthlete's cart carries the 315-5838 compression/encryption chip. */
+    if (strcmp(romset, "decathlt") == 0 || strcmp(romset, "decathlto") == 0)
+      STVCompEnable(STVCOMP_315_5838);
+    else
+      STVCompDisable();
     yabsys.isSTV = 1;
     LOGSTV("Load is ok\n");
     return 0;
