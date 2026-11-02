@@ -384,6 +384,16 @@ int YabauseInit(yabauseinit_struct *init)
    OSDChangeCore(OSDCORE_DEFAULT);
 #endif
 
+#ifdef __LIBRETRO__
+   /* ST-V has no Saturn BIOS: stv.c has already installed the ST-V BIOS in
+      BiosRom, so the HLE fallback must not overwrite it (it would also patch
+      the first bytes of the ST-V BIOS).  Ported from libretro/yabause@kronos. */
+   if (yabsys.isSTV)
+   {
+      yabsys.emulatebios = 0;
+   }
+   else
+#endif
    if (init->biospath != NULL && strlen(init->biospath))
    {
       if (LoadBios(init->biospath) != 0)

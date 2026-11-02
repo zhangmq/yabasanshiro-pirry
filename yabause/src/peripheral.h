@@ -322,12 +322,7 @@ int PlayRecorder_getStatus();
 //int PlayRecorder_getVirtualTime(time_t * t );
 void PlayRecorder_setPlayMode( const char * dir, yabauseinit_struct *init  );
 
-#if defined (__cplusplus)
-}
-#endif
-
-#endif
-
+#ifdef __LIBRETRO__
 /* ST-V JAMMA cabinet inputs (ported from libretro/yabause@kronos, as in our
  * fork): the libretro glue maps the frontend's pads/keys onto these. */
 #define PERJAMMA_COIN1 29
@@ -348,3 +343,83 @@ void PlayRecorder_setPlayMode( const char * dir, yabauseinit_struct *init  );
 #define PERJAMMA_P2_BUTTON4 44
 #define PERJAMMA_P2_BUTTON5 45
 #define PERJAMMA_P2_BUTTON6 46
+
+/* IOGA port indices (ST-V board) */
+typedef enum {
+   PORT_A = 0, PORT_B, PORT_C, PORT_D, PORT_E, PORT_F, PORT_G,
+   PORT_G0, PORT_G1, PORT_G2, PORT_G3,
+   ioPortMAX
+} ioPort;
+
+int IOPortAdd(int key, ioPort port, u8 index);
+extern u8 IOPORT[ioPortMAX];
+u8 IOPortReadByte(u32 addr);
+u16 IOPortReadWord(u32 addr);
+void IOPortWriteByte(u32 addr, u8 val);
+
+typedef u8 PerCab_struct;
+
+PerCab_struct * PerCabAdd(PortData_struct * port);
+void PerCabUpPressed(PerCab_struct * pad);
+void PerCabUpReleased(PerCab_struct * pad);
+void PerCabDownPressed(PerCab_struct * pad);
+void PerCabDownReleased(PerCab_struct * pad);
+void PerCabRightPressed(PerCab_struct * pad);
+void PerCabRightReleased(PerCab_struct * pad);
+void PerCabLeftPressed(PerCab_struct * pad);
+void PerCabLeftReleased(PerCab_struct * pad);
+void PerCabAPressed(PerCab_struct * pad);
+void PerCabAReleased(PerCab_struct * pad);
+void PerCabBPressed(PerCab_struct * pad);
+void PerCabBReleased(PerCab_struct * pad);
+void PerCabCPressed(PerCab_struct * pad);
+void PerCabCReleased(PerCab_struct * pad);
+void PerCabXPressed(PerCab_struct * pad);
+void PerCabXReleased(PerCab_struct * pad);
+void PerCabYPressed(PerCab_struct * pad);
+void PerCabYReleased(PerCab_struct * pad);
+void PerCabZPressed(PerCab_struct * pad);
+void PerCabZReleased(PerCab_struct * pad);
+void PerCabTestPressed(PerCab_struct * pad);
+void PerCabTestReleased(PerCab_struct * pad);
+void PerCabServicePressed(PerCab_struct * pad);
+void PerCabServiceReleased(PerCab_struct * pad);
+void PerCabCoin1Pressed(PerCab_struct * pad);
+void PerCabCoin1Released(PerCab_struct * pad);
+void PerCabCoin2Pressed(PerCab_struct * pad);
+void PerCabCoin2Released(PerCab_struct * pad);
+void PerCabStart1Pressed(PerCab_struct * pad);
+void PerCabStart1Released(PerCab_struct * pad);
+void PerCabStart2Pressed(PerCab_struct * pad);
+void PerCabStart2Released(PerCab_struct * pad);
+void PerCabMultiCartPressed(PerCab_struct * pad);
+void PerCabMultiCartReleased(PerCab_struct * pad);
+void PerCabPausePressed(PerCab_struct * pad);
+void PerCabPauseReleased(PerCab_struct * pad);
+void PerCabP2UpPressed(PerCab_struct * pad);
+void PerCabP2UpReleased(PerCab_struct * pad);
+void PerCabP2RightPressed(PerCab_struct * pad);
+void PerCabP2RightReleased(PerCab_struct * pad);
+void PerCabP2DownPressed(PerCab_struct * pad);
+void PerCabP2DownReleased(PerCab_struct * pad);
+void PerCabP2LeftPressed(PerCab_struct * pad);
+void PerCabP2LeftReleased(PerCab_struct * pad);
+void PerCabP2Button1Pressed(PerCab_struct * pad);
+void PerCabP2Button1Released(PerCab_struct * pad);
+void PerCabP2Button2Pressed(PerCab_struct * pad);
+void PerCabP2Button2Released(PerCab_struct * pad);
+void PerCabP2Button3Pressed(PerCab_struct * pad);
+void PerCabP2Button3Released(PerCab_struct * pad);
+void PerCabP2Button4Pressed(PerCab_struct * pad);
+void PerCabP2Button4Released(PerCab_struct * pad);
+void PerCabP2Button5Pressed(PerCab_struct * pad);
+void PerCabP2Button5Released(PerCab_struct * pad);
+void PerCabP2Button6Pressed(PerCab_struct * pad);
+void PerCabP2Button6Released(PerCab_struct * pad);
+#endif /* __LIBRETRO__ */
+
+#if defined (__cplusplus)
+}
+#endif
+
+#endif

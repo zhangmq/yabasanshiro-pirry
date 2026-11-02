@@ -320,7 +320,7 @@ int PERLIBRETROInit(void)
       current_key_config_nb = STV_KEYCFG_NB(stv_key_config);
       current_key_config = stv_key_config;
       PerPortReset();
-      controller = NULL;   /* PORT: the multi-cabinet type is not ported (no PerCab in this tree) */
+      controller = (void*)PerCabAdd(NULL);   /* JAMMA cabinet: keys write IOPORT[] */
       for (i = 0; i < (uint32_t)system_key_config_nb; i++)
          PerSetKey(system_key_config[i].key, system_key_config[i].key, controller);
       for (i = 0; i < (uint32_t)current_key_config_nb; i++)

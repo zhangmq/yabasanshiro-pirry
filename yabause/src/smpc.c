@@ -45,6 +45,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdlib.h>
 #include <time.h>
 #include "smpc.h"
+#include "eeprom.h"
 #include "cs2.h"
 #include "debug.h"
 #include "peripheral.h"
@@ -69,6 +70,15 @@ u8 * SmpcRegsT;
 SmpcInternal * SmpcInternalVars = NULL;
 int intback_wait_for_line = 0;
 u8 bustmp = 0;
+
+#ifdef __LIBRETRO__
+/* ST-V: the 68k is started/stopped through PDR2 bit 0x10, and the ST-V BIOS
+   bit-bangs its EEPROM through PDR1 (Kronos smpc.c).  Both read paths need the
+   last value the guest wrote, so keep the two latches here.  Libretro-only:
+   the standalone does not build stv.c/eeprom.c. */
+static u8 m_pdr1_readback = 0;
+static u8 m_pdr2_readback = 0;
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -161,6 +171,16 @@ void SmpcReset(void) {
 
    memset((void *)&SmpcInternalVars->port1, 0, sizeof(PortData_struct));
    memset((void *)&SmpcInternalVars->port2, 0, sizeof(PortData_struct));
+
+   if (yabsys.isSTV) {
+      /* Kronos sets this in SmpcReset; without it OREG[31] stays 0 after the
+         memset and the ST-V BIOS never sees the 0xD it polls for at 0x220. */
+      SmpcRegs->OREG[31] = 0xD;
+#ifdef __LIBRETRO__
+      m_pdr1_readback = 0;
+      m_pdr2_readback = 0;
+#endif
+   }
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -189,14 +209,15 @@ static void SmpcSSHOFF(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcSNDON(void) {
-   M68KStart();
+   /* On ST-V the 68k wire is controlled by PDR2 (see case 0x77 / 0x18). */
+   if (!yabsys.isSTV) M68KStart();
    SmpcRegs->OREG[31] = 0x6;
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void SmpcSNDOFF(void) {
-   M68KStop();
+   if (!yabsys.isSTV) M68KStop();
    SmpcRegs->OREG[31] = 0x7;
 }
 
@@ -570,11 +591,14 @@ void SmpcExec(s32 t) {
 
       SmpcInternalVars->timing -= t;
       if (SmpcInternalVars->timing <= 0) {
-         /* OREG31 mirrors COMREG for every command (Ymir) */
-         SmpcRegs->OREG[31] = SmpcRegs->COMREG;
+         /* OREG31 mirrors COMREG for every command (Ymir).  On ST-V Kronos
+            leaves OREG31 to the command handlers: the BIOS polls it at 0x220 for
+            0xD, the game later for the 0x10/0x17/0x18/0x19/0x1A handshake. */
+         if (!yabsys.isSTV) SmpcRegs->OREG[31] = SmpcRegs->COMREG;
          switch(SmpcRegs->COMREG) {
             case 0x0:
                SMPCLOG("smpc\t: MSHON not implemented\n");
+               if (yabsys.isSTV) SmpcRegs->OREG[31] = 0x0;
                break;
             case 0x2:
                SMPCLOG("smpc\t: SSHON\n");
@@ -600,6 +624,9 @@ void SmpcExec(s32 t) {
                break;
             case 0xD:
                SMPCLOG("smpc\t: SYSRES not implemented\n");
+               /* Kronos: the SMPC registers survive SYSRES and OREG[31] becomes
+                  0x0D, which the next boot check at 0xd24 accepts. */
+               if (yabsys.isSTV) SmpcRegs->OREG[31] = 0xD;
                break;
             case 0xE:
                SMPCLOG("smpc\t: CKCHG352\n");
@@ -643,6 +670,37 @@ void SmpcExec(s32 t) {
 
 u8 FASTCALL SmpcReadByte(u32 addr) {
    addr &= 0x7F;
+#ifdef __LIBRETRO__
+   if (yabsys.isSTV) {
+      if (addr == 0x05F) {
+         /* Return the real OREG[31].  A hardcoded 0xF0 here (the old hack) made
+            the BIOS boot but masked every handshake value the game polls for
+            (0x10/0x17/0x18/0x19/0x1A), so coin credits never updated. */
+         return SmpcRegs->OREG[31];
+      }
+      if (addr == 0x077) {
+         /* Kronos reads the EEPROM DO bit through PDR2, not PDR1: when DDR2 is
+            0x18 the byte carries eeprom_do_read() in bit 0.  Without it the
+            BIOS mirrors an always-zero DO line into 0x0600065A and spins. */
+         if ((SmpcRegs->DDR[1] & 0x7F) == 0x18) {
+            return (u8)((((0x67 & ~0x19) | 0x18 | (eeprom_do_read() << 0)) & ~SmpcRegs->DDR[1]) | m_pdr2_readback);
+         }
+      }
+      else if (addr == 0x075) {
+         /* PDR1 read-back while the BIOS bit-bangs the EEPROM (DDR1 = 0x3f). */
+         if ((SmpcRegs->DDR[0] & 0x7F) == 0x3f) {
+            return (u8)((((0x40 & 0x40) | 0x3f) & ~SmpcRegs->DDR[0]) | m_pdr1_readback);
+         }
+      }
+      else if (addr == 0x063) {
+         /* Kronos semantics: return the register array byte with SF in bit 0,
+            not the last byte written to any SMPC register. */
+         bustmp = SmpcRegsT[addr >> 1] & 0xFE;
+         bustmp |= SmpcRegs->SF;
+         return bustmp;
+      }
+   }
+#endif
    if (addr == 0x063) {
      bustmp &= ~0x01;
      bustmp |= SmpcRegs->SF;
@@ -824,18 +882,47 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 
                SmpcRegs->PDR[0] = val;
                break;
+#ifdef __LIBRETRO__
+            case 0x3f: /* EEPROM bit-bang.  ST-V needs it: the BIOS polls the DO
+                          line and spins forever when it never reads 1. */
+               if (yabsys.isSTV) {
+                  m_pdr1_readback = (val & SmpcRegs->DDR[0]) & 0x7f;
+                  eeprom_set_clk((val & 0x08) ? 1 : 0);
+                  eeprom_set_di((val >> 4) & 1);
+                  eeprom_set_cs((val & 0x04) ? 1 : 0);
+                  SmpcRegs->PDR[0] = m_pdr1_readback;
+                  m_pdr1_readback |= (val & 0x80);
+                  break;
+               }
+               /* fall through */
+#endif
             default:
                SMPCLOG("smpc\t: Peripheral Unknown Control Method not implemented\n");
                break;
          }
 			break;
-	  case 0x77: // PDR1
+	  case 0x77: // PDR2
 		  // FIX ME (should support other peripherals)
 		  switch (SmpcRegs->DDR[1] & 0x7F) { // Which Control Method do we use?
 		  case 0x00:
 			  if (PORTDATA2.data[1] == PERGUN && (val & 0x7F) == 0x7F)
 				  SmpcRegs->PDR[1] = PORTDATA2.data[2];
 			  break;
+#ifdef __LIBRETRO__
+		  case 0x18: /* ST-V sound-CPU wire: PDR2 bit 0x10 stops the 68k */
+			  if (yabsys.isSTV) {
+				  m_pdr2_readback = (val & SmpcRegs->DDR[1]) & 0x7F;
+				  if (m_pdr2_readback & 0x10) {
+					  M68KStop();
+				  } else {
+					  M68KStart();
+				  }
+				  SmpcRegs->PDR[1] = m_pdr2_readback;
+				  m_pdr2_readback |= val & 0x80;
+				  break;
+			  }
+			  /* fall through */
+#endif
 		  case 0x60:
 			  switch (val & 0x60) {
 			  case 0x60: // 1st Data

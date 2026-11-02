@@ -50,6 +50,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <ctype.h>
 
 #include "memory.h"
+#ifdef __LIBRETRO__
+#include "peripheral.h"   /* ST-V IOGA (JAMMA) port hooks */
+#endif
 #include "coffelf.h"
 #include "cs0.h"
 #include "cs1.h"
@@ -644,6 +647,18 @@ void MappedMemoryInit()
                                 &LowWramMemoryWriteByte,
                                 &LowWramMemoryWriteWord,
                                 &LowWramMemoryWriteLong);
+#ifdef __LIBRETRO__
+   /* ST-V IOGA ports (JAMMA cabinet inputs).  Without this mapping the whole
+      0x040 area falls through to Unhandled* and the BIOS reads 0 -- i.e. every
+      active-low button (TEST included) looks pressed, so it sits in the
+      hardware-test menu instead of booting the cart. */
+   FillMemoryArea(0x040, 0x041, &IOPortReadByte,
+                                &IOPortReadWord,
+                                &UnhandledMemoryReadLong,
+                                &IOPortWriteByte,
+                                &UnhandledMemoryWriteWord,
+                                &UnhandledMemoryWriteLong);
+#endif
    FillMemoryArea(0x100, 0x17F, &UnhandledMemoryReadByte,
                                 &UnhandledMemoryReadWord,
                                 &UnhandledMemoryReadLong,
@@ -1321,6 +1336,11 @@ int MappedMemoryLoadExec(const char *filename, u32 pc)
 
 int LoadBios(const char *filename)
 {
+   /* On ST-V the ST-V BIOS is already in BiosRom (installed by stv.c); loading
+      the Saturn BIOS on top of it would clobber it.  Ported from
+      libretro/yabause@kronos. */
+   if (yabsys.isSTV)
+      return 0;
    return T123Load(BiosRom, 0x80000, 2, filename);
 }
 
