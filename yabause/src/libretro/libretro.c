@@ -30,6 +30,7 @@
 #include "peripheral.h"
 #include "cdbase.h"
 #include "yabause.h"
+#include "threads.h"
 #include "yui.h"
 #include "cheat.h"
 
@@ -3767,9 +3768,10 @@ static void *yab_emu_main(void *arg)
    (void)arg;
    /* PORT: match the standalone's machine-thread placement.  retro_arena/main.cpp
     * calls YabThreadSetAffinityRaw(0xFu) right before its emulation loop: the
-    * machine may use all four cores, while VdpProc is pinned to core 0
-    * (YabThreadSetCurrentThreadAffinityMask(0x1) at the top of VdpProc) and the
-    * SCSP thread to cores 0-1 (scsp.c).
+    * machine may use all four cores, while VdpProc is pinned to core 1
+    * (YabThreadSetCurrentThreadAffinityMask(0x1) at the top of VdpProc; the
+    * "core 0" in that comment is wrong -- the index API does 1 << mask), the
+    * VDP2 rotation thread to core 2 and the SCSP thread to core 3 (scsp.c).
     *
     * Our emu thread is a plain pthread_create() from the frontend's thread, so it
     * INHERITS whatever mask the frontend set for itself.  If that mask is narrow,
@@ -3778,9 +3780,15 @@ static void *yab_emu_main(void *arg)
     * depend on the renderer's progress (vdp2.cpp:1441-1459 sends ScuSendDrawEnd at
     * the line where the VDP1 walk happens to have finished; if it has not, the
     * check is retried 10 lines later), so a starved machine/renderer pair can put
-    * the game's frame swap on a different emulated line than the standalone's. */
-   { extern void YabThreadSetCurrentThreadAffinityMask(int mask);
-     YabThreadSetCurrentThreadAffinityMask(0xF); }
+    * the game's frame swap on a different emulated line than the standalone's.
+    *
+    * MUST be the raw variant: YabThreadSetCurrentThreadAffinityMask() takes a core
+    * INDEX (thr-rthreads.c does mask = 1 << mask), so the old call with 0xF became
+    * 1 << 15 -- CPU 15 on a 4-core device, sched_setaffinity EINVAL swallowed, no
+    * effect at all.  The libretro build used to lack the raw entry point (it lives
+    * in thr-linux.cpp, which only the standalone compiles); it is in
+    * thr-rthreads.c now. */
+   YabThreadSetAffinityRaw(0xFu);
 #ifdef YAB_HANGDBG
    printf("[DBGT] emu thread tid=%d\n", (int)syscall(SYS_gettid));
    fflush(stdout);

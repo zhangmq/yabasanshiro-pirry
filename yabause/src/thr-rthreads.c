@@ -200,6 +200,22 @@ void YabThreadSetCurrentThreadAffinityMask(int mask)
 #endif
 }
 
+/* Raw-mask variant of YabThreadSetCurrentThreadAffinityMask() (which takes a
+   core index and can only express a single core), so a thread can be given
+   several cores.  Same as the standalone's thr-linux.cpp version; the libretro
+   build compiles this file instead of thr-linux.cpp. */
+void YabThreadSetAffinityRaw(unsigned int mask_val)
+{
+#if defined(_WIN32)
+	SetThreadAffinityMask(GetCurrentThread(), (DWORD_PTR)mask_val);
+#elif !defined(ANDROID)
+	pid_t pid = syscall(SYS_gettid);
+	syscall(__NR_sched_setaffinity, pid, sizeof(mask_val), &mask_val);
+#else
+	(void)mask_val;
+#endif
+}
+
 int YabWaitEventQueue( YabEventQueue * queue_t )
 {
 	int value;
