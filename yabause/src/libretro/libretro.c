@@ -2509,6 +2509,29 @@ void check_variables(void)
       if (e && *e)
          yab_vdp1_fb_readback = (e[0] != '0');
    }
+
+   /* SCSP DSP.  On by default, matching the standalone's global "sound dsp"
+    * key (retro_arena/main.cpp:346).  With the DSP off, DSP-only slots are
+    * output dry through DspPassthrough() and the effect return disappears.
+    * Applied live: scsp.c re-reads g_scsp_dsp_off on every sample
+    * (scsp.c:1593), which is also how the standalone menu toggles it. */
+   var.key = "yabasanshiro_sound_dsp";
+   var.value = NULL;
+   {
+      extern int g_scsp_dsp_off;      /* scsp.c: 1 = DSP off, 0 = on */
+      /* Default ON: scsp.c ships with 1 (off) because only the standalone's
+       * main.cpp sets it, and a frontend that answers the query with NULL (no
+       * saved option yet) must not silently fall back to the cheaper path. */
+      g_scsp_dsp_off = 0;
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         g_scsp_dsp_off = (strcmp(var.value, "disabled") == 0) ? 1 : 0;
+      /* YAB_SOUND_DSP=0|1 for the headless harness, which has no core options. */
+      {
+         const char *e = getenv("YAB_SOUND_DSP");
+         if (e && *e)
+            g_scsp_dsp_off = (e[0] == '0') ? 1 : 0;
+      }
+   }
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)

@@ -113,6 +113,20 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       "100"
    },
 {
+      "yabasanshiro_sound_dsp",
+      "Sound DSP",
+      NULL,
+      "Run the SCSP's DSP: the reverb/effect return, and the only sound source of DSP-only slots. 'Disabled' outputs those slots dry through the passthrough path and runs cooler. The standalone exposes the same switch as its global 'sound dsp' key (on by default). Applied live.",
+      NULL,
+      "system",
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+{
       "yabasanshiro_vdp1_fb_readback",
       "VDP1 Framebuffer Readback",
       NULL,
