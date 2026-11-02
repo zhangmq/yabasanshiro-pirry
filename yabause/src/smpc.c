@@ -497,7 +497,20 @@ static void SmpcINTBACKPeripheral(void) {
 
 static void SmpcINTBACK(void) {
    SmpcRegs->SF = 1;
-   if (SmpcInternalVars->intback) {
+   if (yabsys.isSTV) {
+      /* Kronos: while the game is in a continuous (peripheral) INTBACK keep
+         returning pad data.  The old "intback" gate is cleared by
+         SmpcINTBACKEnd() at every INTBACK end, so it goes silent exactly when
+         the game asks again -- measured on the ST-V side as ZERO peripheral
+         responses, and the game then falls back to register polling, where
+         START never arrives.  Saturn keeps the old gate below. */
+      if (SmpcInternalVars->firstPeri == 1) {
+         SmpcINTBACKPeripheral();
+         ScuSendSystemManager();
+         return;
+      }
+   }
+   else if (SmpcInternalVars->intback) {
       SmpcINTBACKPeripheral();
       ScuSendSystemManager();
       return;
@@ -505,10 +518,14 @@ static void SmpcINTBACK(void) {
 
    //we think rayman sets 0x40 so that it breaks the intback command immediately when it blocks, 
    //rather than having to set 0x40 in response to an interrupt
-   /* status report only when IREG0 == 1, not for any value with bit 0 set (Ymir) */
-   if ((SmpcInternalVars->intbackIreg0 = (SmpcRegs->IREG[0] == 1))) {
+   /* ST-V: status report for any IREG[0] with bit 0 set (SMPC doc table 3.2,
+      as Kronos); Saturn keeps "only exactly 1" (Ymir). */
+   SmpcInternalVars->intbackIreg0 = yabsys.isSTV ? (SmpcRegs->IREG[0] & 1)
+                                                : (SmpcRegs->IREG[0] == 1);
+   if (SmpcInternalVars->intbackIreg0) {
       // Return non-peripheral data
-      SmpcInternalVars->firstPeri = 1;
+      /* ST-V: firstPeri only when the program asked for peripheral data too. */
+      SmpcInternalVars->firstPeri = yabsys.isSTV ? ((SmpcRegs->IREG[1] & 0x8) >> 3) : 1;
       SmpcInternalVars->intback = (SmpcRegs->IREG[1] & 0x8) >> 3; // does the program want peripheral data too?
       SmpcINTBACKStatus();
       SmpcRegs->SR = 0x4F | (SmpcInternalVars->intback << 5); // the low nibble is undefined(or 0xF)
@@ -773,6 +790,10 @@ static void SmpcSetTiming(void) {
             }
             else {
               SMPCLOG("smpc\t: unimplemented command: %02X\n", SmpcRegs->COMREG);
+              /* ST-V (Kronos): any other IREG[0] still needs a timing, or
+                 SmpcExec() never runs the command and the game spins on
+                 SR/SF.  Games ask with IREG[0] = 0xFF/0x80. */
+              if (yabsys.isSTV) SmpcInternalVars->timing = 250;
               SmpcRegs->SF = 0;
             }
          }
@@ -829,17 +850,29 @@ void FASTCALL SmpcWriteByte(u32 addr, u8 val) {
 
    switch(addr) {
       case 0x01: // Maybe an INTBACK continue/break request
-         if (SmpcInternalVars->intback)
+         /* ST-V follows Kronos: gate on firstPeri/timing, clear SF on break and
+            do not rewrite COMREG on continue.  The Saturn path keeps the old
+            "intback" gate.  IREG[0] & 0x40 also catches 11xxxxxx, which the
+            hardware treats as a break (cotton2 writes IREG[0] = 0xFF). */
+         if (yabsys.isSTV
+               ? ((SmpcInternalVars->firstPeri != 0) && (SmpcInternalVars->timing <= 0))
+               : (SmpcInternalVars->intback != 0))
          {
             if (SmpcRegs->IREG[0] & 0x40) {
                // Break
-               SmpcInternalVars->intback = 0;
+               if (yabsys.isSTV) {
+                  SmpcInternalVars->firstPeri = 0;
+                  SmpcRegs->SF = 0;
+               }
+               else
+                  SmpcInternalVars->intback = 0;
                SmpcRegs->SR &= 0x0F;
                break;
             }
-            else if (SmpcRegs->IREG[0] & 0x80) {                    
+            else if (SmpcRegs->IREG[0] & 0x80) {
                // Continue
-               SmpcRegs->COMREG = 0x10;
+               if (!yabsys.isSTV)
+                  SmpcRegs->COMREG = 0x10;
                SmpcSetTiming();
                SmpcRegs->SF = 1;
             }
