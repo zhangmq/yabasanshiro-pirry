@@ -3856,8 +3856,8 @@ static void yab_state_service(void)
    if (req == 1)
    {
       int err = YabLoadStateBuffer(yab_st_load_buf, yab_st_load_size);
-      YAB_TR_L1("[STATE] load %lu bytes -> %s (68k PC=%08X SR=%04X)\n",
-                (unsigned long)yab_st_load_size, err == 0 ? "ok" : "FAILED",
+      YAB_TR_L1("[STATE] load %lu bytes -> %s err=%d (68k PC=%08X SR=%04X)\n",
+                (unsigned long)yab_st_load_size, err == 0 ? "ok" : "FAILED", err,
                 (unsigned)(M68K->GetPC()), (unsigned)(M68K->GetSR()));
       if (err == 0)
       {
