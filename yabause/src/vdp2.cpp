@@ -144,6 +144,9 @@ static int framestoskip = 0;
 static int framesskipped = 0;
 static int skipnextframe = 0;
 static int previous_skipped = 0;
+/* Set while VIDCore's Vdp2Draw* entry points are the VIDDummy ones (a skipped
+ * field).  File scope so that turning the option off mid-run can restore them. */
+static VideoInterface_struct * g_vid_saved = NULL;
 /* signed, so that a clock running backwards does not produce a huge difference; a negative
    difference is treated as "no backlog" below */
 static s64 curticks = 0;
@@ -1907,8 +1910,38 @@ void vdp2ReqRestore() {
 
 
 //////////////////////////////////////////////////////////////////////////////
+/* Take the VIDDummy entry points back out.  Single place: the skip path in
+ * vdp2VBlankOUT() and DisableAutoFrameSkip() both need it, and leaving the
+ * dummies installed makes every later field a no-op (no compose, no present). */
+static void vdp2_restore_vidcore(void)
+{
+  VideoInterface_struct * saved = g_vid_saved;
+  g_vid_saved = NULL;
+  previous_skipped = 0;
+  skipnextframe = 0;
+  framestoskip = 0;
+  if (saved == NULL)
+    return;
+  if (VIDCore->id == VIDCORE_VULKAN) {
+#if defined(HAVE_VULKAN)
+    VIDCore->Vdp2DrawStart = VIDVulkanVdp2DrawStart;
+    VIDCore->Vdp2DrawEnd = VIDVulkanVdp2DrawEnd;
+    VIDCore->Vdp2DrawScreens = VIDVulkanVdp2DrawScreens;
+#endif
+  }
+  else if (VIDCore->id == VIDCORE_OGL) {
+    VIDCore->Vdp2DrawStart = VIDOGLVdp2DrawStart;
+    VIDCore->Vdp2DrawEnd = VIDOGLVdp2DrawEnd;
+    VIDCore->Vdp2DrawScreens = VIDOGLVdp2DrawScreens;
+  }
+  else if (VIDCore->id == VIDCORE_SOFT) {
+    VIDCore->Vdp2DrawStart = VIDSoftVdp2DrawStart;
+    VIDCore->Vdp2DrawEnd = VIDSoftVdp2DrawEnd;
+    VIDCore->Vdp2DrawScreens = VIDSoftVdp2DrawScreens;
+  }
+}
+
 void vdp2VBlankOUT(void) {
-  static VideoInterface_struct * saved = NULL;
   int isrender = 0;
 #if PROFILE_RENDERING
   u64 starttime = YabauseGetTicks();
@@ -1946,7 +1979,7 @@ void vdp2VBlankOUT(void) {
   /* Under constant load the throttle skips strictly every second frame, always in the same phase, so a
      sprite toggled frame by frame (blinking) would vanish completely. After every ps_n executed skips
      one is not executed, so two frames in a row are shown and the phase rotates. */
-  if (skipnextframe && (!saved)) {
+  if (skipnextframe && (!g_vid_saved)) {
     static int ps_n = -1;
     static int ps_sequence = 0;
     if (ps_n < 0) {
@@ -1958,10 +1991,10 @@ void vdp2VBlankOUT(void) {
     }
   }
 
-  if (skipnextframe && (!saved))
+  if (skipnextframe && (!g_vid_saved))
   {
     skipped_frame++;
-    saved = VIDCore;
+    g_vid_saved = VIDCore;
     
     previous_skipped = 1;
     VIDCore->Vdp2DrawStart = VIDDummy.Vdp2DrawStart;
@@ -1969,32 +2002,12 @@ void vdp2VBlankOUT(void) {
     VIDCore->Vdp2DrawScreens = VIDDummy.Vdp2DrawScreens;
 
   }
-  else if (saved && (!skipnextframe))
+  else if (g_vid_saved && (!skipnextframe))
   {
     skipnextframe = 0;
     previous_skipped = 0;
     //VIDCore = saved;
-    if( saved != NULL ){
-
-      if (VIDCore->id == VIDCORE_VULKAN) {
-#if defined(HAVE_VULKAN)
-        VIDCore->Vdp2DrawStart = VIDVulkanVdp2DrawStart;
-        VIDCore->Vdp2DrawEnd = VIDVulkanVdp2DrawEnd;
-        VIDCore->Vdp2DrawScreens = VIDVulkanVdp2DrawScreens;
-#endif
-      }
-      else if (VIDCore->id == VIDCORE_OGL) {
-        VIDCore->Vdp2DrawStart = VIDOGLVdp2DrawStart;
-        VIDCore->Vdp2DrawEnd = VIDOGLVdp2DrawEnd;
-        VIDCore->Vdp2DrawScreens = VIDOGLVdp2DrawScreens;
-      }
-      else if (VIDCore->id == VIDCORE_SOFT ) {
-        VIDCore->Vdp2DrawStart = VIDSoftVdp2DrawStart;
-        VIDCore->Vdp2DrawEnd = VIDSoftVdp2DrawEnd;
-        VIDCore->Vdp2DrawScreens = VIDSoftVdp2DrawScreens;
-      }
-    }
-    saved = NULL;
+    vdp2_restore_vidcore();
   }
 
   VIDCore->Vdp2DrawStart();
@@ -3293,6 +3306,10 @@ void ToggleFullScreen(void)
 void EnableAutoFrameSkip(void)
 {
    autoframeskipenab = 1;
+   /* Fresh accounting: no half-finished skip carried over from the last time. */
+   skipnextframe = 0;
+   framestoskip = 0;
+   previous_skipped = 0;
    lastticks = YabauseGetTicks();
 }
 
@@ -3301,6 +3318,13 @@ void EnableAutoFrameSkip(void)
 void DisableAutoFrameSkip(void)
 {
    autoframeskipenab = 0;
+   /* Turning the option off while a field is skipped used to leave VIDCore's
+    * Vdp2Draw* pointing at VIDDummy (the restore branch in vdp2VBlankOUT only
+    * runs for !skipnextframe): every later field then composed nothing and the
+    * frontend got no picture -- a live toggle crashed the menu path
+    * (measured).  Restore first, then clear the counters. */
+   vdp2_restore_vidcore();
+   framestoskip = 0;
 }
 
 
