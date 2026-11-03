@@ -2448,8 +2448,10 @@ void check_variables(void)
       if (applied != g_frameskip)
       {
          applied = g_frameskip;
-         if (g_frameskip) EnableAutoFrameSkip();
-         else             DisableAutoFrameSkip();
+         /* Applied by the machine thread at its next VOUT: it is the only thread
+          * that rewrites VIDCore->Vdp2Draw*, so the request must not be applied
+          * here (live toggle used to crash). */
+         { extern void Vdp2SetFrameSkipEnabled(int); Vdp2SetFrameSkipEnabled(g_frameskip); }
       }
    }
 

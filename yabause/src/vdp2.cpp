@@ -151,6 +151,31 @@ static int previous_skipped = 0;
  * quit from the frontend's menu froze on pthread_join (measured). */
 static volatile int g_join_abort = 0;
 extern "C" void Vdp2AbortJoins(int on) { g_join_abort = on; }
+
+/* Frameskip is applied HERE, on the machine thread, and only here.
+ *
+ * The option handler runs on the frontend's thread (check_variables in
+ * retro_run) and EnableAutoFrameSkip()/DisableAutoFrameSkip() rewrite
+ * VIDCore->Vdp2Draw{Start,End,Screens}; the dummies are installed and removed
+ * by vdp2VBlankOUT(), i.e. by the machine.  Rewriting those pointers from the
+ * other thread meant the machine could call a half-installed table (this is the
+ * live-toggle crash).  Both the switch and the per-field decision are therefore
+ * turned into requests and applied at the top of vdp2VBlankOUT(). */
+static volatile int g_fs_enable_req = -1;   /* -1 = not requested yet */
+static volatile int g_fs_applied    = -1;
+static volatile int g_fs_decide_req = 0;
+
+extern "C" void Vdp2SetFrameSkipEnabled(int on)
+{
+  g_fs_enable_req = on ? 1 : 0;
+}
+
+/* Called from the caller's thread (Vdp2FrameSkipDecide): record the decision,
+ * never touch the skip state itself. */
+extern "C" void Vdp2RequestFrameSkip(void)
+{
+  g_fs_decide_req = 1;
+}
 /* Shutdown helper: drop pending dispatch events without rendering them, so a
  * machine thread blocked in YabAddEventQueue (the queue holds 32 and nothing
  * consumes it once retro_run stops) can finish.  The frontend calls this while
@@ -1222,10 +1247,7 @@ extern "C" void Vdp2FrameSkipDecide(void)
   if (!autoframeskipenab)
     return;
   if (yab_core_behind)
-  {
-    skipnextframe = 1;
-    framestoskip = 1;
-  }
+    Vdp2RequestFrameSkip();
 }
 
 void frameSkipAndLimit() {
@@ -1965,6 +1987,27 @@ static void vdp2_restore_vidcore(void)
 }
 
 void vdp2VBlankOUT(void) {
+  /* Frameskip switch + decision are applied here, on the machine thread: it is
+   * the only thread that rewrites VIDCore->Vdp2Draw* (see the block below). */
+  {
+    if (g_fs_applied < 0)
+      g_fs_applied = autoframeskipenab ? 1 : 0;
+    if (g_fs_enable_req >= 0 && g_fs_enable_req != g_fs_applied)
+    {
+      g_fs_applied = g_fs_enable_req;
+      if (g_fs_applied) EnableAutoFrameSkip();
+      else              DisableAutoFrameSkip();
+    }
+    if (g_fs_decide_req)
+    {
+      g_fs_decide_req = 0;
+      if (autoframeskipenab)
+      {
+        skipnextframe = 1;
+        framestoskip = 1;
+      }
+    }
+  }
   int isrender = 0;
 #if PROFILE_RENDERING
   u64 starttime = YabauseGetTicks();
