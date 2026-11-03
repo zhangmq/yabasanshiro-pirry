@@ -144,6 +144,13 @@ static int framestoskip = 0;
 static int framesskipped = 0;
 static int skipnextframe = 0;
 static int previous_skipped = 0;
+/* Set while the core is shutting the machine down.  Both joins below wait for
+ * a retire that only the VDP workflow consumer can produce; in the single-path
+ * model that consumer is retro_run, and the frontend stops calling it before
+ * context_destroy -> yab_emu_stop() joins the machine thread.  Without this the
+ * quit from the frontend's menu froze on pthread_join (measured). */
+static volatile int g_join_abort = 0;
+extern "C" void Vdp2AbortJoins(int on) { g_join_abort = on; }
 /* Set while VIDCore's Vdp2Draw* entry points are the VIDDummy ones (a skipped
  * field).  File scope so that turning the option off mid-run can restore them. */
 static VideoInterface_struct * g_vid_saved = NULL;
@@ -198,6 +205,7 @@ static int g_vin_decoupled = -1;
 static int vin_render_pending = 0;
 
 static void Vdp2JoinPendingVIN(void) {
+  if (g_join_abort) { vin_render_pending = 0; return; }
   if (vin_render_pending) {
     YabWaitEventQueue(rcv_evqueue);
     vin_render_pending = 0;
@@ -276,6 +284,7 @@ static void Vdp1MarkRenderRetired(void) {
  * one-field lead needs double-buffered snapshots, which is a separate change;
  * until then the joins stay as they are. */
 static void Vdp1JoinPendingRenders(void) {
+  if (g_join_abort) return;
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_retired.load(std::memory_order_acquire) >=
         vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
@@ -283,7 +292,8 @@ static void Vdp1JoinPendingRenders(void) {
     }
   }
   pthread_mutex_lock(&vdp1_join_mtx);
-  while (vdp1_ev_retired.load(std::memory_order_acquire) <
+  while (!g_join_abort &&
+         vdp1_ev_retired.load(std::memory_order_acquire) <
          vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
     pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
   }
@@ -301,6 +311,7 @@ static void Vdp1JoinPendingRenders(void) {
  * only when no reader is active. */
 static void Vdp1JoinPendingRendersLead(void) {
   if (!vdp_on_caller) { Vdp1JoinPendingRenders(); return; }
+  if (g_join_abort) return;
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_dispatched.load(std::memory_order_relaxed) -
         vdp1_ev_retired.load(std::memory_order_acquire) < 2) {
@@ -308,7 +319,8 @@ static void Vdp1JoinPendingRendersLead(void) {
     }
   }
   pthread_mutex_lock(&vdp1_join_mtx);
-  while (vdp1_ev_dispatched.load(std::memory_order_relaxed) -
+  while (!g_join_abort &&
+         vdp1_ev_dispatched.load(std::memory_order_relaxed) -
          vdp1_ev_retired.load(std::memory_order_acquire) >= 2) {
     pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
   }

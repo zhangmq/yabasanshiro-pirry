@@ -6,7 +6,14 @@
  *  - VDP1 framebuffer readback and the CPU-clock option are not ported. */
 #include "yabause.h"
 
-void yab_frame_abort(void) {}
+void yab_frame_abort(void)
+{
+   /* The machine may be blocked in one of vdp2.cpp's dispatch joins, waiting
+    * for a retire that only retro_run produces; the frontend calls nothing
+    * after context_destroy starts, so those waits must be released here. */
+   extern void Vdp2AbortJoins(int);
+   Vdp2AbortJoins(1);
+}
 void yab_frame_resume(void) {}
 void YabSetRenderThread(void) {}
 void YabauseApplyCpuClock(void) {}

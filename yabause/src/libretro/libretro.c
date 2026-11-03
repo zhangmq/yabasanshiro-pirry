@@ -3987,6 +3987,7 @@ static void yab_emu_stop(void)
    yab_emu_running = 0;
    yab_emu_paused = 0;
    pthread_join(yab_emu_tid, NULL);
+   { extern void Vdp2AbortJoins(int); Vdp2AbortJoins(0); }
    yab_emu_parked = 1;
 }
 
