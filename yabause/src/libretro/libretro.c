@@ -3951,30 +3951,34 @@ int yab_core_behind = 0;
 
 static void yab_pace_field(u64 t_entry_ns)
 {
-   static u64 gap_ns, t_prev_exit_ns;
+   /* Pace ENTRY to ENTRY, not "core work + sleep".
+    *
+    * The previous version targeted `entry + period - gap`, where gap was the
+    * measured frontend present cost.  That double-counts as soon as the
+    * frontend's swap starts blocking on vsync: the swap already provides the
+    * period, so our sleep pushed the entry-to-entry interval past it (measured
+    * 59.1-59.8 instead of 60.0).  Targeting the NEXT ENTRY directly is exact
+    * whatever spends the time: machine, rendering, present or swap.
+    *
+    * Fully conditional: when the loop already used the period, the deadline has
+    * passed and nothing sleeps -- there is no unconditional sleep here. */
+   static u64 next_entry_ns;
    struct timespec ts;
-   u64 now_ns, period_ns, budget_ns, deadline_ns;
+   u64 now_ns, period_ns;
    clock_gettime(CLOCK_MONOTONIC, &ts);
    now_ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
    period_ns = (u64)(1000000000.0 / (yabsys.IsPal ? 50.0 : 60.0));
-   if (t_prev_exit_ns && t_entry_ns > t_prev_exit_ns)
+   if (next_entry_ns == 0 || t_entry_ns > next_entry_ns + 2 * period_ns)
+      next_entry_ns = t_entry_ns;
+   next_entry_ns += period_ns;
+   yab_core_behind = (now_ns > next_entry_ns + period_ns / 2) ? 1 : 0;
+   if (next_entry_ns > now_ns)
    {
-      u64 g = t_entry_ns - t_prev_exit_ns;
-      if (g < period_ns)                    /* longer means a stall, not a cost */
-         gap_ns = gap_ns ? (gap_ns * 3 + g) / 4 : g;
-   }
-   budget_ns = period_ns > gap_ns ? period_ns - gap_ns : period_ns / 2;
-   deadline_ns = t_entry_ns + budget_ns;
-   yab_core_behind = (now_ns > deadline_ns + period_ns / 2) ? 1 : 0;
-   if (deadline_ns > now_ns)
-   {
-      u64 d = deadline_ns - now_ns;
+      u64 d = next_entry_ns - now_ns;
       ts.tv_sec = (time_t)(d / 1000000000ull);
       ts.tv_nsec = (long)(d % 1000000000ull);
       nanosleep(&ts, NULL);
    }
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   t_prev_exit_ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
 
 static void yab_emu_start(void)
