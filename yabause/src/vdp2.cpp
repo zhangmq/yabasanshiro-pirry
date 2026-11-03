@@ -3397,6 +3397,7 @@ void DisableAutoFrameSkip(void)
 
 void VdpResume( void ){
 #if defined(YAB_ASYNC_RENDERING)
+  if (vdp_on_caller) return;      /* see VdpRevoke() */
 	YabAddEventQueue(evqueue,VDPEV_MAKECURRENT);
   YabWaitEventQueue(command_);
 #endif
@@ -3404,6 +3405,12 @@ void VdpResume( void ){
 
 void VdpRevoke( void ){
 #if defined(YAB_ASYNC_RENDERING)
+  /* Caller mode: the context never leaves the presenting thread, so there is
+   * nobody to revoke it from -- and the event below is only acknowledged by
+   * VdpProc, which does not exist here.  Waiting for that ack deadlocked the
+   * frontend inside every savestate load / resolution change (device: process
+   * alive, log stops right after RA_loadGame). */
+  if (vdp_on_caller) return;
 	YabAddEventQueue(evqueue,VDPEV_REVOKE);
   YabWaitEventQueue(command_);
 #endif
