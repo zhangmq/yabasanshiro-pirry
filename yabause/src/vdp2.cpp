@@ -135,6 +135,9 @@ YabEventQueue * vdp1_rcv_evqueue = NULL;
 YabEventQueue * vout_rcv_evqueue = NULL;
 static u64 syncticks = 0;       // CPU time sync for real time.
 static int vdp_proc_running = 0;
+/* PORT: 1 = the VDP workflow is driven by the caller (libretro retro_run) instead
+ * of the VdpProc thread; declared here because the join helpers below use it. */
+static int vdp_on_caller = 0;
 YabMutex * vrammutex = NULL;
 int g_frame_count = 0;
 static int framestoskip = 0;
@@ -262,6 +265,13 @@ static void Vdp1MarkRenderRetired(void) {
   pthread_mutex_unlock(&vdp1_join_mtx);
 }
 
+/* The joins below assume ONE snapshot buffer (see vdp1.cpp): they must run
+ * before every dispatch or the renderer reads a buffer the machine is
+ * rewriting.  Caller mode cannot simply skip them -- measured (Daytona, 50 s):
+ * with the joins off the machine outruns retro_run, the pump then drains
+ * several fields per call, and the frontend fell from 59 fps to 16 fps.  A
+ * one-field lead needs double-buffered snapshots, which is a separate change;
+ * until then the joins stay as they are. */
 static void Vdp1JoinPendingRenders(void) {
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_retired.load(std::memory_order_acquire) >=
@@ -278,10 +288,49 @@ static void Vdp1JoinPendingRenders(void) {
 }
 
 
+/* Caller mode needs ONE field of lead at the VBlank-IN join: the caller drains
+ * VOUT(a) + VIN(a+1) in a single retro_run, so both events must already be
+ * queued when it runs.  With the strict join the machine stopped at
+ * VBlankIN(a+1) until VOUT(a) was retired, the caller got one event per call
+ * and only half the calls produced a picture (measured: M:60.0 P:30.0,
+ * "150 new, 150 dupe").  The VOUT *dispatch* keeps the strict join, and the
+ * retire now happens after the composition, so the snapshots are still copied
+ * only when no reader is active. */
+static void Vdp1JoinPendingRendersLead(void) {
+  if (!vdp_on_caller) { Vdp1JoinPendingRenders(); return; }
+  for (int i = 0; i < 2000; i++) {
+    if (vdp1_ev_dispatched.load(std::memory_order_relaxed) -
+        vdp1_ev_retired.load(std::memory_order_acquire) < 2) {
+      return;
+    }
+  }
+  pthread_mutex_lock(&vdp1_join_mtx);
+  while (vdp1_ev_dispatched.load(std::memory_order_relaxed) -
+         vdp1_ev_retired.load(std::memory_order_acquire) >= 2) {
+    pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+  }
+  pthread_mutex_unlock(&vdp1_join_mtx);
+}
+
 extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
 
 /* PORT: the libretro frontend thread waits for "the worker retired a field"
  * (retro_run -> video_cb); the counter itself stays private. */
+/* PORT (probe): queue depth, so [RP] in libretro.c can tell "nothing to render
+ * yet" (the machine is still emulating) from "rendering costs this much". */
+extern "C" int YabVdpQueueSize(void) {
+   return evqueue ? YaGetQueueSize(evqueue) : -1;
+}
+
+/* PORT: number of VDP1 framebuffer changes so far -- the counter the standalone's
+ * OSD shows as "vdp1=".  The Saturn's VDP1 runs far below the field rate (Daytona:
+ * 17-30/s against 60 fields/s), so this is the rate at which the picture really
+ * changes; the frontend is told so and re-presents the same frame in between. */
+extern "C" int YabVdp1FrameCount(void) {
+   extern int vdp1_frame;   /* defined further down (the OSD counter) */
+   return vdp1_frame;
+}
+
 extern "C" int YabVdp1RetiredCount(void) {
    return vdp1_ev_retired.load(std::memory_order_acquire);
 }
@@ -807,6 +856,82 @@ extern "C" int YabIsRenderThread(void)
   return (r != 0 && r == (unsigned long)pthread_self()) ? 1 : 0;
 }
 
+/* PORT: the same render workflow, driven by the caller's thread (libretro's
+ * retro_run) instead of a dedicated pthread.  The standalone presents from the
+ * render thread itself, so that thread owns the GL context; libretro presents on
+ * the thread that calls retro_run, so the workflow has to run there. */
+extern "C" void Vdp2SetOnCaller(int on) { vdp_on_caller = on; }
+
+/* Caller mode: drain exactly ONE field per call and never wait.
+ *
+ * Why bounded: the standalone is paced by SwapWindow (a blocking swap per
+ * field); the machine's joins then keep it at one field per present.  In
+ * retro_run the swap is replaced by a non-blocking video_cb, so nothing paced
+ * the machine any more and it free-ran faster than the frontend: the queue kept
+ * growing and each pump call drained 2-3 fields (measured: swap ran ahead of
+ * present by ~100, [RP] render 13-17 ms while one field's work is ~5 ms).
+ * Draining one field per call restores the standalone's shape with the frontend
+ * as the pacer: the machine blocks on its join until the next retro_run.
+ * Returns 1 when a VBLANK_IN (i.e. a picture) was consumed, 0 otherwise. */
+extern "C" int Vdp2DrainOneField(void)
+{
+  int got_picture = 0;
+  if (!vdp_on_caller || !evqueue)
+    return 0;
+  while (YaGetQueueSize(evqueue) > 0)
+  {
+    int ev = YabWaitEventQueue(evqueue);
+    struct timespec _ts0, _ts1;
+    clock_gettime(CLOCK_MONOTONIC, &_ts0);
+    switch (ev) {
+    case VDPEV_VBLANK_IN:
+      FrameProfileAdd("VIN start");
+      vdp2VBlankIN();
+      FrameProfileAdd("VIN end");
+      got_picture = 1;
+      break;
+    case VDPEV_VBLANK_OUT:
+      FrameProfileAdd("VOUT start");
+      vdp2VBlankOUT();
+      FrameProfileAdd("VOUT end");
+      /* Same point as the standalone (VdpProc's VBLANK_OUT case): the machine
+       * may go on with the next field's snapshot while this thread composes.
+       * Retiring at the end of the field instead made the machine wait for the
+       * composition and cost the caller a whole field (measured [RP]=21 ms). */
+      Vdp1MarkRenderRetired();
+      break;
+    case VDPEV_DIRECT_DRAW:
+      FrameProfileAdd("DirectDraw start");
+      Vdp1Draw();
+      VIDCore->Vdp1DrawEnd();
+      Vdp1External.frame_change_plot = 0;
+      FrameProfileAdd("DirectDraw end");
+      Vdp1RcvSignal();
+      Vdp1MarkRenderRetired();
+      break;
+    default:
+      break;
+    }
+    /* probe: the caller waits for the whole workflow here, so name any event
+     * that costs more than a few hundred microseconds. */
+    clock_gettime(CLOCK_MONOTONIC, &_ts1);
+    {
+      double _ms = (double)(_ts1.tv_sec - _ts0.tv_sec) * 1000.0 +
+                   (double)(_ts1.tv_nsec - _ts0.tv_nsec) / 1e6;
+      static int _n = 0;
+      if (_ms > 3.0 && _n < 400)
+      {
+        _n++;
+        fprintf(stderr, "[EV] code=%d took %.2f ms\n", ev, _ms);
+        fflush(stderr);
+      }
+    }
+    if (got_picture)
+      break;              /* one field per call: see the comment above */
+  }
+  return got_picture;
+}
+
 extern "C" void * VdpProc( void *arg ){
 
   int evcode;
@@ -834,7 +959,18 @@ extern "C" void * VdpProc( void *arg ){
     switch(evcode){
     case VDPEV_VBLANK_IN:
       FrameProfileAdd("VIN start");
-      vdp2VBlankIN();
+      {
+        struct timespec _w0, _w1;
+        clock_gettime(CLOCK_MONOTONIC, &_w0);
+        vdp2VBlankIN();
+        clock_gettime(CLOCK_MONOTONIC, &_w1);
+        {
+          double _ms = (double)(_w1.tv_sec - _w0.tv_sec) * 1000.0 +
+                       (double)(_w1.tv_nsec - _w0.tv_nsec) / 1e6;
+          static int _n = 0;
+          if (_ms > 3.0 && _n < 200) { _n++; fprintf(stderr, "[EVW] VIN took %.2f ms\n", _ms); fflush(stderr); }
+        }
+      }
       FrameProfileAdd("VIN end");
       break;
     case VDPEV_VBLANK_OUT:
@@ -1125,7 +1261,15 @@ void vdp2VBlankIN(void) {
    //if (Vdp1External.manualchange) Vdp1Regs->EDSR >>= 1;
 
    VIDCore->Vdp2DrawEnd();
-   frameSkipAndLimit();
+   /* The field clock lives in retro_run (yab_pace_field): it has to subtract the
+    * frontend's own present cost, which this function cannot see.  The engine
+    * limiter's accounting is kept for frameskip, its sleep is not. */
+   {
+     static int limit_on = -1;
+     if (limit_on < 0) limit_on = vdp_on_caller ? 0 : 1;
+     if (limit_on)
+       frameSkipAndLimit();
+   }
    VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would
       fire a second time. */
@@ -1149,11 +1293,17 @@ void Vdp2VBlankIN(void) {
   FRAMELOG("***** VIN *****");
 
 #if defined(YAB_ASYNC_RENDERING)
-  if( vdp_proc_running == 0 ){
+  if( vdp_proc_running == 0 && !vdp_on_caller ){
     vdp_proc_running = 1;
     YuiRevokeOGLOnThisThread();
     evqueue = YabThreadCreateQueue(32);
     YabThreadStart(YAB_THREAD_VDP, VdpProc, NULL);
+  }
+  else if (vdp_proc_running == 0 && vdp_on_caller)
+  {
+    /* Caller-driven: just create the queue; retro_run drains it. */
+    vdp_proc_running = 1;
+    evqueue = YabThreadCreateQueue(32);
   }
 
   if (g_vin_decoupled < 0) g_vin_decoupled = 1;   /* fixed on */
@@ -1169,7 +1319,7 @@ void Vdp2VBlankIN(void) {
        with Vdp1MarkRenderRetired() after Vdp2DrawScreens and does not include Vdp2DrawEnd,
        frameSkipAndLimit or Sync. This join is the only protection of the line scroll tables against
        the reading render thread; do not remove it. */
-    Vdp1JoinPendingRenders();   /* correctness join */
+    Vdp1JoinPendingRendersLead();   /* one field of lead in caller mode */
     g_tvmd_vin = Vdp2Regs->TVMD;   /* state before the game's VBlank routine */
     g_tvmd_vin_valid = 1;
     Vdp2Regs->TVSTAT |= 0x0008;
@@ -1402,10 +1552,18 @@ void Vdp2HBlankOUT(void) {
     }
 #if defined(YAB_ASYNC_RENDERING)
     if (vdp_proc_running == 0) {
-      YuiRevokeOGLOnThisThread();
+      /* The VOUT dispatch is the *other* place that can create the queue first
+       * (measured: on Daytona the machine reaches MaxLineCount before
+       * VBlankLineCount, so VOUT ran before any VBlankIN and started the
+       * worker even in caller mode -- two consumers on one queue, and the
+       * worker's GL had no context because the caller held it).  Same rule as
+       * VBlankIN: caller mode only creates the queue. */
       evqueue = YabThreadCreateQueue(32);
       vdp_proc_running = 1;
-      YabThreadStart(YAB_THREAD_VDP, VdpProc, NULL);
+      if (!vdp_on_caller) {
+        YuiRevokeOGLOnThisThread();
+        YabThreadStart(YAB_THREAD_VDP, VdpProc, NULL);
+      }
     }
     if (Vdp1External.swap_frame_buffer == 1)
     {

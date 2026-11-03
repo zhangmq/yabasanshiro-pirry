@@ -716,6 +716,9 @@ void YglTmPush(YglTextureManager *tm)
 
 void YglTmPull(YglTextureManager *tm, u32 flg)
 {
+#ifdef __LIBRETRO__
+  { extern int YuiEnsureGL(void); if (YuiEnsureGL() < 0) return; }
+#endif
   if (tm->texture == NULL)
   {
 
@@ -737,6 +740,12 @@ void YglTmPull(YglTextureManager *tm, u32 flg)
     }
     if (tm->texture_in[tm->current] == NULL)
     {
+#ifdef __LIBRETRO__
+      /* The atlas map is missing because a rebuild was deferred to the render
+       * thread (machine-side GL may not run).  Skip this field instead of
+       * aborting; the next field's realloc recreates it. */
+      return;
+#endif
       abort();
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -756,6 +765,9 @@ void YglTmPull(YglTextureManager *tm, u32 flg)
 
 void YglTMRealloc(YglTextureManager *tm, unsigned int width, unsigned int height)
 {
+#ifdef __LIBRETRO__
+  { extern int YuiEnsureGL(void); if (YuiEnsureGL() < 0) return; }
+#endif
 
   GLuint new_textureID[2];
   GLuint new_pixelBufferID[2];
@@ -1436,6 +1448,11 @@ int YglGenFrameBuffer()
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
   glFinish();
   glGetError();
+  /* PORT: the texture manager leaves a PIXEL_UNPACK_BUFFER bound; with one
+   * bound, glTexImage2D treats the NULL data as an offset into it and fails
+   * with GL_INVALID_OPERATION when that buffer is smaller than the image
+   * (measured: 0x502 on the VDP1 frame-buffer creation). */
+  glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
   if (_Ygl->vdp1FrameBuff[0] == 0)
   {
@@ -1445,12 +1462,22 @@ int YglGenFrameBuffer()
   glBindTexture(GL_TEXTURE_2D, _Ygl->vdp1FrameBuff[0]);
   if ((error = glGetError()) != GL_NO_ERROR)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1460 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
 
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _Ygl->width, _Ygl->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   if ((error = glGetError()) != GL_NO_ERROR)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1466 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1462,6 +1489,11 @@ int YglGenFrameBuffer()
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _Ygl->width, _Ygl->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   if ((error = glGetError()) != GL_NO_ERROR)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1477 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
 
@@ -1482,6 +1514,17 @@ int YglGenFrameBuffer()
     _Ygl->rboid_stencil = _Ygl->rboid_depth;
     if ((error = glGetError()) != GL_NO_ERROR)
     {
+#ifdef __LIBRETRO__
+      fprintf(stderr, "[FB] glRenderbufferStorage(%dx%d) failed: 0x%x\n",
+              _Ygl->width, _Ygl->height, (unsigned)error);
+      fflush(stderr);
+      return 0;
+#endif
+      #ifdef __LIBRETRO__
+      fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1503 gle=0x%x\n", (unsigned)error);
+      fflush(stderr);
+      return 0;
+      #endif
       abort();
     }
   }
@@ -1500,6 +1543,11 @@ int YglGenFrameBuffer()
     glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, _Ygl->width, _Ygl->height);
     if ((error = glGetError()) != GL_NO_ERROR)
     {
+      #ifdef __LIBRETRO__
+      fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1521 gle=0x%x\n", (unsigned)error);
+      fflush(stderr);
+      return 0;
+      #endif
       abort();
     }
   }
@@ -1515,6 +1563,11 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1536 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
@@ -1529,6 +1582,11 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1550 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
 
@@ -1552,6 +1610,11 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1573 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
 
@@ -1564,6 +1627,11 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
+    #ifdef __LIBRETRO__
+    fprintf(stderr, "[FB2] YglGenFrameBuffer fail at :1585 gle=0x%x\n", (unsigned)error);
+    fflush(stderr);
+    return 0;
+    #endif
     abort();
   }
 
@@ -4593,6 +4661,39 @@ static void EdgeBlack(int gw, int gh)
   glDisable(GL_SCISSOR_TEST);
 }
 
+#ifdef __LIBRETRO__
+/* probe: where the per-field composition time goes.  A = our retarget/query
+ * glue, B = YglUpdateVdp2Reg, C = the layer draw, D = tail (EdgeBlack + the
+ * frontend's swap stand-in).  Reported per 60 fields like [FT]/[RP]. */
+#include <time.h>
+static unsigned long long ygr_now(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)(ts.tv_nsec / 1000);
+}
+static unsigned long long ygr_acc[4];
+static unsigned ygr_n;
+static void ygr_add(int i, unsigned long long t0, unsigned long long t1)
+{
+  ygr_acc[i] += t1 - t0;
+}
+static void ygr_report(void)
+{
+  if (++ygr_n >= 60)
+  {
+    printf("[YGR] n=%u field: glue %.2f + regs %.2f + draw %.2f + tail %.2f = %.2f ms\n",
+           ygr_n,
+           (double)ygr_acc[0] / 60.0 / 1000.0, (double)ygr_acc[1] / 60.0 / 1000.0,
+           (double)ygr_acc[2] / 60.0 / 1000.0, (double)ygr_acc[3] / 60.0 / 1000.0,
+           (double)(ygr_acc[0] + ygr_acc[1] + ygr_acc[2] + ygr_acc[3]) / 60.0 / 1000.0);
+    fflush(stdout);
+    ygr_acc[0] = ygr_acc[1] = ygr_acc[2] = ygr_acc[3] = 0;
+    ygr_n = 0;
+  }
+}
+#endif
+
 void YglRender(void)
 {
   YglLevel *level;
@@ -4600,14 +4701,24 @@ void YglRender(void)
   int from = 0;
   int to = 0;
 #ifdef __LIBRETRO__
+  unsigned long long _ygr_t0 = ygr_now(), _ygr_t1;
   /* PORT: the frontend rotates its hw-render ring once per presented frame and
    * may recreate its textures on a resolution change, so the mirror FBO (core
    * context) has to be re-pointed at the frontend's current colour texture
    * before anything is drawn. */
   {
     extern void YuiRetargetFB(void);
+    extern int YuiGetFB(void);
+    int fb;
     YuiRetargetFB();
+    fb = YuiGetFB();
+    if (fb) _Ygl->default_fbo = (GLuint)fb;
   }
+#ifdef __LIBRETRO__
+{ static unsigned _n_after_retarget = 0; if (_n_after_retarget < 8) { _n_after_retarget++; fprintf(stderr, "YGR[after-retarget] %u\n", _n_after_retarget); fflush(stderr); } }
+#endif
+  _ygr_t1 = ygr_now();
+  ygr_add(0, _ygr_t0, _ygr_t1);
 #endif
   YglMatrix mtx;
   YglMatrix dmtx;
@@ -4694,7 +4805,13 @@ void YglRender(void)
 
   if (_Ygl->texture_manager == NULL)
     goto render_finish;
+  _ygr_t0 = _ygr_t1;
   YglUpdateVdp2Reg();
+  _ygr_t1 = ygr_now();
+  ygr_add(1, _ygr_t0, _ygr_t1);
+#ifdef __LIBRETRO__
+{ static unsigned _n_after_upd = 0; if (_n_after_upd < 8) { _n_after_upd++; fprintf(stderr, "YGR[after-upd] %u\n", _n_after_upd); fflush(stderr); } }
+#endif
 
   glBindTexture(GL_TEXTURE_2D, YglTM->textureID_in[YglTM->current]);
   glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
@@ -4926,6 +5043,12 @@ void YglRender(void)
   else
   {
   }
+#ifdef __LIBRETRO__
+{ static unsigned _n_finish = 0; if (_n_finish < 8) { _n_finish++; fprintf(stderr, "YGR[finish] %u\n", _n_finish); fflush(stderr); } }
+#endif
+  _ygr_t0 = _ygr_t1;
+  _ygr_t1 = ygr_now();
+  ygr_add(2, _ygr_t0, _ygr_t1);
 render_finish:
   glViewport(_Ygl->originx, _Ygl->originy, GlWidth, GlHeight);
   EdgeBlack(GlWidth, GlHeight);
@@ -4949,7 +5072,13 @@ render_finish:
      the GPU lags at least one field behind. Never waits or flushes here, since any extra
      synchronization point would distort the result. Off by default. */
 
+#ifdef __LIBRETRO__
+{ static unsigned _n_before_swap = 0; if (_n_before_swap < 8) { _n_before_swap++; fprintf(stderr, "YGR[before-swap] %u\n", _n_before_swap); fflush(stderr); } }
+#endif
   YuiSwapBuffers();
+#ifdef __LIBRETRO__
+  { unsigned long long _t = ygr_now(); ygr_add(3, _ygr_t1, _t); ygr_report(); }
+#endif
   FrameProfileAdd("YglRender end");
   return;
 }

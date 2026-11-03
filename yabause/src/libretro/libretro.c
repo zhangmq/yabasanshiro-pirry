@@ -88,7 +88,6 @@ static void yab_emu_resume(void);
 static bool hle_bios_force = false;
 static bool one_frame_rendered = false;
 static volatile unsigned yab_swap_count = 0;   /* pictures drawn by the worker */
-static volatile unsigned yab_present_ack = 0;  /* pictures the frontend has presented */
 static int yab_vcrc_nopresent = 0;
 /* 最近一次合成（YglRender 末尾）的画面 CRC，见 yab_after_compose()。 */
 static unsigned yab_last_crc = 0;
@@ -126,6 +125,8 @@ static int g_videoformat_pending = -1;
  * Declared here because check_variables() (below) reads it; the skip decision
  * lives in vdp2.cpp (frameSkipAndLimit at VIN, applied by the next VOUT). */
 static int g_frameskip = 0;
+static int yk_no_present;
+static int yk_hold;        /* diagnostic: YK_HOLD=1 keeps the lease on the render thread */   /* diagnostic: YK_NO_PRESENT=1 skips the frontend borrow */
 static int g_rbg_resolution_mode = 0;
 static int g_rbg_use_compute_shader = 1;
 static int addon_cart_type = CART_DRAM32MBIT;
@@ -920,6 +921,9 @@ typedef void *YK_Display; typedef void *YK_Context; typedef void *YK_Surface;
 typedef void *YK_Config;  typedef unsigned int YK_Uint; typedef int YK_Int;
 typedef unsigned int YK_Enum; typedef unsigned int YK_Bool;
 
+/* hw-render ring slots we keep FBOs for */
+#define YK_SLOT_COUNT 3
+
 static struct {
    void *lib;
    YK_Display dpy; YK_Context ctx_front; YK_Context ctx_sub; YK_Surface pb;
@@ -930,6 +934,9 @@ static struct {
     * gives the core (see yk_mirror_depth): the engine clips VDP2 layers with
     * the STENCIL buffer and composites them with GL_GEQUAL against a DEPTH
     * buffer cleared to 0.0. */
+   YK_Uint slot_fbo[YK_SLOT_COUNT];
+   YK_Uint slot_tex[YK_SLOT_COUNT];
+   int slot_n, slot_cur;
    YK_Uint mirror_rb;            /* depth+stencil renderbuffer (core context) */
    int mirror_rb_w, mirror_rb_h; /* its size == the frontend colour texture's */
    int front_tex_w, front_tex_h;
@@ -959,6 +966,10 @@ static struct {
    YK_Surface (*CreatePbufferSurface)(YK_Display, YK_Config, const YK_Int *);
    YK_Context (*CreateContext)(YK_Display, YK_Config, YK_Context, const YK_Int *);
    YK_Bool (*MakeCurrent)(YK_Display, YK_Surface, YK_Surface, YK_Context);
+   YK_Bool (*BindAPI)(YK_Enum);
+   void *sdl_win;
+   int  (*SdlMakeCurrent)(void *, void *);
+   void *(*SdlGetCurrentWindow)(void);
    void *(*GetProcAddress)(const char *);
    void (*GenFramebuffers)(YK_Int, YK_Uint *);
    void (*BindFramebuffer)(YK_Enum, YK_Uint);
@@ -1162,6 +1173,8 @@ static void yk_load(void)
       return;
    yk.state = -1;
    yk.main_thread = pthread_self();
+   yk_no_present = getenv("YK_NO_PRESENT") ? 1 : 0;
+   yk_hold = getenv("YK_HOLD") ? 1 : 0;
 
    yk.lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_LOCAL);
    if (!yk.lib)
@@ -1177,6 +1190,12 @@ static void yk_load(void)
    yk.CreatePbufferSurface = dlsym(yk.lib, "eglCreatePbufferSurface");
    yk.CreateContext     = dlsym(yk.lib, "eglCreateContext");
    yk.MakeCurrent       = dlsym(yk.lib, "eglMakeCurrent");
+   yk.BindAPI           = dlsym(yk.lib, "eglBindAPI");
+#ifndef RTLD_DEFAULT
+#define RTLD_DEFAULT ((void *)0)
+#endif
+   yk.SdlMakeCurrent      = dlsym(RTLD_DEFAULT, "SDL_GL_MakeCurrent");
+   yk.SdlGetCurrentWindow = dlsym(RTLD_DEFAULT, "SDL_GL_GetCurrentWindow");
    yk.GetProcAddress    = dlsym(yk.lib, "eglGetProcAddress");
    if (!yk.GetCurrentDisplay || !yk.GetCurrentContext || !yk.GetCurrentSurface ||
        !yk.QueryContext || !yk.GetConfigs || !yk.GetConfigAttrib ||
@@ -1186,6 +1205,8 @@ static void yk_load(void)
 
    yk.dpy       = yk.GetCurrentDisplay();
    yk.ctx_front = yk.GetCurrentContext();
+   if (yk.SdlGetCurrentWindow)
+      yk.sdl_win = yk.SdlGetCurrentWindow();
    yk.draw      = yk.GetCurrentSurface(YK_EGL_DRAW);
    yk.read      = yk.GetCurrentSurface(YK_EGL_READ);
    /* The frontend's context is the one current here (yk_load() is called from
@@ -1247,37 +1268,17 @@ static void yk_load(void)
    if (!yk.front_tex)
    { yk_log("frontend FBO has no colour texture -> async rendering disabled"); return; }
 
-   pbattr[0] = YK_EGL_WIDTH;  pbattr[1] = 16;
-   pbattr[2] = YK_EGL_HEIGHT; pbattr[3] = 16;
-   pbattr[4] = YK_EGL_NONE;
-   yk.pb = yk.CreatePbufferSurface(yk.dpy, yk.cfg, pbattr);
-   if (!yk.pb) { yk_log("eglCreatePbufferSurface failed"); return; }
 
-   /* PORT: pirry's renderer runs on the VdpProc thread, so the core needs its
-    * OWN context, sharing textures with the frontend's (a context cannot be
-    * current on two threads: making the frontend's current on the worker fails
-    * with "already current").  Textures are shared, FBOs are not, so the mirror
-    * FBO and the depth/stencil renderbuffer are created in ctx_sub below.  This
-    * is the shape our tree used for the VDP worker before 0ccea5cf. */
-   ctxattr[0] = YK_EGL_CONTEXT_CLIENT_VERSION; ctxattr[1] = 3;
-   ctxattr[2] = YK_EGL_NONE;
-   yk.ctx_sub = yk.CreateContext(yk.dpy, yk.cfg, yk.ctx_front, ctxattr);
-   if (!yk.ctx_sub)
-   {
-      ctxattr[1] = 2;
-      yk.ctx_sub = yk.CreateContext(yk.dpy, yk.cfg, yk.ctx_front, ctxattr);
-   }
-   if (!yk.ctx_sub) { yk_log("eglCreateContext(share) failed"); return; }
-
-   if (!yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub))
-   { yk_log("eglMakeCurrent(share) on the emulation thread failed"); return; }
-
+   /* ONE context: the frontend's; access is leased. */
    yk.GenFramebuffers(1, &yk.mirror_fbo);
    yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
    yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
          YK_GL_TEXTURE_2D, yk.front_tex, 0);
    yk_query_front_size(yk.front_tex);
    yk_mirror_depth();
+   yk.slot_fbo[0] = yk.mirror_fbo;
+   yk.slot_tex[0] = yk.front_tex;
+   yk.slot_n = 1; yk.slot_cur = 0;
    st = yk.CheckFramebufferStatus ? yk.CheckFramebufferStatus(YK_GL_FRAMEBUFFER) : 0;
    yk_log("share ctx=%p pbuffer=%p front_ctx=%p cfgid=%d front_fbo=%u front_tex=%u "
           "mirror_fbo=%u depth_rb=%u status=0x%x",
@@ -1289,150 +1290,287 @@ static void yk_load(void)
    yk.state = 1;
 }
 
-/* Make the shared context current on the calling thread (VDP thread: for its
- * lifetime; emulation thread: only while it borrows the context for engine GL
- * work, e.g. a resolution/option change). */
-static void yk_remember_front(void);
-static void yk_restore_front(void);
+/* ONE context (the frontend's) shared by three callers: VdpProc (main), the
+ * machine thread (resolution changes, VDP1 readback) and the frontend thread
+ * (present only).  Recursive lease; GL sections never block. */
+static volatile int yk_gl_busy = 0;
+static volatile int yk_front_want;  /* the frontend is waiting to present */
+static unsigned long yk_ms(void)
+{
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (unsigned long)ts.tv_sec * 1000ul + (unsigned long)(ts.tv_nsec / 1000000);
+}
+#define YK_LEASE_LOG(...) do { if (getenv("YK_LEASE_LOG")) { fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } } while (0)
+static unsigned yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb;
+static unsigned yk_att_ok[2], yk_att_fail[2], yk_att_wait[2];
+/* Seg probes: one counter per marker, sized to the highest marker + 1.  It was
+ * [8] while retro_run used seg9, so seg9 wrote past the array and corrupted the
+ * statics that follow it (measured: yk_n_present advanced twice per retro_run
+ * call, pn/present diverged 121 vs 241). */
+static unsigned yk_seg[16];
+/* A resize is requested by the frontend but performed by the render thread: it
+ * is the lease's default holder and the only thread that may run an engine GL
+ * rebuild (from the frontend it waits on the render thread while the render
+ * thread waits for the lease). */
+static volatile int yk_res_wanted;
+static volatile int yk_res_done;      /* render thread finished the deferred resize */
+static void yk_seg_hit(int id)
+{
+   if (++yk_seg[id] <= 30)
+      YK_TRACE("seg%d=%u (retarget=%u swap=%u present=%u vcb=%u ok=%u/%u wait=%u/%u fail=%u/%u)",
+               id, yk_seg[id], yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb,
+               yk_att_ok[0], yk_att_ok[1], yk_att_wait[0], yk_att_wait[1],
+               yk_att_fail[0], yk_att_fail[1]);
+}
+/* Waiters get priority: the render thread re-acquires the lease the instant it
+ * releases it (next field), so a waiter would never win the race -- observed as
+ * present=0 while retarget/swap kept counting. */
+static volatile int yk_gl_waiters = 0;
+static int yk_gl_rec = 0;
+static pthread_t yk_gl_tid;
+/* Caller mode (see Vdp2SetOnCaller): the VDP workflow runs inside retro_run, on
+ * the frontend's own thread and in the frontend's own context, so exactly one
+ * thread may ever hold the context -- the one that also presents.  Declared up
+ * here because the lease helpers below all branch on it. */
+static int yk_caller_mode;
 
 static int yk_attach(void)
 {
-   if (yk.state != 1)
+   if (yk.state != 1 || !yk.MakeCurrent || !yk.GetCurrentContext)
       return 0;
-   /* NB: do NOT use pthread_equal() here.  In this cross toolchain/glibc combo
-    * it returns 0 for two identical pthread_t values (observed: eq=0 with
-    * me==worker), which silently disables the frame-delivery path.  Compare the
-    * values directly (glibc's pthread_equal is exactly this comparison). */
+   if (yk_no_present && pthread_self() == yk.main_thread)
+      return 0;                 /* diagnostic: the frontend never borrows */
+   if (yk_caller_mode && !pthread_equal(yk.main_thread, pthread_self()))
+   {
+      /* Measured (WD probe, caller build): the machine thread took the lease
+       * through YglTmPull/YglTMRealloc -- the engine's texture manager is also
+       * reached from the SH-2 side -- and never gave it back, so retro_run spun
+       * forever in this function at the present and the machine starved
+       * (present=2 vcb=0 vdp queue empty, machine parked by the pause guard).
+       * In caller mode the machine thread's GL work is deferred to the caller by
+       * design; it must not become a lease holder. */
+      static unsigned n = 0;
+      if (n < 8) { n++; YK_TRACE("attach DENIED on non-caller tid=%lu (caller=%lu)",
+            (unsigned long)pthread_self(), (unsigned long)yk.main_thread); }
+      return -1;
+   }
    if (!yk.worker_valid && (pthread_self() != yk.main_thread))
    {
       yk.worker = pthread_self();
       yk.worker_valid = 1;
    }
-   /* A borrower that is not the VDP thread (i.e. the frontend's thread) must
-    * remember what it is taking the thread away from, so yk_detach() can hand
-    * it back instead of leaving the thread context-less. */
-   if (!(yk.worker_valid && pthread_self() == yk.worker))
-      yk_remember_front();
-   if (yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub)
+   if (yk_gl_rec > 0 && pthread_equal(yk_gl_tid, pthread_self()))
    {
-      YK_TRACE("attach tid=%lu: already sub", (unsigned long)pthread_self());
-      return 0;                 /* already ours on this thread */
+      yk_gl_rec++;
+      return 0;
    }
    {
-      YK_Bool ok = yk.MakeCurrent(yk.dpy, yk.pb, yk.pb, yk.ctx_sub);
-      YK_TRACE("attach tid=%lu rc=%d now=%p sub=%p front=%p", (unsigned long)pthread_self(),
-            (int)ok,
-            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL),
-            (void *)yk.ctx_sub, (void *)yk.ctx_front);
-      return ok ? 0 : -1;
+      unsigned spins = 0;
+      /* The render thread only releases the context when it sees this: the
+       * frontend cannot take it while the render thread keeps it current. */
+      if (pthread_self() == yk.main_thread)
+         __atomic_store_n(&yk_front_want, 1, __ATOMIC_RELEASE);
+      int role = (yk.worker_valid && pthread_equal(yk.worker, pthread_self())) ? 0 : 1;
+      if (__atomic_load_n(&yk_gl_waiters, __ATOMIC_ACQUIRE) > 0)
+         usleep(200);            /* let a waiting thread in first */
+      __atomic_add_fetch(&yk_gl_waiters, 1, __ATOMIC_ACQ_REL);
+      while (__atomic_exchange_n(&yk_gl_busy, 1, __ATOMIC_ACQUIRE))
+      {
+         if (++spins == 2000)
+            YK_TRACE("gl-enter waits: held by tid=%lu, me=%lu (retarget=%u swap=%u present=%u vcb=%u)",
+                     (unsigned long)yk_gl_tid, (unsigned long)pthread_self(),
+                     yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb);
+         usleep(50);
+      }
+      /* Someone else's take may have been recorded (the owner fields are global):
+       * never let two threads hold the one context. */
+      if (yk_gl_rec > 0 && !pthread_equal(yk_gl_tid, pthread_self()))
+      {
+         __atomic_store_n(&yk_gl_busy, 0, __ATOMIC_RELEASE);
+         __atomic_sub_fetch(&yk_gl_waiters, 1, __ATOMIC_ACQ_REL);
+         usleep(50);
+         return -1;
+      }
+      __atomic_sub_fetch(&yk_gl_waiters, 1, __ATOMIC_ACQ_REL);
+      if (spins)
+         yk_att_wait[role]++;
    }
-}
-
-/* Remember the frontend's context (and the surfaces it has current) so it can
- * be handed back later.  Called whenever the frontend's context is the one
- * current on this thread; a no-op while the core's own context is current or
- * before yk_load() has resolved the EGL entry points. */
-static void yk_remember_front(void)
-{
-   YK_Context cur;
-   if (!yk.GetCurrentContext)
-      return;
-   cur = yk.GetCurrentContext();
-   if (!cur || cur == yk.ctx_sub)
-      return;
-   yk.prev_ctx  = cur;
-   yk.prev_draw = yk.GetCurrentSurface ? yk.GetCurrentSurface(YK_EGL_DRAW) : NULL;
-   yk.prev_read = yk.GetCurrentSurface ? yk.GetCurrentSurface(YK_EGL_READ) : NULL;
-}
-
-/* Hand the calling thread its own context back.
- *
- * Why this matters: the frontend (SDL) keeps a PER-THREAD record of which
- * context it made current and treats "the context I would make current is
- * already the one I recorded" as a no-op.  Releasing the borrowing thread to
- * EGL_NO_CONTEXT behind SDL's back therefore leaves the frontend believing its
- * context is current while the thread really has none, so every frontend GL
- * call of that frame is silently void -- measured on device as
- * "present shader compile failed" with an uninitialised info-log one frame
- * before the retry succeeded, and in the offscreen harness (with the frontend's
- * unconditional eglMakeCurrent disabled) as a permanently context-less frontend
- * thread whose every FBO readback comes back black.  Restoring the saved
- * context keeps that record true, and keeps the frontend's FBO/texture
- * namespace (names 1/3, the same names the engine's own objects use) from ever
- * being touched by the wrong context.
- *
- * Unconditional on purpose: if this thread already holds a context that is not
- * ours there is nothing to give back; if it holds ctx_sub (the normal case) or
- * nothing at all (the VDP thread took ctx_sub over while the engine was
- * starting) the frontend's context is the right thing to have current.
- */
-static void yk_restore_front(void)
-{
-   YK_Context cur, back;
-   if (!yk.GetCurrentContext || !yk.MakeCurrent)
-      return;
-   cur = yk.GetCurrentContext();
-   if (cur && cur != yk.ctx_sub)
-      return;                   /* somebody else's context is current here */
-   back = yk.prev_ctx ? yk.prev_ctx : yk.ctx_front;
-   if (!back)
-      return;
+   if (yk.BindAPI)
+      yk.BindAPI(0x30A0);
+   if (!((yk.SdlMakeCurrent && yk.sdl_win)
+         ? (yk.SdlMakeCurrent(yk.sdl_win, yk.ctx_front) == 0)
+         : yk.MakeCurrent(yk.dpy, yk.draw, yk.read, yk.ctx_front)))
    {
-      YK_Bool ok = yk.MakeCurrent(yk.dpy,
-            yk.prev_ctx ? yk.prev_draw : yk.draw,
-            yk.prev_ctx ? yk.prev_read : yk.read,
-            back);
-      YK_TRACE("restore-front tid=%lu cur_was=%p back=%p rc=%d now=%p",
-            (unsigned long)pthread_self(), (void *)cur, (void *)back, (int)ok,
-            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
+      __atomic_store_n(&yk_gl_busy, 0, __ATOMIC_RELEASE);
+      yk_att_fail[(yk.worker_valid && pthread_equal(yk.worker, pthread_self())) ? 0 : 1]++;
+      YK_TRACE("gl-enter FAILED tid=%lu", (unsigned long)pthread_self());
+      return -1;
    }
+   yk_gl_tid = pthread_self();
+   yk_gl_rec = 1;
+   __atomic_store_n(&yk_front_want, 0, __ATOMIC_RELEASE);
+   YK_LEASE_LOG("TAKE t=%lu tid=%lu", yk_ms(), (unsigned long)yk_gl_tid);
+   yk_att_ok[(yk.worker_valid && pthread_equal(yk.worker, pthread_self())) ? 0 : 1]++;
+   {
+      static unsigned roles = 0;
+      unsigned bit = (pthread_equal(yk_gl_tid, yk.main_thread) ? 1u : 0u);
+      if (bit && !(roles & 1u)) { roles |= 1u; YK_TRACE("role FRONTEND tid=%lu", (unsigned long)yk_gl_tid); }
+      if (!bit && !(roles & 2u)) { roles |= 2u; YK_TRACE("role RENDER   tid=%lu", (unsigned long)yk_gl_tid); }
+   }
+   return 0;
 }
 
 static void yk_detach(void)
 {
-   if (yk.state != 1)
-      return;
-   if (yk.worker_valid && pthread_self() == yk.worker)
+   if (yk_caller_mode && pthread_equal(yk.main_thread, pthread_self()))
    {
-      if (yk.GetCurrentContext && yk.GetCurrentContext() != yk.ctx_sub)
-         return;                /* not ours on this thread */
-      yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);   /* VDP thread: plain release */
-      YK_TRACE("detach[worker] tid=%lu -> released (now=%p)",
-            (unsigned long)pthread_self(),
-            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
+      /* Caller mode: rendering and presenting are the same thread, so the
+       * context never has to leave it.  Handing it back (MakeCurrent(NULL)) and
+       * re-taking it every field is exactly the window-surface churn that
+       * crashes the driver in seconds on this platform (measured 5/5); keeping
+       * it current is what the standalone does (VdpProc owns it for its whole
+       * life) and it ran clean. */
       return;
    }
-   /* Frontend thread: hand back the context this thread owns (no-op when it is
-    * already current, which is also what makes a failed yk_attach() harmless). */
-   if (yk.main_thread && pthread_self() != yk.main_thread)
+   if (yk_gl_rec <= 0)
    {
-      /* NEITHER the render thread NOR the frontend thread: this is the engine's
-       * machine thread calling YuiRevokeOGLOnThisThread() -- vdp2.cpp does that
-       * once, at the top of Vdp2VBlankIN() when it starts VdpProc.  The
-       * standalone's hook is SDL_GL_MakeCurrent(wnd, nullptr), i.e. RELEASE.
-       * yk_restore_front() instead binds the FRONTEND's context on the calling
-       * thread, which is wrong here twice over: (a) that context is normally
-       * already current on the frontend's thread, so EGL fails and we leave the
-       * machine thread in an arbitrary state; (b) if it were not, the frontend's
-       * context would become current on the machine thread, and SDL's per-thread
-       * make-current bookkeeping would then make every later frontend GL call a
-       * silent no-op (see yk_restore_front's comment).  Release instead, exactly
-       * like the standalone. */
+      if (__atomic_load_n(&yk_gl_busy, __ATOMIC_ACQUIRE))
+      {
+         static unsigned na = 0;
+         if (na < 8) { na++; YK_TRACE("lease anomaly: rec=0 busy=1 tid=%lu", (unsigned long)pthread_self()); }
+      }
+      if (yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_front)
+      {
+         if (yk.SdlMakeCurrent && yk.sdl_win)
+            yk.SdlMakeCurrent(yk.sdl_win, NULL);
+         else
+            yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);
+      }
+      return;
+   }
+   if (!pthread_equal(yk_gl_tid, pthread_self()))
+   {
+      static unsigned nw = 0;
+      if (nw < 8) { nw++; YK_TRACE("detach by NON-holder tid=%lu own=%lu", (unsigned long)pthread_self(), (unsigned long)yk_gl_tid); }
+      return;
+   }
+   if (yk_gl_rec > 1)
+   {
+      static unsigned nr = 0;
+      if (nr < 8) { nr++; YK_TRACE("detach rec>1: rec=%d tid=%lu", yk_gl_rec, (unsigned long)pthread_self()); }
+   }
+   YK_LEASE_LOG("GIVE t=%lu tid=%lu rec=%d", yk_ms(), (unsigned long)pthread_self(), yk_gl_rec);
+   if (--yk_gl_rec > 0)
+      return;
+   if (yk.SdlMakeCurrent && yk.sdl_win)
+      yk.SdlMakeCurrent(yk.sdl_win, NULL);
+   else
       yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);
-      YK_TRACE("detach[other] tid=%lu -> released (now=%p)",
-            (unsigned long)pthread_self(),
-            (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
-      return;
-   }
-   yk_restore_front();
+   yk_gl_tid = 0;
+   __atomic_store_n(&yk_gl_busy, 0, __ATOMIC_RELEASE);
 }
 
-/* Does the calling thread currently hold the shared context? */
+static void yk_release_all(void)
+{
+   if (yk_caller_mode)
+      return;                 /* same thread renders and presents: keep it current */
+   if (!pthread_equal(yk_gl_tid, pthread_self()))
+      return;
+   YK_LEASE_LOG("GIVE-ALL t=%lu tid=%lu rec_was=%d", yk_ms(), (unsigned long)pthread_self(), yk_gl_rec);
+   yk_gl_rec = 0;
+   if (yk.SdlMakeCurrent && yk.sdl_win)
+      yk.SdlMakeCurrent(yk.sdl_win, NULL);
+   else
+      yk.MakeCurrent(yk.dpy, NULL, NULL, NULL);
+   yk_gl_tid = 0;
+   __atomic_store_n(&yk_gl_busy, 0, __ATOMIC_RELEASE);
+}
+
+static void yk_yield_keep(void)
+{
+   if (!pthread_equal(yk_gl_tid, pthread_self()))
+      return;
+   yk_gl_rec = 0;
+   yk_gl_tid = 0;
+   __atomic_store_n(&yk_gl_busy, 0, __ATOMIC_RELEASE);
+}
+
 static int yk_held(void)
 {
-   return yk.state == 1 && yk.GetCurrentContext && yk.GetCurrentContext() == yk.ctx_sub;
+   return yk_gl_rec > 0 && pthread_equal(yk_gl_tid, pthread_self());
 }
 
+/* "Ensure this thread holds the lease" -- used by engine paths that may run
+ * outside a GL section (texture-manager rebuild).  It must NOT bump the
+ * recursive count when the thread already holds it: that count is released only
+ * at the end of a section (YuiSwapBuffers), so every bump leaked one lease and
+ * the frontend could never borrow (observed: present=0 forever). */
+/* Executed by the render thread at the top of its loop (vdp2.cpp): the frontend
+ * parks the machine while it waits, so a full YglGLInit here is safe. */
+/* The render thread gives the lease back at the top of its own loop (after a
+ * whole event has been handled): releasing at YuiSwapBuffers was too early --
+ * the VDP1 draw-end path still runs GL after it and then had no context
+ * (measured: glTexImage2D -> GL_INVALID_OPERATION, texture 0 bound). */
+void YuiReleaseGL(void)
+{
+   if (!g_vdp_async || yk_hold)
+      return;
+   /* Hand the context over only when the frontend is actually waiting for it;
+    * otherwise keep it current on this thread (a per-field NULL release and
+    * re-take is what destabilised the driver: 100+ switches/s crashed, keeping
+    * it ran 5/5 clean). */
+   if (__atomic_load_n(&yk_front_want, __ATOMIC_ACQUIRE))
+      yk_release_all();
+   else
+      yk_yield_keep();
+}
+
+int YuiResizeIfWanted(void)
+{
+   if (!g_vdp_async || yk.state != 1 || !yk_res_wanted)
+      return 0;
+   yk_res_wanted = 0;
+   if (yk_attach() < 0)
+   {
+      yk_res_wanted = 1;      /* retry on the next field */
+      return -1;
+   }
+   YK_TRACE("res: render thread rebuilding");
+   retro_set_resolution();
+   YK_TRACE("res: render thread done");
+   yk_detach();
+   __atomic_store_n(&yk_res_done, 1, __ATOMIC_RELEASE);
+   return 0;
+}
+
+int YuiEnsureGL(void)
+{
+   if (!g_vdp_async)
+      return 0;
+   if (yk_held())
+      return 0;
+   /* Caller mode: the VDP workflow runs on the frontend's thread, in the
+    * frontend's context.  That thread is the only legitimate borrower; any other
+    * thread (the machine's SH-2 side reaching the texture manager) must skip the
+    * work, exactly like the render-thread model deferred it. */
+   if (yk_caller_mode)
+      return pthread_equal(yk.main_thread, pthread_self()) ? yk_attach() : -1;
+   /* Only the render thread may wait for the lease: on any other thread a wait
+    * deadlocks against the renderer (measured: machine thread and frontend both
+    * spinning in yk_attach while the render thread held the lease). */
+   /* The render thread is whichever non-frontend thread draws first; the lease
+    * helpers record it, so accept that thread here too (before the first
+    * YuiRetargetFB sets yk.worker). */
+   if (!yk.worker_valid && pthread_self() != yk.main_thread)
+   {
+      yk.worker = pthread_self();
+      yk.worker_valid = 1;
+   }
+   if (!yk.worker_valid || !pthread_equal(yk.worker, pthread_self()))
+      return -1;
+   return yk_attach();
+}
 
 static int first_ctx_reset = 1;
 
@@ -1444,16 +1582,13 @@ static int first_ctx_reset = 1;
  * frontend) would call them again; see SYNCPATH-STATUS-2026-10-31.md. */
 int YuiUseOGLOnThisThread()
 {
-  /* Async renderer: the renderer borrows the core-owned shared context.
-   * Sync renderer: nothing to borrow (the engine draws with the frontend's
-   * context on the frontend's thread), keep the old glsm bind for parity. */
-  if (g_vdp_async)
-    return yk_attach();
-#if !defined(_USEGLEW_)
-  return glsm_ctl(GLSM_CTL_STATE_BIND, NULL);
-#else
+  /* Lease model: this hook fires at VdpProc startup and on MAKECURRENT, neither
+   * of which is a GL section.  Taking the lease here would hold it for the
+   * thread's whole life (it is only released in YuiSwapBuffers), starving the
+   * frontend's present -- observed as a deadlock with the render thread as the
+   * holder.  GL sections take/release it themselves (YuiRetargetFB ->
+   * YuiSwapBuffers, YglTm* -> YuiEnsureGL). */
   return 0;
-#endif
 }
 
 int YuiRevokeOGLOnThisThread()
@@ -1501,41 +1636,6 @@ int YuiRevokeOGLOnThisThread()
  *   YAB_MIRROR_DUMP=<from>-<to>[:step]   e.g. 600-900:20
  */
 
-static void yk_adopt_front_fbo(void)
-{
-   YK_Uint fbo, name = 0;
-   YK_Int  type = 0, prev_fbo = 0;
-
-   if (!g_vdp_async || yk.state != 1 || !hw_render.get_current_framebuffer)
-      return;
-   fbo = (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer();
-   if (!fbo)
-      return;
-   if (!yk.BindFramebuffer || !yk.GetFramebufferAttachmentParameteriv)
-      return;
-   if (yk.GetIntegerv)
-      yk.GetIntegerv(YK_GL_FRAMEBUFFER_BINDING, &prev_fbo);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, fbo);
-   yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-         YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
-   if (type == YK_GL_TEXTURE)
-      yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-            YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, (YK_Uint)prev_fbo);
-   if (name && name != yk.front_tex)
-   {
-      yk.front_fbo = fbo;
-      yk.front_tex = name;
-      yk.retarget  = 1;
-      yk_query_front_size((YK_Uint)name);
-      if (yk.ring_adopt_log < 4)   /* one-time confirmation that the ring is followed */
-      {
-         YAB_TR_L1("[YK] ring adopt: front fbo=%u tex=%u\n",
-                   (unsigned)fbo, (unsigned)name);
-         yk.ring_adopt_log++;
-      }
-   }
-}
 
 /* Applied on the VDP thread, at the top of YglRender(): the engine binds the
  * mirror FBO (its cached _Ygl->default_fbo == yk.mirror_fbo) for the whole
@@ -1677,45 +1777,63 @@ static void yk_rt_present_to(unsigned dst_fbo, int w, int h)
 }
 
 
+static YK_Uint yk_pick_slot(YK_Uint fbo)
+{
+   YK_Uint name = 0; YK_Int type = 0, prev = 0; int i;
+   if (!fbo || !yk.GetFramebufferAttachmentParameteriv || !yk.BindFramebuffer)
+      return yk.slot_fbo[yk.slot_cur];
+   if (yk.GetIntegerv) yk.GetIntegerv(YK_GL_FRAMEBUFFER_BINDING, &prev);
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, fbo);
+   yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
+   if (type == YK_GL_TEXTURE)
+      yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+            YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, (YK_Uint)prev);
+   if (!name) return yk.slot_fbo[yk.slot_cur];
+   for (i = 0; i < yk.slot_n; i++)
+      if (yk.slot_tex[i] == name)
+      { yk.slot_cur = i; yk.front_fbo = fbo; return yk.slot_fbo[i]; }
+   i = (yk.slot_n < YK_SLOT_COUNT) ? yk.slot_n++ : (yk.slot_cur + 1) % YK_SLOT_COUNT;
+   if (!yk.slot_fbo[i]) yk.GenFramebuffers(1, &yk.slot_fbo[i]);
+   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.slot_fbo[i]);
+   yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
+         YK_GL_TEXTURE_2D, name, 0);
+   yk.slot_tex[i] = name; yk.slot_cur = i; yk.front_fbo = fbo; yk.front_tex = name;
+   yk_query_front_size(name); yk.retarget = 1;
+   if (yk.ring_log < 24)
+   {
+      YAB_TR_L1("[YK] slot %d fbo=%u tex=%u\n", i, (unsigned)yk.slot_fbo[i], (unsigned)name);
+      yk.ring_log++;
+   }
+   return yk.slot_fbo[i];
+}
+
 void YuiRetargetFB(void)
 {
-   if (g_vdp_async && yk.state == 1 && yk.front_tex)
+   if (g_vdp_async && yk.state == 1)
    {
-      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-      /* Zero copy: draw straight into the frontend's colour texture.  With the
-       * flycast-style split (machine on its own thread, all GL and presentation
-       * on the frontend thread) nothing else can be drawing from, or rotating,
-       * the frontend's ring while this frame is being rendered, so the
-       * double-buffered render target and the present-time blit are not needed
-       * -- and while they were still in the path the picture came out black. */
-      yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-            YK_GL_TEXTURE_2D, yk.front_tex, 0);
-      yk_mirror_depth();
-      if (yk.retarget && yk.ring_log < 24)
-      {
-         YAB_TR_L1("[YK] ring draw: mirror=%u <- front fbo=%u tex=%u\n",
-                   (unsigned)yk.mirror_fbo, (unsigned)yk.front_fbo, (unsigned)yk.front_tex);
-         yk.ring_log++;
-      }
-      yk.retarget = 0;
+      YK_Uint slot;
+      if (yk_attach() < 0)
+         return;
+      slot = yk_pick_slot(hw_render.get_current_framebuffer
+            ? (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer() : 0);
+      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, slot);
+      if (yk.retarget) { yk_mirror_depth(); yk.retarget = 0; }
+      yk_n_retarget++;
+      if ((yk_n_retarget % 10) == 0)
+         YK_TRACE("counts retarget=%u swap=%u present=%u vcb=%u | lease ok r=%u f=%u fail r=%u f=%u wait r=%u f=%u",
+                  yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb,
+                  yk_att_ok[0], yk_att_ok[1], yk_att_fail[0], yk_att_fail[1],
+                  yk_att_wait[0], yk_att_wait[1]);
    }
 }
 
 int YuiGetFB(void)
 {
-  /* async: the engine renders into the core's mirror FBO, which attaches the
-   * frontend's colour texture (re-pointed per frame by YuiRetargetFB).
-   * sync: the engine renders straight into the frontend's hw-render FBO. */
-
-  /* Draw through the core's mirror FBO: it is the frontend's colour texture
-   * plus our own depth/stencil attachments, which VDP2's compositing needs
-   * (stencil windows, priority).  The cross-thread reason for the mirror is
-   * gone, but the attachment reason is not -- without it some titles render a
-   * flat background only.  Same context, same thread, so this is still one GL
-   * thread. */
-  if (yk.mirror_fbo)
-     return (int)yk.mirror_fbo;
-  return hw_render.get_current_framebuffer();
+   if (yk.slot_fbo[yk.slot_cur])
+      return (int)yk.slot_fbo[yk.slot_cur];
+   return hw_render.get_current_framebuffer ? hw_render.get_current_framebuffer() : 0;
 }
 
 /* what the engine actually renders (ygles.c globals); see YuiSwapBuffers */
@@ -1831,6 +1949,13 @@ void YabVdp2ModeChanged(int native_w, int native_h)
    fh = native_h * resolution_mode;
    if (fw == current_width && fh == current_height)
       return;
+   if (!yk_held())
+   {
+      /* Engine GL belongs to the render thread: ask it to perform this resize
+       * instead of running YglGLInit on the machine thread. */
+      yk_res_wanted = 1;
+      return;
+   }
    VIDCore->Resize(0, 0, fw, fh, 1, FULL);
    current_width  = fw;
    current_height = fh;
@@ -1920,23 +2045,10 @@ void YuiSwapBuffers(void)
        * the frame is complete before the ack below lets the frontend sample it.
        * (Cheaper later: a GLsync fence here + the frontend waiting on it; the
        * alignment comes first, performance later.) */
-      if (yk.Finish)
-         yk.Finish();
-      unsigned me = __atomic_add_fetch(&yab_swap_count, 1, __ATOMIC_RELEASE);
+      __atomic_add_fetch(&yab_swap_count, 1, __ATOMIC_RELEASE);
       one_frame_rendered = true;
-      /* PORT, aligned with the standalone: there YuiSwapBuffers() is
-       * SDL_GL_SwapWindow(), i.e. the render thread BLOCKS until the display has
-       * the frame, and the machine waits for that VIN token before the next
-       * field.  Here the frontend presents in retro_run, so wait for its ack
-       * (bounded, so a paused frontend cannot wedge the machine).  Without this
-       * the worker never waits for the present, the machine runs ahead and VDP1
-       * is walked ~3x more often per second than the standalone in heavy
-       * scenes -- which is where the picture differences came from. */
-      {
-         int spins = 0;
-         while (__atomic_load_n(&yab_present_ack, __ATOMIC_ACQUIRE) < me && ++spins < 200)
-            usleep(500);
-      }
+      yk_n_swap++;
+      /* the lease is released at the top of the render thread's loop */
    }
 }
 
@@ -2041,8 +2153,6 @@ static void context_reset(void)
       outer_borrow = yk_held();
       YK_TRACE("context_reset enter outer_borrow=%d now=%p", outer_borrow,
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL));
-      if (!outer_borrow)
-         yk_remember_front();
       yk_load();
       yk_attach();
    }
@@ -2130,9 +2240,21 @@ static void context_reset(void)
    {
       YK_TRACE("context_reset engine-up now=%p (outer_borrow=%d)",
             (void *)(yk.GetCurrentContext ? yk.GetCurrentContext() : NULL), outer_borrow);
-      if (!outer_borrow)
-         yk_restore_front();
-      /* Engine is fully up: start the machine on its own thread. */
+      /* Engine is fully up: release the lease and start the machine.  In caller
+       * mode the lease stays on this thread: it is the thread that will run the
+       * whole VDP workflow and present, so the context never needs to move
+       * (yk_detach() is a no-op there -- see its comment). */
+      {
+         /* Caller-driven VDP workflow: the standalone presents from the render
+          * thread; libretro presents from the thread that calls retro_run. */
+         extern void Vdp2SetOnCaller(int);
+         if (getenv("YAB_VDP_CALLER"))
+         {
+            Vdp2SetOnCaller(1);
+            yk_caller_mode = 1;
+         }
+      }
+      yk_detach();
       yab_emu_start();
    }
 }
@@ -3919,6 +4041,12 @@ static void *yab_emu_main(void *arg)
       if (!yab_emu_running) break;
       yab_emu_parked = 0;
 
+      {
+         static unsigned loops = 0;
+         loops++;
+         if (loops <= 3 || (loops % 60) == 0)
+            YK_TRACE("emu loop n=%u", loops);
+      }
       YABEMU("emu:handle-events");
 #if YAB_TRACE_LEVEL >= 2
       if (yab_ft_on())
@@ -3932,10 +4060,53 @@ static void *yab_emu_main(void *arg)
       if (PERCore)
          PERCore->HandleEvents();                    /* one machine frame */
       YABEMU("emu:after-events");
+      {
+         static unsigned done = 0;
+         done++;
+         if (done <= 3)
+            YK_TRACE("emu frame returned n=%u", done);
+      }
       sram_sync();
    }
    yab_emu_parked = 1;
    return NULL;
+}
+
+/* Field clock, owned by the thread that presents -- in the standalone that is
+ * VdpProc, here it is the frontend's thread inside retro_run.
+ *
+ * VdpProc's cycle is work + sleep + SwapWindow = one field period.  Our swap and
+ * the frontend's quad/shader pass happen after retro_run returns, on the same
+ * thread, so they have to come out of the core's share: the gap between two
+ * retro_run entries is exactly the frontend's per-frame cost, and the sleep is
+ * `period - gap - work`.  Without that subtraction the core paced itself to a
+ * full period on top of the frontend's work (measured: 16.7 + 2-3 ms per frame).
+ */
+static void yab_pace_field(u64 t_entry_ns)
+{
+   static u64 gap_ns, t_prev_exit_ns;
+   struct timespec ts;
+   u64 now_ns, period_ns, budget_ns, deadline_ns;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   now_ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+   period_ns = (u64)(1000000000.0 / (yabsys.IsPal ? 50.0 : 60.0));
+   if (t_prev_exit_ns && t_entry_ns > t_prev_exit_ns)
+   {
+      u64 g = t_entry_ns - t_prev_exit_ns;
+      if (g < period_ns)                    /* longer means a stall, not a cost */
+         gap_ns = gap_ns ? (gap_ns * 3 + g) / 4 : g;
+   }
+   budget_ns = period_ns > gap_ns ? period_ns - gap_ns : period_ns / 2;
+   deadline_ns = t_entry_ns + budget_ns;
+   if (deadline_ns > now_ns)
+   {
+      u64 d = deadline_ns - now_ns;
+      ts.tv_sec = (time_t)(d / 1000000000ull);
+      ts.tv_nsec = (long)(d % 1000000000ull);
+      nanosleep(&ts, NULL);
+   }
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   t_prev_exit_ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
 
 static void yab_emu_start(void)
@@ -4093,6 +4264,22 @@ void retro_run(void)
 
    one_frame_rendered = false;
    yab_in_run = 1;          /* SET_GEOMETRY is legal only while this is set */
+   u64 _rr_entry_ns;
+   {
+      struct timespec _ts;
+      clock_gettime(CLOCK_MONOTONIC, &_ts);
+      _rr_entry_ns = (u64)_ts.tv_sec * 1000000000ull + (u64)_ts.tv_nsec;
+   }
+#if YAB_TRACE_LEVEL >= 2
+   u64 _rr_t0 = yab_ft_now();
+#endif
+   {
+      static unsigned n = 0;
+      n++;
+      if ((n % 60) == 0)
+         YK_TRACE("retro_run entry n=%u (retarget=%u swap=%u present=%u vcb=%u)",
+                  n, yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb);
+   }
 
    /* Tell the machine (and the sound thread) that the frontend is running
     * again: this is the only "the frontend is not paused" signal a libretro
@@ -4120,74 +4307,120 @@ void retro_run(void)
     * (design §7 #4).  Audio no longer passes through this thread at all -- the
     * sound thread writes it itself (pirry's shape, see SNDLIBRETROUpdateAudio). */
    yab_input_snapshot();
+   yk_seg_hit(1);
 
    /* Renderer (design §1/§5): the machine runs on the emu thread and dispatches
     * one field at its VOUT point (line ~5); this thread renders exactly that
     * field - the queued PTMR=1 direct draws, then VOUT (Vdp1Draw /
     * Vdp2DrawScreens / Vdp1DrawEnd) and VIN (Vdp2DrawEnd -> video_cb).  All GL
     * and the frontend's hw-render ring stay on this thread. */
-   if (yk.res_pending)
-   {
-      /* Deferred resolution change: outside the render call stack and with the
-       * machine parked, so YglGLInit() does not tear down GL objects a frame in
-       * progress is using. */
-      yk.res_pending = 0;
-      yab_emu_pause();
-      /* PORT: the engine's GL objects live in ctx_sub (the worker's context).
-       * This thread holds the frontend's context, so the resize has to borrow
-       * ctx_sub for the call -- otherwise the new FBOs/textures are created in
-       * the frontend context, where the renderer cannot see them. */
-      yk_attach();
-      retro_set_resolution();
-      yk_detach();
-      yab_emu_resume();
-   }
-   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
-   {
-      /* Option changes rebuild GL objects and may resize the engine's
-       * framebuffers: park the machine so it is not mid-frame. */
-      int prev_resolution_mode = resolution_mode;
-      int prev_multitap[2] = {multitap[0],multitap[1]};
-      bool prev_service_enabled = service_enabled;
-      yab_emu_pause();
-      check_variables();
-      if(prev_resolution_mode != resolution_mode)
-         retro_set_resolution();
-      VIDCore->SetSettingValue(VDP_SETTING_RBG_RESOLUTION_MODE, g_rbg_resolution_mode);
-      VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
-      if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
-                     || prev_service_enabled != service_enabled))
-         PERCore->Init();
-      yab_emu_resume();
-   }
-
+   yk_seg_hit(2);
    {
       /* PORT (pirry model): the machine thread runs the emulation and dispatches
-       * a field at its VOUT point; the VdpProc worker rasterises it into the
-       * mirror FBO (the frontend's current colour texture).  This thread waits
-       * until that field retires (Vdp1MarkRenderRetired) and then presents. */
+       * a field at its VOUT point; this thread is the workflow's consumer (the
+       * standalone's VdpProc runs on it), rasterises that field into the
+       * frontend's current colour texture and presents it. */
       static unsigned swap_seen = 0;
-      int spins = 0;
       unsigned now;
+      int yk_new_pic = 0;
       /* Wait for a *picture* (YuiSwapBuffers on the worker), not for a retire:
        * VOUT retires every field, but only fields that reach YglRender produce
        * a new picture, and the flag/false race between the two threads made
        * almost every field look like a duplicate. */
-      for (;;)
+      if (yk.res_pending)
       {
+         /* The render thread performs the rebuild at the top of its own loop
+          * (machine parked there by design); this thread only asks. */
+         yk.res_pending = 0;
+         yk_res_wanted = 1;
+      }
+      if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
+      {
+         /* Option changes rebuild GL objects and may resize the engine's
+          * framebuffers: park the machine so it is not mid-frame. */
+         int prev_resolution_mode = resolution_mode;
+         int prev_multitap[2] = {multitap[0],multitap[1]};
+         bool prev_service_enabled = service_enabled;
+         check_variables();
+         yk_seg_hit(7);
+         if(prev_resolution_mode != resolution_mode)
+            yk_res_wanted = 1;   /* the render thread performs it */
+         VIDCore->SetSettingValue(VDP_SETTING_RBG_RESOLUTION_MODE, g_rbg_resolution_mode);
+         VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
+         if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
+                        || prev_service_enabled != service_enabled))
+            PERCore->Init();
+         yk_seg_hit(6);        /* option block finished */
+      }
+
+
+      yk_seg_hit(3);
+      yk_detach();
+#if YAB_TRACE_LEVEL >= 2
+      /* Caller mode: the whole VDP workflow (rasterise + compose) runs here, on
+       * the thread the frontend waits for, so its cost is part of the frame
+       * budget.  [RP] reports it per 60 fields, like [FT] does for the machine. */
+      u64 _rp_t0 = yab_ft_now();
+#endif
+      /* One field per call, never wait: the frontend is the pacer and the
+       * machine's retire join holds it to one field of lead.  Waiting for a
+       * picture here (the earlier shape) made the core the pacer: the machine
+       * free-ran, the queue backed up and commands drained 2-3 fields per call
+       * (measured [RP]=18-23 ms against ~5 ms of work per field, swap running
+       * ~100 ahead of present).  See Vdp2DrainOneField(). */
+      {
+         extern int Vdp2DrainOneField(void);
+         extern int YabVdp1FrameCount(void);
+         int v1_before = YabVdp1FrameCount();
+         unsigned before = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
+         /* One field per call, never the backlog: the drain consumes VOUT(a)
+          * and VIN(a+1) and stops at the VIN, so a call never touches a second
+          * field.  The field clock is inside the workflow
+          * (frameSkipAndLimit), exactly as on VdpProc, so this call spans the
+          * field period and the frontend's next retro_run finds the next field
+          * ready. */
+         Vdp2DrainOneField();
          now = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
+         /* Default: every composed field is a picture (the standalone's
+          * YuiSwapBuffers runs once per field, unconditionally).  A VDP1-change
+          * trigger is available for A/B -- measured on Daytona it drops the
+          * picture rate to the vdp1= value (13-31/s) and the frontend then
+          * re-presents the same frame for the rest of the second, so VDP2-only
+          * motion (scrolling backgrounds) updates at that rate too. */
+         {
+            static int v1_only = -1;
+            if (v1_only < 0) v1_only = getenv("YAB_VDP_PRESENT_VDP1") ? 1 : 0;
+            yk_new_pic = v1_only ? (YabVdp1FrameCount() != v1_before) : (now != before);
+         }
+         if (yk_new_pic) swap_seen = now;
+      }
       /* One field of audio space per field, whether or not this field produced
        * a picture: the SCSP thread blocks in SNDLIBRETROGetAudioSpace() until
        * the frontend grants it, and a frameskip field must not starve the
        * sound (our fork's model; without this the thread produces nothing and
        * UpdateAudio is never called -- measured: silent core). */
       audio_size = soundlen;
-         if (now != swap_seen) break;
-         if (++spins > 500) break;          /* 5 s safety cap */
-         usleep(1000);
+#if YAB_TRACE_LEVEL >= 2
+      {
+         static u64 sum, mx;
+         static unsigned n;
+         u64 d = yab_ft_now() - _rp_t0;
+         sum += d;
+         if (d > mx) mx = d;
+         if (++n >= 60)
+         {
+            printf("[RP] n=%u caller field: %.2f ms avg, %.2f ms max\n",
+                   n, (double)sum / 60.0 / 1e6, (double)mx / 1e6);
+            fflush(stdout);
+            sum = mx = 0; n = 0;
+         }
       }
-      now = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
-
+#endif
+      yk_seg_hit(4);
+      yk_n_present++;
+      yk_seg_hit(9);
+      yk_attach();          /* borrow for the present */
+      yk_seg_hit(8);
       {
          /* Present every field the worker composed -- that is what the standalone
           * does, and the earlier "only present when VDP1 produced a new frame"
@@ -4210,20 +4443,20 @@ void retro_run(void)
           * reports "6 new, 296 dupe (M:60.0 P:43.6)" -- i.e. the display stopped
           * updating while the machine kept running.  Without it the same log
           * shows "298 new, 0 dupe (M:60.4 P:60.4)". */
-         if (now != swap_seen)
+         yk_seg_hit(6);
+         if (yk_new_pic)
          {
-            swap_seen = now;
-            video_cb(RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
+            yk_n_vcb++;
+            video_cb(yk_no_present ? NULL : RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
          }
          else
          {
-            /* Safety-cap path only (the worker produced no picture within the
-             * wait window): a dupe keeps the frontend's clock alive. */
+            /* No field was ready to compose this call (the machine is still
+             * emulating): hand the frontend a dupe so its clock stays alive. */
             video_cb(NULL, current_width, current_height, 0);
          }
       }
-      /* The frontend advanced its hw-render ring inside that video_cb. */
-      yk_adopt_front_fbo();
+      /* the next field picks the slot the frontend advanced to */
 #if YAB_TRACE_LEVEL >= 2
       /* L2 probe [V1]: the numbers the standalone's OSD shows, measured the same
        * way -- VDP1 frame changes per second (vdp1_frame), commands drawn
@@ -4248,15 +4481,32 @@ void retro_run(void)
          }
       }
 #endif /* YAB_TRACE_LEVEL >= 2 */
-      /* Release the render thread (it blocks in YuiSwapBuffers until the frame
-       * is presented, like the standalone's SDL swap). */
-      __atomic_store_n(&yab_present_ack, now, __ATOMIC_RELEASE);
+      yk_seg_hit(5);
+      yk_detach();          /* present done: hand the lease back */
       YABFRONT("retro_run:end");
 #if YAB_TRACE_LEVEL >= 2
       yab_ft_report();
 #endif
    }
+#if YAB_TRACE_LEVEL >= 2
+   {
+      static u64 sum, mx;
+      static unsigned n;
+      u64 d = yab_ft_now() - _rr_t0;
+      sum += d;
+      if (d > mx) mx = d;
+      if (++n >= 60)
+      {
+         printf("[RR] n=%u retro_run total: %.2f ms avg, %.2f ms max\n",
+                n, (double)sum / 60.0 / 1e6, (double)mx / 1e6);
+         fflush(stdout);
+         sum = mx = 0; n = 0;
+      }
+   }
+#endif
    yab_in_run = 0;
+   if (yk_caller_mode)
+      yab_pace_field(_rr_entry_ns);
 }
 
 #ifdef ANDROID

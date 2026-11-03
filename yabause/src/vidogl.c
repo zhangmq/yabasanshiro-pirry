@@ -7023,9 +7023,27 @@ void VIDOGLVdp2DrawEnd(void)
   Vdp2DrawRotationSync();
   FrameProfileAdd("Vdp2DrawRotationSync end");
 
-  YglTmPush(YglTM);
-
-  YglRender();
+  {
+    /* probe: VIDOGLVdp2DrawEnd = atlas push + composition. [YGR] shows the
+     * composition is ~1.3 ms, so time the push separately. */
+    struct timespec _p0, _p1, _p2;
+    clock_gettime(CLOCK_MONOTONIC, &_p0);
+    YglTmPush(YglTM);
+    clock_gettime(CLOCK_MONOTONIC, &_p1);
+    YglRender();
+    clock_gettime(CLOCK_MONOTONIC, &_p2);
+    {
+      double _push = (double)(_p1.tv_sec - _p0.tv_sec) * 1000.0 + (double)(_p1.tv_nsec - _p0.tv_nsec) / 1e6;
+      double _rend = (double)(_p2.tv_sec - _p1.tv_sec) * 1000.0 + (double)(_p2.tv_nsec - _p1.tv_nsec) / 1e6;
+      static int _n = 0;
+      if (_n < 400)
+      {
+        _n++;
+        fprintf(stderr, "[PUSH] Vdp2DrawEnd: push %.2f ms + render %.2f ms\n", _push, _rend);
+        fflush(stderr);
+      }
+    }
+  }
 
 
   /* It would be better to reset manualchange in a Vdp1SwapFrameBuffer
