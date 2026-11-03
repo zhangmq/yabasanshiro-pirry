@@ -602,7 +602,8 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
         g_ptmr_this_frame = 1;   /* VOUT dispatch ordering, see Vdp2HBlankOUT */
         FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
         {
-          { extern void Vdp1JoinPendingRendersC(void); Vdp1JoinPendingRendersC(); }
+          { extern void Vdp1JoinPendingRendersC(void); extern void Vdp1JoinPendingRendersLeadC(void);
+            Vdp1JoinPendingRendersLeadC(); }
           if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
             yabsys.wait_line_count = -1;
             do{

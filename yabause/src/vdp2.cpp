@@ -83,8 +83,14 @@ u8 * Vdp2RamRender = NULL;        /* VDP2 RAM as read by the render thread (snap
    tile maps while the previous frame is still being drawn, so the drawn frame mixed old and new data (Earthworm Jim 2:
    background judder). Only a few pages change per frame (about 4-5 of 128), the copy is cheap. */
 #define V2SNAP_PAGES 128
-static u8 *Vdp2RamSnap = NULL;
-static u8 v2snap_dirty[V2SNAP_PAGES];
+/* Two snapshot slots for VDP2 RAM and line registers, for the same reason as
+ * Vdp1RamSnap: the machine writes the slot the renderer is not reading, so a
+ * one-field lead no longer overwrites live data.  Which slot a field uses is
+ * published with the snapshot and recorded by the consumer. */
+static u8 *Vdp2RamSnap[2] = { NULL, NULL };
+static int v2_snap_cur = 0;
+static u8 v2snap_dirty[2][V2SNAP_PAGES];   /* per slot */
+static int v2_snap_slot(void) { return v2_snap_cur; }
 static int v2snap_all = 1;
 /* Set by the VDP1 PTMR=1 write (vdp1.cpp); see the VOUT dispatch in Vdp2HBlankOUT. */
 extern "C" { volatile int g_ptmr_this_frame = 0; }
@@ -96,7 +102,7 @@ Vdp2 Vdp2Lines[270];
    (depth effects). With the VBlank-IN decoupling the render thread would read lines that the
    emulation thread is already overwriting for the next frame, showing up as a black seam
    between two layers. */
-static Vdp2 Vdp2LinesSnap[270];
+static Vdp2 Vdp2LinesSnap[2][270];
 Vdp2 * Vdp2LinesRender = Vdp2Lines;   /* points to the live data or the snapshot */
 static int g_v2snap = -1;
 
@@ -116,8 +122,8 @@ extern "C" void Vdp2LinesSnapshot(void) {
     g_v2snap = 1;   /* fixed on */
   }
   if (!g_v2snap) { Vdp2LinesRender = Vdp2Lines; return; }
-  memcpy(Vdp2LinesSnap, Vdp2Lines, sizeof(Vdp2LinesSnap));
-  Vdp2LinesRender = Vdp2LinesSnap;
+  memcpy(Vdp2LinesSnap[v2_snap_cur], Vdp2Lines, sizeof(Vdp2LinesSnap[0]));
+  Vdp2LinesRender = Vdp2LinesSnap[v2_snap_cur];
 }
 
 
@@ -140,6 +146,9 @@ static int vdp_proc_running = 0;
 static int vdp_on_caller = 0;
 /* Breadcrumb owned by libretro.c: the last point the machine thread reached. */
 extern "C" int yab_emu_stage;
+/* vdp2.cpp snapshot slots, reachable from the consumer functions below. */
+extern "C" int  Vdp2SnapshotSlot(void);
+extern "C" void Vdp2SelectSnapshot(int slot);
 /* vdp1.cpp: which of the two VDP1 RAM snapshot slots a VOUT belongs to. */
 extern "C" int  Vdp1SnapshotSlot(void);
 extern "C" void Vdp1SelectSnapshot(int slot);
@@ -250,6 +259,9 @@ static volatile u8 vdp1_evt_erase[64];
 static volatile u8 vdp1_evt_manualerase[64];
 static volatile u8 vdp1_evt_swap[64];
 static volatile u8 vdp1_evt_snap[64];   /* which Vdp1RamSnap slot this VOUT belongs to */
+/* Consumer side: the VDP2 snapshot slot the next VBLANK_IN composes from.  VOUT
+ * publishes it, the VIN that follows in the queue uses it. */
+static u8 v2_slot_next_vin = 0;
 static volatile u32 vdp1_evt_widx = 0;
 static volatile u32 vdp1_evt_ridx = 0;
 static int vdp1_manualerase_armed = 0;  // emulation thread: armed until the next swap
@@ -278,15 +290,33 @@ static inline unsigned int counter_delta(unsigned int now_val, unsigned int *pre
 static int g_vin_decoupled = -1;
 static int vin_render_pending = 0;
 
+/* How many VINs may be outstanding.  One is 1.6.2's handshake: the machine waits
+ * for the renderer to consume the previous VIN.  That works when the renderer is
+ * a thread answering in microseconds; here it is the frontend's thread and its
+ * latency is one field, so a depth-1 handshake costs the machine a whole field per
+ * field (measured 12-16 ms).  With the VDP1/VDP2 snapshots double-buffered the
+ * older field is still intact while the machine runs the next one, so two may be
+ * in flight; the machine then only waits when the renderer is a full two fields
+ * behind. */
+#define YAB_VIN_DEPTH 2
+
 static void Vdp2JoinPendingVIN(void) {
   /* Caller mode only: the standalone keeps 1.6.2's wait, which its renderer
    * releases as usual. */
   if (vdp_on_caller && g_join_abort) { vin_render_pending = 0; return; }
-  if (vin_render_pending) {
+  if (!vin_render_pending) return;
+  if (!vdp_on_caller) {
     unsigned long long _t0 = yab_now_ns();
     YabWaitEventQueue(rcv_evqueue);
     { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_vin += _d; }
     vin_render_pending = 0;
+    return;
+  }
+  while (vin_render_pending >= YAB_VIN_DEPTH) {
+    unsigned long long _t0 = yab_now_ns();
+    YabWaitEventQueue(rcv_evqueue);
+    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_vin += _d; }
+    vin_render_pending--;
   }
 }
 
@@ -546,7 +576,7 @@ extern "C" void Vdp2RamBlockWritten(u32 addr, u32 bytes) {
     u32 n = page_end - a; if (n > rest) n = rest;
     if (a < 0x20000) A0_Updated = 1; else if (a < 0x40000) A1_Updated = 1; else if (a < 0x60000) B0_Updated = 1; else B1_Updated = 1;
     Vdp2MarkVramWrite(a, n);
-    v2snap_dirty[a >> 12] = 1;
+    v2snap_dirty[0][a >> 12] = 1; v2snap_dirty[1][a >> 12] = 1;
     rest -= n; a = (a + n) & 0x7FFFF;
   }
 }
@@ -555,27 +585,43 @@ extern "C" void Vdp2RamBlockWritten(u32 addr, u32 bytes) {
    so no render reads the snapshot meanwhile. Every copied page gets a new texture cache stamp: otherwise a tile written
    after the previous dispatch would have been decoded from the old copy and kept as fresh. */
 static void Vdp2RamSnapshot(void) {
-  if (Vdp2RamSnap == NULL || Vdp2Ram == NULL) return;
+  int slot = v2_snap_cur ^ 1;          /* the slot the renderer is not reading */
+  u8 *dst;
+  if (Vdp2RamSnap[0] == NULL || Vdp2Ram == NULL) return;
+  dst = Vdp2RamSnap[slot];
   if (v2snap_all) {
-    memcpy(Vdp2RamSnap, Vdp2Ram, 0x80000);
+    memcpy(Vdp2RamSnap[0], Vdp2Ram, 0x80000);
+    memcpy(Vdp2RamSnap[1], Vdp2Ram, 0x80000);
     memset(v2snap_dirty, 0, sizeof(v2snap_dirty));
     v2snap_all = 0;
     for (u32 p = 0; p < V2SNAP_PAGES; p++) Vdp2MarkVramWrite(p << 12, 0x1000);
   } else {
+    u8 *dirty = v2snap_dirty[slot];
     u32 i = 0;
     for (;;) {
       if (i >= V2SNAP_PAGES) break;
-      if (!v2snap_dirty[i]) { i++; continue; }
+      if (!dirty[i]) { i++; continue; }
       u32 a0 = i;
       for (;;) {
-        if (i >= V2SNAP_PAGES || !v2snap_dirty[i]) break;
-        v2snap_dirty[i] = 0; i++;
+        if (i >= V2SNAP_PAGES || !dirty[i]) break;
+        dirty[i] = 0; i++;
       }
-      memcpy(Vdp2RamSnap + (a0 << 12), Vdp2Ram + (a0 << 12), (size_t)(i - a0) << 12);
+      memcpy(dst + (a0 << 12), Vdp2Ram + (a0 << 12), (size_t)(i - a0) << 12);
       for (u32 p = a0; p < i; p++) Vdp2MarkVramWrite(p << 12, 0x1000);
     }
   }
-  Vdp2RamRender = Vdp2RamSnap;
+  v2_snap_cur = slot;
+  Vdp2RamRender = dst;
+  Vdp2LinesRender = Vdp2LinesSnap[slot];
+}
+
+/* Publish/pick the slot for the consumer (same contract as the VDP1 snapshot). */
+extern "C" int Vdp2SnapshotSlot(void) { return v2_snap_slot(); }
+extern "C" void Vdp2SelectSnapshot(int slot)
+{
+  if (slot < 0 || slot > 1) return;
+  if (Vdp2RamSnap[slot] != NULL) Vdp2RamRender = Vdp2RamSnap[slot];
+  Vdp2LinesRender = Vdp2LinesSnap[slot];
 }
 
 //#define VRAM_WRITE_CHECK 1
@@ -607,7 +653,7 @@ void FASTCALL Vdp2RamWriteByte(u32 addr, u8 val) {
    }
 
    Vdp2MarkVramWrite(addr, 1);
-   v2snap_dirty[addr >> 12] = 1;
+   v2snap_dirty[0][addr >> 12] = 1; v2snap_dirty[1][addr >> 12] = 1;
    T1WriteByte(Vdp2Ram, addr, val);
 }
 
@@ -638,7 +684,8 @@ void FASTCALL Vdp2RamWriteWord(u32 addr, u16 val) {
    }
 
    Vdp2MarkVramWrite(addr, 2);
-   v2snap_dirty[addr >> 12] = 1; v2snap_dirty[((addr + 1) & 0x7FFFF) >> 12] = 1;
+   v2snap_dirty[0][addr >> 12] = 1; v2snap_dirty[0][((addr + 1) & 0x7FFFF) >> 12] = 1;
+   v2snap_dirty[1][addr >> 12] = 1; v2snap_dirty[1][((addr + 1) & 0x7FFFF) >> 12] = 1;
    T1WriteWord(Vdp2Ram, addr, val);
 }
 
@@ -669,7 +716,8 @@ void FASTCALL Vdp2RamWriteLong(u32 addr, u32 val) {
    }
 
    Vdp2MarkVramWrite(addr, 4);
-   v2snap_dirty[addr >> 12] = 1; v2snap_dirty[((addr + 3) & 0x7FFFF) >> 12] = 1;
+   v2snap_dirty[0][addr >> 12] = 1; v2snap_dirty[0][((addr + 3) & 0x7FFFF) >> 12] = 1;
+   v2snap_dirty[1][addr >> 12] = 1; v2snap_dirty[1][((addr + 3) & 0x7FFFF) >> 12] = 1;
    T1WriteLong(Vdp2Ram, addr, val);
 }
 
@@ -779,8 +827,11 @@ int Vdp2Init(void) {
       return -1;
 
    Vdp2RamRender = Vdp2Ram;   /* until the first dispatch */
-   if (Vdp2RamSnap == NULL && (Vdp2RamSnap = T1MemoryInit(0x80000)) == NULL)
+   if (Vdp2RamSnap[0] == NULL && (Vdp2RamSnap[0] = T1MemoryInit(0x80000)) == NULL)
       return -1;
+   if (Vdp2RamSnap[1] == NULL && (Vdp2RamSnap[1] = T1MemoryInit(0x80000)) == NULL)
+      return -1;
+   v2_snap_cur = 0;
    v2snap_all = 1;
 
    if ((Vdp2ColorRam = T2MemoryInit(0x1000)) == NULL)
@@ -830,9 +881,9 @@ void Vdp2DeInit(void) {
 
    Vdp2RamRender = NULL;
 
-   if (Vdp2RamSnap)
-      T1MemoryDeInit(Vdp2RamSnap);
-   Vdp2RamSnap = NULL;
+   if (Vdp2RamSnap[0]) T1MemoryDeInit(Vdp2RamSnap[0]);
+   if (Vdp2RamSnap[1]) T1MemoryDeInit(Vdp2RamSnap[1]);
+   Vdp2RamSnap[0] = Vdp2RamSnap[1] = NULL;
 
    if (Vdp2Ram)
       T1MemoryDeInit(Vdp2Ram);
@@ -1373,6 +1424,8 @@ void frameSkipAndLimit() {
 
 //////////////////////////////////////////////////////////////////////////////
 void vdp2VBlankIN(void) {
+   /* Compose from the VDP2 snapshot slot the preceding VOUT published. */
+   Vdp2SelectSnapshot(v2_slot_next_vin);
    /* this should be done after a frame change or a plot trigger */
    //Vdp1Regs->COPR = 0;
    //printf("COPR = 0 at %d\n", __LINE__);
@@ -1449,7 +1502,7 @@ void Vdp2VBlankIN(void) {
     yab_emu_stage = 11;   /* before VIN enqueue */
     YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
     yab_emu_stage = 12;
-    vin_render_pending = 1;
+    vin_render_pending++;
     FrameProfileAdd("VIN decoupled");
     return;
   }
@@ -1620,7 +1673,13 @@ void Vdp2HBlankOUT(void) {
     Vdp2External.frame_render_flg = 1;
 #if defined(YAB_ASYNC_RENDERING)
     /* This join guards the single VDP1 snapshot buffer. */
-    Vdp1JoinPendingRenders();
+    /* Two snapshot slots (vdp1.cpp/vdp2.cpp): one field of lead no longer
+     * overwrites what the renderer is reading, so the lead join is the right
+     * protection here.  Caller mode only; the standalone keeps the strict join. */
+    if (vdp_on_caller)
+      Vdp1JoinPendingRendersLead();
+    else
+      Vdp1JoinPendingRenders();
 #endif
     // Manual Change
     if (Vdp1External.manualchange == 1) {
@@ -1713,6 +1772,9 @@ void Vdp2HBlankOUT(void) {
     vdp1_evt_snap[(vdp1_evt_widx - 1) & 63] = (u8)(Vdp1SnapshotSlot() & 1);
     Vdp2LinesSnapshot();
     Vdp2RamSnapshot();
+    /* Which slot these snapshots landed in: the consumer's next VIN composes from
+     * it (the VOUT event and the following VIN belong to the same field). */
+    v2_slot_next_vin = (u8)(Vdp2SnapshotSlot() & 1);
     FRAMELOG("YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT)");
     yab_emu_stage = 13;   /* before VOUT enqueue */
     YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
