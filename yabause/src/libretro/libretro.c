@@ -82,6 +82,7 @@ static bool renderer_running = false;
 
 /* Async emulation thread control (defined next to retro_run). */
 static void yab_emu_start(void);
+static volatile int yab_emu_running;   /* defined next to the emulation thread */
 static volatile int yab_emu_done = 1;   /* the machine thread has returned */
 /* Breadcrumb: the last point of its frame the machine thread reached.  Printed
  * with [RR] so a machine that stops advancing names its blocking call. */
@@ -2599,6 +2600,12 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
  * caller's size out of a freshly allocated buffer with no bounds check. */
 static size_t g_serialize_size = 0;
 
+static const void *yab_st_load_buf; static size_t yab_st_load_size;
+static void       *yab_st_save_buf; static size_t yab_st_save_size;
+static volatile int yab_st_req;        /* 0 none, 1 load, 2 save */
+static volatile int yab_st_done;       /* 0 pending, 1 ok, -1 failed */
+static volatile int yab_st_need_res;   /* ask retro_run to refresh the video size */
+
 size_t retro_serialize_size(void)
 {
    void *buffer = NULL;
@@ -2624,35 +2631,35 @@ size_t retro_serialize_size(void)
 
 bool retro_serialize(void *data, size_t size)
 {
-   void *buffer = NULL;
-   size_t out_size = 0;
-   int error;
-
-   /* The machine runs on its own thread: park it so the state we save is a
-    * between-frames state, not one being mutated under us.  The state lives in
-    * plain globals now, so no binding is needed. */
-   yab_emu_pause();
-   ScspMuteAudio(SCSP_MUTE_SYSTEM);
-   error = YabSaveStateBuffer (&buffer, &out_size);
-   ScspUnMuteAudio(SCSP_MUTE_SYSTEM);
-   yab_emu_resume();
-
-   if (error || !buffer)
-      return false;
-
-   if (out_size > size)
+   /* The engine work runs on the machine thread, at its frame boundary -- the
+    * same place the standalone's menu performs YabSaveStateSlot().  See
+    * yab_state_service(). */
+   int spins = 0;
+   yab_st_save_buf = NULL; yab_st_save_size = 0;
+   yab_st_done = 0;
+   yab_st_req = 2;
+   while (yab_st_done == 0 && ++spins < 3000)
+      usleep(1000);
+   if (yab_st_done != 1 || yab_st_save_buf == NULL)
    {
-      /* State grew past the cached upper bound -- fail rather than truncate. */
-      free(buffer);
+      free(yab_st_save_buf);
+      yab_st_save_buf = NULL;
       return false;
    }
-
-   memcpy(data, buffer, out_size);
-   if (out_size < size)
-      memset((unsigned char *)data + out_size, 0, size - out_size);
+   if (yab_st_save_size > size)
+   {
+      /* State grew past the cached upper bound -- fail rather than truncate. */
+      free(yab_st_save_buf);
+      yab_st_save_buf = NULL;
+      return false;
+   }
+   memcpy(data, yab_st_save_buf, yab_st_save_size);
+   if (yab_st_save_size < size)
+      memset((unsigned char *)data + yab_st_save_size, 0, size - yab_st_save_size);
    YAB_TR_L1("[STATE] save %lu bytes (buffer %lu)\n",
-             (unsigned long)out_size, (unsigned long)size);
-   free(buffer);
+             (unsigned long)yab_st_save_size, (unsigned long)size);
+   free(yab_st_save_buf);
+   yab_st_save_buf = NULL; yab_st_save_size = 0;
    return true;
 }
 
@@ -2676,51 +2683,18 @@ bool retro_serialize(void *data, size_t size)
  * still load through M68KMusashiLoadStateV4().  With that in place a state loads
  * correctly at any frame, so the gate is gone.
  * ------------------------------------------------------------------------- */
-static int apply_state_buffer(const void *data, size_t size)
-{
-   int error = YabLoadStateBuffer(data, size);
-   if (g_vdp_async)
-   {
-      /* retro_set_resolution() rebuilds the video core's GL objects, and the
-       * thread driving retro_run does not have the core's shared context
-       * current -- borrow it for the duration, exactly like the option-change
-       * and res_pending paths in retro_run().  VdpRevoke()/VdpResume() are the
-       * old handshake with the deleted VDP worker and are no-ops today
-       * (vdp2.cpp); they stay so a restored render thread keeps working. */
-      VdpRevoke();
-      yk_attach();
-      retro_set_resolution();
-      yk_detach();
-      VdpResume();
-   }
-   else
-      retro_set_resolution();
-   return error;
-}
 
 bool retro_unserialize(const void *data, size_t size)
 {
-   bool ok;
-   yab_emu_pause();
-   /* A state load restores VRAM/registers through the thread-local pointers: bind
-    * them to the machine's buffers first, otherwise the restored data lands in
-    * this thread's own pointers and the machine keeps running with empty VRAM
-    * (measured: every layer sampled nothing and the picture was black).
-    * Pointers only -- the full bind would zero the live VDP1 handshake, the same
-    * way it did on the save path. */
-   ok = apply_state_buffer(data, size) == 0;
-   /* The sound CPU's PC/SR are the cheapest proof that the 68k block really
-    * landed (the SH2s are not usable here: the dynarec keeps its own copy). */
-   YAB_TR_L1("[STATE] load %lu bytes -> %s (68k PC=%08X SR=%04X)\n",
-             (unsigned long)size, ok ? "ok" : "FAILED",
-             (unsigned)(M68K->GetPC()), (unsigned)(M68K->GetSR()));
-   Vdp2AfterLoadState();      /* PORT: pirry's reset of Vdp1External/waits after a load */
-   /* Audio queued before the load belongs to the old timeline (the sound thread
-    * keeps producing while the frontend is busy loading); handing it over after
-    * the load is both wrong and a blocking burst. */
-   yab_audio_drop_pending();
-   yab_emu_resume();
-   return ok;
+   /* Same hand-off as the save side: the frontend copies nothing and touches no
+    * engine state, it only waits for the machine thread to report. */
+   int spins = 0;
+   yab_st_load_buf = data; yab_st_load_size = size;
+   yab_st_done = 0;
+   yab_st_req = 1;
+   while (yab_st_done == 0 && ++spins < 3000)
+      usleep(1000);
+   return yab_st_done == 1;
 }
 
 void retro_cheat_reset(void)
@@ -3859,6 +3833,50 @@ static void yab_ft_report(void)
 }
 #endif /* YAB_TRACE_LEVEL >= 2 */
 
+/* ---------------------------------------------------------------------------
+ * Save/load hand-off.
+ *
+ * The standalone performs both at its frame boundary, on the thread that runs
+ * the machine: its menu handler calls YabSaveStateSlot()/YabLoadStateSlot()
+ * from the same loop as YabauseExec().  libretro calls retro_serialize()/
+ * retro_unserialize() from the frontend's thread instead, and doing the engine
+ * work there (the old shape: yab_emu_pause + VdpRevoke/VdpResume + GL lease)
+ * raced the machine: after a load it wedged inside the CD block
+ * (machine stage=72, Cs2Area->cdi->GetStatus()).
+ *
+ * So the frontend only copies the buffer and waits; the machine thread runs the
+ * very same YabLoadStateBuffer()/YabSaveStateBuffer() the standalone uses.
+ * ------------------------------------------------------------------------- */
+
+static void yab_state_service(void)
+{
+   int req = yab_st_req;
+   if (req == 0)
+      return;
+   if (req == 1)
+   {
+      int err = YabLoadStateBuffer(yab_st_load_buf, yab_st_load_size);
+      YAB_TR_L1("[STATE] load %lu bytes -> %s (68k PC=%08X SR=%04X)\n",
+                (unsigned long)yab_st_load_size, err == 0 ? "ok" : "FAILED",
+                (unsigned)(M68K->GetPC()), (unsigned)(M68K->GetSR()));
+      if (err == 0)
+      {
+         Vdp2AfterLoadState();
+         yab_audio_drop_pending();
+         yab_st_need_res = 1;      /* applied by retro_run, which owns GL */
+      }
+      yab_st_done = (err == 0) ? 1 : -1;
+   }
+   else if (req == 2)
+   {
+      void *buf = NULL; size_t size = 0;
+      int err = YabSaveStateBuffer(&buf, &size);
+      yab_st_save_buf = buf; yab_st_save_size = size;
+      yab_st_done = (err == 0) ? 1 : -1;
+   }
+   yab_st_req = 0;
+}
+
 static void *yab_emu_main(void *arg)
 {
    (void)arg;
@@ -3898,12 +3916,13 @@ static void *yab_emu_main(void *arg)
        * requested mid-frame also lands here within one frame. */
       yab_emu_parked = 1;
       YAB_STAGE(1);
+      yab_state_service();             /* save/load handed over by the frontend */
       for (;;)
       {
          if (!yab_emu_running) break;
-         if (yab_emu_paused) { usleep(500); continue; }
+         if (yab_emu_paused) { yab_state_service(); usleep(500); continue; }
          /* Frontend away (menu): park the machine, not just this thread's cycle. */
-         if (yab_front_pause_poll()) { usleep(1000); continue; }
+         if (yab_front_pause_poll()) { yab_state_service(); usleep(1000); continue; }
          break;
       }
       if (!yab_emu_running) break;
@@ -4274,6 +4293,13 @@ void retro_run(void)
        * budget.  [RP] reports it per 60 fields, like [FT] does for the machine. */
       u64 _rp_t0 = yab_ft_now();
 #endif
+      if (yab_st_need_res)
+      {
+         /* A savestate may carry another video mode; the rebuild has to run on
+          * this thread (it owns GL and the lease). */
+         yab_st_need_res = 0;
+         retro_set_resolution();
+      }
       /* One field per call, never wait: the frontend is the pacer and the
        * machine's retire join holds it to one field of lead.  Waiting for a
        * picture here (the earlier shape) made the core the pacer: the machine

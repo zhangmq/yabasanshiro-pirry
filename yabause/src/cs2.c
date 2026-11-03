@@ -945,10 +945,13 @@ void Cs2Exec(u32 timing) {
    if( Cs2Area->_command_execlock > 0  ){
       Cs2Area->_command_execlock -= timing;
       if (Cs2Area->_command_execlock <= 0) {
+        { extern int yab_emu_stage; yab_emu_stage = 69; }
         Cs2SetIRQ(Cs2Area->_delay_irq);
+        { extern int yab_emu_stage; yab_emu_stage = 68; }
       }
    }
    else {
+     { extern int yab_emu_stage; yab_emu_stage = 71; }
      if (Cs2Area->_commandtiming > 0)
      {
        if (Cs2Area->_commandtiming <= timing)
@@ -966,6 +969,7 @@ void Cs2Exec(u32 timing) {
    }
 
 
+   { extern int yab_emu_stage; yab_emu_stage = 72; }
    if (Cs2Area->_statuscycles >= Cs2Area->_statustiming)
    {
       Cs2Area->_statuscycles -= Cs2Area->_statustiming;
