@@ -2701,6 +2701,8 @@ bool retro_unserialize(const void *data, size_t size)
    yab_st_req = 1;
    while (yab_st_done == 0 && ++spins < 3000)
       usleep(1000);
+   if (yab_st_done == 0)
+      yab_st_req = 0;      /* cancel: the machine must not service it later */
    free(copy);
    yab_st_load_buf = NULL;
    return yab_st_done == 1;
@@ -3865,6 +3867,15 @@ static void yab_state_service(void)
    if (req == 1)
    {
       const unsigned char *h = (const unsigned char *)yab_st_load_buf;
+      if (!h)
+      {
+         /* The frontend gave up (it clears the request on timeout) or the
+          * pointer was already consumed: never feed a NULL buffer to the
+          * loader, it reports -2 (signature mismatch) and hides the real one. */
+         yab_st_req = 0;
+         yab_st_done = -1;
+         return;
+      }
       if (h)
          YAB_TR_L1("[STATE] load buffer head=%02X %02X %02X size=%lu\n",
                    h[0], h[1], h[2], (unsigned long)yab_st_load_size);
