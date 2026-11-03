@@ -922,23 +922,13 @@ typedef void *YK_Config;  typedef unsigned int YK_Uint; typedef int YK_Int;
 typedef unsigned int YK_Enum; typedef unsigned int YK_Bool;
 
 /* hw-render ring slots we keep FBOs for */
-#define YK_SLOT_COUNT 3
-
 static struct {
    void *lib;
    YK_Display dpy; YK_Context ctx_front; YK_Context ctx_sub; YK_Surface pb;
    YK_Surface draw, read;
    YK_Config cfg; YK_Int cfgid;
-   YK_Uint front_fbo, front_tex, mirror_fbo;
-   /* The mirror FBO must carry the same depth+stencil attachment the frontend
-    * gives the core (see yk_mirror_depth): the engine clips VDP2 layers with
-    * the STENCIL buffer and composites them with GL_GEQUAL against a DEPTH
-    * buffer cleared to 0.0. */
-   YK_Uint slot_fbo[YK_SLOT_COUNT];
-   YK_Uint slot_tex[YK_SLOT_COUNT];
-   int slot_n, slot_cur;
-   YK_Uint mirror_rb;            /* depth+stencil renderbuffer (core context) */
-   int mirror_rb_w, mirror_rb_h; /* its size == the frontend colour texture's */
+   YK_Uint front_fbo, front_tex;  /* what the frontend handed us (log only) */
+   YK_Uint mirror_rb;             /* unused: kept for the dormant YAB_NOWAIT path */
    int front_tex_w, front_tex_h;
    int state;                    /* 0 = untried, -1 = failed, 1 = ready */
    volatile int frame_pending, res_pending;
@@ -1019,14 +1009,6 @@ static struct {
 #define YK_GL_TEXTURE_HEIGHT     0x1001
 #define YK_GL_RGBA               0x1908
 #define YK_GL_UNSIGNED_BYTE      0x1401
-/* Fallback depth/stencil size when the frontend colour texture size cannot be
- * queried (see yk_query_front_size); every frontend we target hands out a
- * power-of-two FBO of at least this size for a 320x224..704x448 core. */
-#define YK_MIRROR_FALLBACK_DIM   1024
-/* Slack added to the engine's render area before sizing the depth/stencil
- * attachment: aspect/offset modes can shift the viewport by a few pixels, and
- * the attachment must never clip a draw. */
-#define YK_MIRROR_MARGIN         32
 
 /* Context-handoff trace: build with -DYAB_CTX_TRACE to see, on every borrow /
  * hand-back, which EGL context really ends up current on which thread.  The
@@ -1060,25 +1042,6 @@ static void yk_log_impl(const char *fmt, ...)
 /* Frontend context current: size of the colour texture the frontend hands the
  * core.  The depth/stencil attachment of the mirror FBO has to match it -- a
  * smaller attachment shrinks the framebuffer's effective render area. */
-static void yk_query_front_size(YK_Uint tex)
-{
-   YK_Int prev = 0, w = 0, h = 0;
-
-   if (!tex || !yk.BindTexture || !yk.GetTexLevelParameteriv)
-      return;
-   if (yk.GetIntegerv)
-      yk.GetIntegerv(YK_GL_TEXTURE_BINDING_2D, &prev);
-   yk.BindTexture(YK_GL_TEXTURE_2D, tex);
-   yk.GetTexLevelParameteriv(YK_GL_TEXTURE_2D, 0, YK_GL_TEXTURE_WIDTH, &w);
-   yk.GetTexLevelParameteriv(YK_GL_TEXTURE_2D, 0, YK_GL_TEXTURE_HEIGHT, &h);
-   yk.BindTexture(YK_GL_TEXTURE_2D, (YK_Uint)prev);
-   if (w > 0 && h > 0)
-   {
-      yk.front_tex_w = w;
-      yk.front_tex_h = h;
-   }
-}
-
 /* Core (shared) context current: (re)create and attach the mirror FBO's
  * depth+stencil renderbuffer.
  *
@@ -1094,69 +1057,6 @@ static void yk_query_front_size(YK_Uint tex)
  * through).  The frontend's own FBO has the attachment (glsm asks for
  * depth+stencil; minarch-gl attaches GL_DEPTH24_STENCIL8), the core-owned
  * mirror FBO needs its own -- FBOs are not shared between the two contexts. */
-static void yk_mirror_depth(void)
-{
-   /* Size the depth/stencil to the area the engine actually renders, not to
-    * the frontend's power-of-two colour texture.
-    *
-    * A framebuffer's dimensions are the INTERSECTION of its attachments', and
-    * the engine's per-frame clear is not scissored (ygles.c YglRender():
-    * glDisable(GL_SCISSOR_TEST); glClear(COLOR|DEPTH|STENCIL)), so with a
-    * frontend-sized (1024x1024) depth/stencil the engine clears
-    * 1024*1024*4 = 4 MB of depth+stencil every frame on top of the colour
-    * clear -- and every layer fragment does a depth read-modify-write against
-    * it.  In RES_NATIVE (the mode this port uses) the engine draws only
-    * current_width x current_height at the origin, so a render-area-sized
-    * attachment makes both clears (and the attachment traffic) 10x+ smaller at
-    * 320x224 while every draw stays inside the area.  Clamped to the
-    * frontend's texture: never larger than before. */
-   int w, h;
-   int fw = yk.front_tex_w, fh = yk.front_tex_h;
-
-   if (current_width > 0 && current_height > 0)
-   {
-      w = current_width  + YK_MIRROR_MARGIN;
-      h = current_height + YK_MIRROR_MARGIN;
-   }
-   else
-   {
-      /* resolution not known yet (context_reset runs before the first
-       * retro_set_resolution): stay frontend-sized, shrink on the first frame */
-      w = fw;
-      h = fh;
-   }
-
-   if (!yk.FramebufferRenderbuffer || !yk.GenRenderbuffers ||
-       !yk.RenderbufferStorage || !yk.BindRenderbuffer)
-      return;
-   if (fw > 0 && w > fw) w = fw;
-   if (fh > 0 && h > fh) h = fh;
-   if (w <= 0 || h <= 0)
-   {
-      w = fw > 0 ? fw : YK_MIRROR_FALLBACK_DIM;
-      h = fh > 0 ? fh : YK_MIRROR_FALLBACK_DIM;
-   }
-   if (yk.mirror_rb && (yk.mirror_rb_w != w || yk.mirror_rb_h != h))
-   {
-      if (yk.DeleteRenderbuffers)
-         yk.DeleteRenderbuffers(1, &yk.mirror_rb);
-      yk.mirror_rb = 0;
-      yk.mirror_rb_w = yk.mirror_rb_h = 0;
-   }
-   if (!yk.mirror_rb)
-   {
-      yk.GenRenderbuffers(1, &yk.mirror_rb);
-      yk.BindRenderbuffer(YK_GL_RENDERBUFFER, yk.mirror_rb);
-      yk.RenderbufferStorage(YK_GL_RENDERBUFFER, YK_GL_DEPTH24_STENCIL8, w, h);
-      yk.BindRenderbuffer(YK_GL_RENDERBUFFER, 0);
-      yk.mirror_rb_w = w;
-      yk.mirror_rb_h = h;
-      yk_log("mirror depth/stencil rb=%u %dx%d", (unsigned)yk.mirror_rb, w, h);
-   }
-   yk.FramebufferRenderbuffer(YK_GL_FRAMEBUFFER, YK_GL_DEPTH_STENCIL_ATTACHMENT,
-         YK_GL_RENDERBUFFER, yk.mirror_rb);
-}
-
 /* Emulation thread, frontend context current (called from context_reset, i.e.
  * after the frontend created its FBO).  Creates the shared context, the mirror
  * FBO, and leaves the SHARED context current on this thread so that
@@ -1269,23 +1169,16 @@ static void yk_load(void)
    { yk_log("frontend FBO has no colour texture -> async rendering disabled"); return; }
 
 
-   /* ONE context: the frontend's; access is leased. */
-   yk.GenFramebuffers(1, &yk.mirror_fbo);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.mirror_fbo);
-   yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-         YK_GL_TEXTURE_2D, yk.front_tex, 0);
-   yk_query_front_size(yk.front_tex);
-   yk_mirror_depth();
-   yk.slot_fbo[0] = yk.mirror_fbo;
-   yk.slot_tex[0] = yk.front_tex;
-   yk.slot_n = 1; yk.slot_cur = 0;
+   /* ONE context: the frontend's, leased to whichever thread is drawing.  The
+    * core does NOT own a framebuffer any more: in a single context the FBO the
+    * frontend hands out (hw_render.get_current_framebuffer()) already carries
+    * the depth+stencil the engine needs (glsm asked for both), so YuiRetargetFB
+    * only has to bind it.  The mirror FBO, its private depth/stencil
+    * renderbuffer and the per-field attachment/texture queries were all
+    * artefacts of the two-context model, where FBOs could not be shared. */
    st = yk.CheckFramebufferStatus ? yk.CheckFramebufferStatus(YK_GL_FRAMEBUFFER) : 0;
-   yk_log("share ctx=%p pbuffer=%p front_ctx=%p cfgid=%d front_fbo=%u front_tex=%u "
-          "mirror_fbo=%u depth_rb=%u status=0x%x",
-          yk.ctx_sub, yk.pb, yk.ctx_front, (int)yk.cfgid, yk.front_fbo, yk.front_tex,
-          yk.mirror_fbo, (unsigned)yk.mirror_rb, (unsigned)st);
-   if (yk.CheckFramebufferStatus && st != YK_GL_FRAMEBUFFER_COMPLETE)
-   { yk_log("mirror FBO incomplete -> async rendering disabled"); return; }
+   yk_log("share ctx=%p front_ctx=%p cfgid=%d front_fbo=%u front_tex=%u status=0x%x",
+          yk.ctx_sub, yk.ctx_front, (int)yk.cfgid, yk.front_fbo, yk.front_tex, (unsigned)st);
 
    yk.state = 1;
 }
@@ -1744,9 +1637,7 @@ static void yk_rt_blit_to_front(int w, int h)
    /* The render targets only ever grow, so after a resolution SHRINK they are
     * larger than the picture: copy exactly the area the engine renders
     * (current_width x current_height), never the whole target -- blitting the
-    * full target scaled the picture up by 352/320 and shifted every pixel
-    * (measured: 75% of the pixels differing from the baseline at the same
-    * machine frame). */
+    * full target scaled the picture up by 352/320 and shifted every pixel. */
    if (w > yk.rt_w) w = yk.rt_w;
    if (h > yk.rt_h) h = yk.rt_h;
    yk_rt_lock();
@@ -1758,81 +1649,29 @@ static void yk_rt_blit_to_front(int w, int h)
    glBlitFramebuffer(0, 0, w, h, 0, 0, w, h, GL_COLOR_BUFFER_BIT, GL_NEAREST);
    yk.BindFramebuffer(YK_GL_FRAMEBUFFER, 0);
    yk_rt_unlock();
-
 }
 
-static void yk_rt_present_to(unsigned dst_fbo, int w, int h)
-{
-   yk_rt_lock();
-   if (!yk.rt_ok || !yk.rt_tex[yk.rt_front]) { yk_rt_unlock(); return; }
-   if (!yk.rt_read_fbo) yk.GenFramebuffers(1, &yk.rt_read_fbo);
-   yk.BindFramebuffer(GL_READ_FRAMEBUFFER, yk.rt_read_fbo);
-   yk.FramebufferTexture2D(GL_READ_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-         YK_GL_TEXTURE_2D, yk.rt_tex[yk.rt_front], 0);
-   yk.BindFramebuffer(GL_DRAW_FRAMEBUFFER, dst_fbo);
-   glBlitFramebuffer(0, 0, yk.rt_w, yk.rt_h, 0, 0, w, h,
-         GL_COLOR_BUFFER_BIT, GL_NEAREST);
-   yk.BindFramebuffer(GL_FRAMEBUFFER, dst_fbo);
-   yk_rt_unlock();
-}
-
-
-static YK_Uint yk_pick_slot(YK_Uint fbo)
-{
-   YK_Uint name = 0; YK_Int type = 0, prev = 0; int i;
-   if (!fbo || !yk.GetFramebufferAttachmentParameteriv || !yk.BindFramebuffer)
-      return yk.slot_fbo[yk.slot_cur];
-   if (yk.GetIntegerv) yk.GetIntegerv(YK_GL_FRAMEBUFFER_BINDING, &prev);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, fbo);
-   yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-         YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type);
-   if (type == YK_GL_TEXTURE)
-      yk.GetFramebufferAttachmentParameteriv(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-            YK_GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, (YK_Uint)prev);
-   if (!name) return yk.slot_fbo[yk.slot_cur];
-   for (i = 0; i < yk.slot_n; i++)
-      if (yk.slot_tex[i] == name)
-      { yk.slot_cur = i; yk.front_fbo = fbo; return yk.slot_fbo[i]; }
-   i = (yk.slot_n < YK_SLOT_COUNT) ? yk.slot_n++ : (yk.slot_cur + 1) % YK_SLOT_COUNT;
-   if (!yk.slot_fbo[i]) yk.GenFramebuffers(1, &yk.slot_fbo[i]);
-   yk.BindFramebuffer(YK_GL_FRAMEBUFFER, yk.slot_fbo[i]);
-   yk.FramebufferTexture2D(YK_GL_FRAMEBUFFER, YK_GL_COLOR_ATTACHMENT0,
-         YK_GL_TEXTURE_2D, name, 0);
-   yk.slot_tex[i] = name; yk.slot_cur = i; yk.front_fbo = fbo; yk.front_tex = name;
-   yk_query_front_size(name); yk.retarget = 1;
-   if (yk.ring_log < 24)
-   {
-      YAB_TR_L1("[YK] slot %d fbo=%u tex=%u\n", i, (unsigned)yk.slot_fbo[i], (unsigned)name);
-      yk.ring_log++;
-   }
-   return yk.slot_fbo[i];
-}
-
+/* The engine's render target: whatever FBO the frontend handed out for this
+ * frame.  One context means one bind -- no mirror FBO to keep in sync, no
+ * attachment query to find out which of our slots corresponds to it, no private
+ * depth/stencil to size (the frontend's FBO carries the depth+stencil glsm
+ * asked for, and the engine's VDP2 windows need exactly that). */
 void YuiRetargetFB(void)
 {
    if (g_vdp_async && yk.state == 1)
    {
-      YK_Uint slot;
-      if (yk_attach() < 0)
+      YK_Uint fbo = hw_render.get_current_framebuffer
+            ? (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer() : 0;
+      if (!fbo)
          return;
-      slot = yk_pick_slot(hw_render.get_current_framebuffer
-            ? (YK_Uint)(uintptr_t)hw_render.get_current_framebuffer() : 0);
-      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, slot);
-      if (yk.retarget) { yk_mirror_depth(); yk.retarget = 0; }
+      yk.BindFramebuffer(YK_GL_FRAMEBUFFER, fbo);
+      yk.front_fbo = fbo;
       yk_n_retarget++;
-      if ((yk_n_retarget % 10) == 0)
-         YK_TRACE("counts retarget=%u swap=%u present=%u vcb=%u | lease ok r=%u f=%u fail r=%u f=%u wait r=%u f=%u",
-                  yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb,
-                  yk_att_ok[0], yk_att_ok[1], yk_att_fail[0], yk_att_fail[1],
-                  yk_att_wait[0], yk_att_wait[1]);
    }
 }
 
 int YuiGetFB(void)
 {
-   if (yk.slot_fbo[yk.slot_cur])
-      return (int)yk.slot_fbo[yk.slot_cur];
    return hw_render.get_current_framebuffer ? hw_render.get_current_framebuffer() : 0;
 }
 
