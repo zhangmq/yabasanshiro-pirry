@@ -4027,6 +4027,14 @@ static void yab_pace_field(u64 t_entry_ns)
     * engine's frameskip then stayed engaged, most fields went through VIDDummy
     * and the frontend got far fewer pictures.  Half a period is jitter. */
    yab_core_behind = (now_ns > next_entry_ns + period_ns) ? 1 : 0;
+   /* Phase bias: the caller's arrival races the machine's VIN dispatch, and
+    * losing that race costs a whole picture (a dupe).  Arriving a few ms after
+    * the field boundary removes the race and keeps the period unchanged (only
+    * the phase moves).  HEAD has no such race because its worker runs free. */
+   /* No phase bias: measured, shifting the arrival by 3 ms did not reduce the
+    * dupes (still 77 per 5 s in the heaviest scenes), so the loss is not a race
+    * between the caller and the VIN dispatch.  Those scenes need the machine to
+    * run a field ahead (double-buffered snapshots) instead. */
    if (next_entry_ns > now_ns)
    {
       u64 d = next_entry_ns - now_ns;
