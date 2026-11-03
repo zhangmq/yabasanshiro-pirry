@@ -1184,6 +1184,24 @@ void VDP2SetFrameLimit(int mode) {
   }
 }
 
+/* Caller mode: frameSkipAndLimit() does two jobs -- it SLEEPS into the next
+ * field boundary and it DECIDES the skip.  The sleep moved to retro_run
+ * (yab_pace_field) because only the frontend's thread can see the present cost
+ * that has to come out of the period; the decision stays here, fed with the
+ * lateness that same function measures.  Gated by the same switch as the
+ * standalone's "frame skip" option (EnableAutoFrameSkip / yinit.frameskip). */
+extern "C" int yab_core_behind;
+extern "C" void Vdp2FrameSkipDecide(void)
+{
+  if (!autoframeskipenab)
+    return;
+  if (yab_core_behind)
+  {
+    skipnextframe = 1;
+    framestoskip = 1;
+  }
+}
+
 void frameSkipAndLimit() {
   if (FrameAdvanceVariable == 0 && enableFrameLimit )
   {
@@ -1268,7 +1286,9 @@ void vdp2VBlankIN(void) {
      static int limit_on = -1;
      if (limit_on < 0) limit_on = vdp_on_caller ? 0 : 1;
      if (limit_on)
-       frameSkipAndLimit();
+       frameSkipAndLimit();        /* worker model: sleep AND decide here */
+     else
+       Vdp2FrameSkipDecide();      /* caller model: only decide, see above */
    }
    VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would

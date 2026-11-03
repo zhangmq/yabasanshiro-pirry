@@ -2086,12 +2086,15 @@ static void context_reset(void)
       {
          /* Caller-driven VDP workflow: the standalone presents from the render
           * thread; libretro presents from the thread that calls retro_run. */
+         /* ONE path: the VDP workflow runs on the frontend's thread, in the
+          * frontend's context, exactly as VdpProc does in the standalone.
+          * There is no switch: the second-context worker model cannot present
+          * here (releasing the window-surface context every field crashes the
+          * driver in seconds) and keeping it alive leaves the frontend unable
+          * to draw. */
          extern void Vdp2SetOnCaller(int);
-         if (getenv("YAB_VDP_CALLER"))
-         {
-            Vdp2SetOnCaller(1);
-            yk_caller_mode = 1;
-         }
+         Vdp2SetOnCaller(1);
+         yk_caller_mode = 1;
       }
       yk_detach();
       yab_emu_start();
@@ -3088,7 +3091,12 @@ bool retro_load_game_common()
    yinit.m68kcoretype              = M68KCORE_C68K;
 #endif
    yinit.mpegpath                  = NULL;
-   yinit.frameskip                 = 0;   /* Auto Frameskip option removed (see frameSkipAndLimit) */
+   /* Same hand-over as the standalone (main.cpp: yinit.frameskip = g_frame_skip):
+    * the module latches the flag in YabauseInit (yabause.c: if (init->frameskip)
+    * EnableAutoFrameSkip()) and frameSkipAndLimit() then decides per field
+    * whether to skip.  check_variables() has already read the core option, so
+    * g_frameskip is the user's choice at this point. */
+   yinit.frameskip                 = g_frameskip;
    yinit.rbg_resolution_mode       = g_rbg_resolution_mode;
    yinit.rbg_use_compute_shader    = g_rbg_use_compute_shader;
    yinit.usethreads                = 0;
@@ -3921,6 +3929,11 @@ static void *yab_emu_main(void *arg)
  * `period - gap - work`.  Without that subtraction the core paced itself to a
  * full period on top of the frontend's work (measured: 16.7 + 2-3 ms per frame).
  */
+/* Consumed by the engine's frameskip decision (vdp2.cpp Vdp2FrameSkipDecide):
+ * 1 when the field did not fit its period, i.e. the same "behind" the
+ * standalone's frameSkipAndLimit() derives from its own clock. */
+int yab_core_behind = 0;
+
 static void yab_pace_field(u64 t_entry_ns)
 {
    static u64 gap_ns, t_prev_exit_ns;
@@ -3937,6 +3950,7 @@ static void yab_pace_field(u64 t_entry_ns)
    }
    budget_ns = period_ns > gap_ns ? period_ns - gap_ns : period_ns / 2;
    deadline_ns = t_entry_ns + budget_ns;
+   yab_core_behind = (now_ns > deadline_ns + period_ns / 2) ? 1 : 0;
    if (deadline_ns > now_ns)
    {
       u64 d = deadline_ns - now_ns;
@@ -4226,11 +4240,7 @@ void retro_run(void)
           * picture rate to the vdp1= value (13-31/s) and the frontend then
           * re-presents the same frame for the rest of the second, so VDP2-only
           * motion (scrolling backgrounds) updates at that rate too. */
-         {
-            static int v1_only = -1;
-            if (v1_only < 0) v1_only = getenv("YAB_VDP_PRESENT_VDP1") ? 1 : 0;
-            yk_new_pic = v1_only ? (YabVdp1FrameCount() != v1_before) : (now != before);
-         }
+         yk_new_pic = (now != before);   /* a field was composed this call */
          if (yk_new_pic) swap_seen = now;
       }
       /* One field of audio space per field, whether or not this field produced
