@@ -2689,11 +2689,20 @@ bool retro_unserialize(const void *data, size_t size)
    /* Same hand-off as the save side: the frontend copies nothing and touches no
     * engine state, it only waits for the machine thread to report. */
    int spins = 0;
-   yab_st_load_buf = data; yab_st_load_size = size;
+   /* Copy: the buffer belongs to the frontend and the machine thread reads it
+    * later; handing the pointer over directly made the load see something that
+    * did not start with "YSS" (err=-2), so copy once here. */
+   void *copy = malloc(size);
+   if (!copy)
+      return false;
+   memcpy(copy, data, size);
+   yab_st_load_buf = copy; yab_st_load_size = size;
    yab_st_done = 0;
    yab_st_req = 1;
    while (yab_st_done == 0 && ++spins < 3000)
       usleep(1000);
+   free(copy);
+   yab_st_load_buf = NULL;
    return yab_st_done == 1;
 }
 
@@ -3855,6 +3864,10 @@ static void yab_state_service(void)
       return;
    if (req == 1)
    {
+      const unsigned char *h = (const unsigned char *)yab_st_load_buf;
+      if (h)
+         YAB_TR_L1("[STATE] load buffer head=%02X %02X %02X size=%lu\n",
+                   h[0], h[1], h[2], (unsigned long)yab_st_load_size);
       int err = YabLoadStateBuffer(yab_st_load_buf, yab_st_load_size);
       YAB_TR_L1("[STATE] load %lu bytes -> %s err=%d (68k PC=%08X SR=%04X)\n",
                 (unsigned long)yab_st_load_size, err == 0 ? "ok" : "FAILED", err,
