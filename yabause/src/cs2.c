@@ -937,6 +937,7 @@ int Cs2ForceCloseTray( int coreid, const char * cdpath ){
 //////////////////////////////////////////////////////////////////////////////
 
 void Cs2Exec(u32 timing) {
+   { extern int yab_emu_stage; yab_emu_stage = 60; }
    Cs2Area->_statuscycles += timing * 3;
    Cs2Area->_periodiccycles += timing * 3;
 
@@ -952,7 +953,9 @@ void Cs2Exec(u32 timing) {
      {
        if (Cs2Area->_commandtiming <= timing)
        {
-         Cs2Execute();
+         { extern int yab_emu_stage; yab_emu_stage = 66; }
+        Cs2Execute();
+        { extern int yab_emu_stage; yab_emu_stage = 67; }
          Cs2Area->_commandtiming = 0;
        }
        else {
@@ -966,6 +969,7 @@ void Cs2Exec(u32 timing) {
    if (Cs2Area->_statuscycles >= Cs2Area->_statustiming)
    {
       Cs2Area->_statuscycles -= Cs2Area->_statustiming;
+      { extern int yab_emu_stage; yab_emu_stage = 61; }
       switch(Cs2Area->cdi->GetStatus())
       {
          case 0:
@@ -1007,7 +1011,9 @@ void Cs2Exec(u32 timing) {
          case CDB_STAT_PLAY:
          {
             partition_struct * playpartition;
+            { extern int yab_emu_stage; yab_emu_stage = 62; }
             int ret = Cs2ReadFilteredSector(Cs2Area->FAD, &playpartition);
+            { extern int yab_emu_stage; yab_emu_stage = 63; }
 
             switch (ret)
             {
@@ -1015,7 +1021,9 @@ void Cs2Exec(u32 timing) {
                   // Sector Read OK
                   Cs2Area->FAD++;
                   Cs2Area->track = Cs2FADToTrack(Cs2Area->FAD);
+                  { extern int yab_emu_stage; yab_emu_stage = 64; }
                   Cs2Area->cdi->ReadAheadFAD(Cs2Area->FAD);
+                  { extern int yab_emu_stage; yab_emu_stage = 65; }
 
                   if (playpartition != NULL)
                   {
@@ -1184,6 +1192,19 @@ void Cs2SetCommandTiming(u8 cmd) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+/* A savestate load restores Cs2Area with a command possibly still "executing"
+ * while the transfer that drove it was aborted by the load.  The next
+ * Cs2Exec() then re-enters Cs2Execute() and waits for data that will never
+ * arrive (device: the machine wedges on its first frame after every load,
+ * breadcrumb stage=60/66).  Dropping the in-flight command is safe: the game
+ * re-issues it, exactly as it does after a tray cycle. */
+void Cs2AfterLoadState(void)
+{
+  Cs2Area->_command_execlock = 0;
+  Cs2Area->_commandtiming = 0;
+  Cs2Area->_periodiccycles = 0;
+}
 
 void Cs2Execute(void) {
   u16 instruction = Cs2Area->reg.CR1 >> 8;
