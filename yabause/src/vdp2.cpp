@@ -140,6 +140,9 @@ static int vdp_proc_running = 0;
 static int vdp_on_caller = 0;
 /* Breadcrumb owned by libretro.c: the last point the machine thread reached. */
 extern "C" int yab_emu_stage;
+/* vdp1.cpp: which of the two VDP1 RAM snapshot slots a VOUT belongs to. */
+extern "C" int  Vdp1SnapshotSlot(void);
+extern "C" void Vdp1SelectSnapshot(int slot);
 YabMutex * vrammutex = NULL;
 int g_frame_count = 0;
 static int framestoskip = 0;
@@ -159,12 +162,21 @@ static pthread_cond_t  vdp1_join_cv  = PTHREAD_COND_INITIALIZER;
  * retires (the two joins).  [FT] machine= includes it; subtracting it gives the
  * machine's own compute per field.  Written on the machine thread only. */
 unsigned long long yab_joinwait_ns = 0;
+unsigned long long yab_jw_strict = 0;   /* Vdp1JoinPendingRenders   (direct draw / VOUT) */
+unsigned long long yab_jw_lead = 0;     /* Vdp1JoinPendingRendersLead (VIN, caller mode) */
+unsigned long long yab_jw_vin = 0;      /* Vdp2JoinPendingVIN        (VIN token) */
+unsigned long long yab_jw_direct = 0;   /* VDP1 draw-end sync at wait_line_count (ScuSendDrawEnd) */
+unsigned long long yab_jw_ptmr = 0;     /* PTMR=1 direct-draw token drain (mid-field render request) */
+
 static unsigned long long yab_now_ns(void)
 {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
 }
+/* Same clock for probes in vdp1.cpp (C linkage: that file is C++ too, but the
+ * symbol is read from libretro.c's report). */
+extern "C" unsigned long long yab_now_ns2(void) { return yab_now_ns(); }
 extern "C" void Vdp2AbortJoins(int on)
 {
   g_join_abort = on;
@@ -237,6 +249,7 @@ YabEventQueue * command_ = NULL;
 static volatile u8 vdp1_evt_erase[64];
 static volatile u8 vdp1_evt_manualerase[64];
 static volatile u8 vdp1_evt_swap[64];
+static volatile u8 vdp1_evt_snap[64];   /* which Vdp1RamSnap slot this VOUT belongs to */
 static volatile u32 vdp1_evt_widx = 0;
 static volatile u32 vdp1_evt_ridx = 0;
 static int vdp1_manualerase_armed = 0;  // emulation thread: armed until the next swap
@@ -272,7 +285,7 @@ static void Vdp2JoinPendingVIN(void) {
   if (vin_render_pending) {
     unsigned long long _t0 = yab_now_ns();
     YabWaitEventQueue(rcv_evqueue);
-    yab_joinwait_ns += yab_now_ns() - _t0;
+    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_vin += _d; }
     vin_render_pending = 0;
   }
 }
@@ -366,13 +379,17 @@ static void Vdp1JoinPendingRenders(void) {
       return;
     }
   }
-  pthread_mutex_lock(&vdp1_join_mtx);
-  while (!g_join_abort &&
-         vdp1_ev_retired.load(std::memory_order_acquire) <
-         vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
-    pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+  {
+    unsigned long long _t0 = yab_now_ns();
+    pthread_mutex_lock(&vdp1_join_mtx);
+    while (!g_join_abort &&
+           vdp1_ev_retired.load(std::memory_order_acquire) <
+           vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
+      pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+    }
+    pthread_mutex_unlock(&vdp1_join_mtx);
+    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_strict += _d; }
   }
-  pthread_mutex_unlock(&vdp1_join_mtx);
 }
 
 
@@ -403,11 +420,12 @@ static void Vdp1JoinPendingRendersLead(void) {
       pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
     }
     pthread_mutex_unlock(&vdp1_join_mtx);
-    yab_joinwait_ns += yab_now_ns() - _t0;
+    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_lead += _d; }
   }
 }
 
 extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
+extern "C" void Vdp1JoinPendingRendersLeadC(void) { Vdp1JoinPendingRendersLead(); }
 
 /* PORT: the libretro frontend thread waits for "the worker retired a field"
  * (retro_run -> video_cb); the counter itself stays private. */
@@ -1689,6 +1707,10 @@ void Vdp2HBlankOUT(void) {
        The renderer reads the snapshot (vidogl.c via Vdp1RamRender) while the SH2 keeps writing the real
        Vdp1Ram. Only changed 4 KB pages are copied. */
     Vdp1RamSnapshot();
+    /* The consumer must draw from the slot this VOUT published, and it peeks the
+     * FIFO before drawing, so the slot id rides the same entry: the one written
+     * above is (widx - 1), because the write already advanced widx. */
+    vdp1_evt_snap[(vdp1_evt_widx - 1) & 63] = (u8)(Vdp1SnapshotSlot() & 1);
     Vdp2LinesSnapshot();
     Vdp2RamSnapshot();
     FRAMELOG("YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT)");
@@ -2027,6 +2049,12 @@ static void vdp2_restore_vidcore(void)
 
 void vdp2VBlankOUT(void) {
   int isrender = 0;
+  /* VDP1 draws below read Vdp1RamRender.  Pick the snapshot slot of the FIFO
+   * entry this VOUT consumes (peek; the entry is consumed further down), so the
+   * draw sees the command list that belongs to this field and not whatever the
+   * machine snapshotted last. */
+  if (vdp1_evt_ridx != vdp1_evt_widx)
+    Vdp1SelectSnapshot(vdp1_evt_snap[vdp1_evt_ridx & 63]);
 #if PROFILE_RENDERING
   u64 starttime = YabauseGetTicks();
 #endif

@@ -78,7 +78,15 @@ Vdp1JoinPendingRenders() (vdp2.cpp) runs before every dispatch, so no render is
 active while the snapshot is taken. With snapshotting off, Vdp1RamRender points
 at Vdp1Ram itself. */
 u8 * Vdp1RamRender = NULL;
-static u8 * Vdp1RamSnap = NULL;
+/* Two slots: the machine snapshots into the free one while the renderer reads the
+ * published one, so the strict "renderer finished" join is only needed when the
+ * renderer falls a whole field behind.  The standalone can live with one slot
+ * because its renderer is a thread that answers within microseconds; in the caller
+ * model the renderer only runs inside retro_run, and one slot made the machine
+ * wait a whole field for it (measured: 12 ms/field in Vdp1JoinPendingRenders). */
+static u8 * Vdp1RamSnap[2] = { NULL, NULL };
+static int v1_snap_cur = 0;                    /* published slot */
+static int v1_snap_slot(void) { return v1_snap_cur; }
 
 /* TVMR and FBCR determine the frame geometry (width, height, interlace; see
 vidogl.c) and are written by the SH2 and read by the renderer, so they are
@@ -93,7 +101,7 @@ u16 Vdp1RenderFBCR = 0;
 the snapshot copies only the marked ones. Deliberately not hooked into
 Vdp1MarkVramWrite(), whose bookkeeping depends on g_texcache_persist. */
 #define V1SNAP_PAGES 128            /* 0x80000 / 4096 */
-static u8  v1_snap_dirty[V1SNAP_PAGES];
+static u8  v1_snap_dirty[2][V1SNAP_PAGES];   /* per slot: pages changed since it was last written */
 static int v1_snap_all = 1;        /* first snapshot: copy everything */
 
 /* Mark everything as changed after reset and savestate load, since Vdp1Ram is
@@ -103,26 +111,43 @@ extern "C" void Vdp1RamSnapAllNew(void) { v1_snap_all = 1; }
 /* Shared by both drawing paths: the VBlank-OUT path (vdp2.cpp) and the immediate
 draw path via PTMR=1 / VDPEV_DIRECT_DRAW (further down in this file). */
 extern "C" void Vdp1RamSnapshot(void) {
-   if (Vdp1RamSnap == NULL || Vdp1Ram == NULL) return;
+   u8 * dst;
+   int slot;
+   if (Vdp1RamSnap[0] == NULL || Vdp1Ram == NULL) return;
+   slot = v1_snap_cur ^ 1;              /* write the slot the renderer is not reading */
+   dst = Vdp1RamSnap[slot];
    if (v1_snap_all) {
-      memcpy(Vdp1RamSnap, Vdp1Ram, 0x80000);
+      memcpy(Vdp1RamSnap[0], Vdp1Ram, 0x80000);
+      memcpy(Vdp1RamSnap[1], Vdp1Ram, 0x80000);
       v1_snap_all = 0;
       memset(v1_snap_dirty, 0, sizeof(v1_snap_dirty));
    } else {
-/* copy contiguous runs in one go instead of 128 separate memcpy calls */
+/* copy contiguous runs in one go instead of 128 separate memcpy calls; only the
+   pages this slot has not seen yet */
       u32 i = 0;
+      u8 * dirty = v1_snap_dirty[slot];
       while (i < V1SNAP_PAGES) {
-         if (!v1_snap_dirty[i]) { i++; continue; }
+         if (!dirty[i]) { i++; continue; }
          u32 a = i;
-         while (i < V1SNAP_PAGES && v1_snap_dirty[i]) { v1_snap_dirty[i] = 0; i++; }
-         memcpy(Vdp1RamSnap + (a << 12), Vdp1Ram + (a << 12), (size_t)(i - a) << 12);
+         while (i < V1SNAP_PAGES && dirty[i]) { dirty[i] = 0; i++; }
+         memcpy(dst + (a << 12), Vdp1Ram + (a << 12), (size_t)(i - a) << 12);
       }
    }
 /* also take the two geometry-relevant registers */
    Vdp1RenderTVMR = Vdp1Regs->TVMR;
    Vdp1RenderFBCR = Vdp1Regs->FBCR;
    Vdp1RenderRegsValid = 1;
-   Vdp1RamRender = Vdp1RamSnap;
+   v1_snap_cur = slot;
+   Vdp1RamRender = dst;
+}
+/* Which slot the renderer should read for a given VOUT, and the publish/pick
+ * pair: the machine publishes after Vdp1RamSnapshot(), the renderer selects the
+ * slot that was current for the VOUT it is processing. */
+extern "C" int  Vdp1SnapshotSlot(void) { return v1_snap_cur; }
+extern "C" void Vdp1SelectSnapshot(int slot)
+{
+   if (slot >= 0 && slot < 2 && Vdp1RamSnap[slot] != NULL)
+      Vdp1RamRender = Vdp1RamSnap[slot];
 }
 u8 * Vdp1FrameBuffer[2];
 VideoInterface_struct *VIDCore = NULL;
@@ -209,7 +234,7 @@ extern "C" void FASTCALL Vdp1RamWriteByte(u32 addr, u8 val) {
    addr &= 0x7FFFF;
    T1WriteByte(Vdp1Ram, addr, val);
    vdp1_clock = 0;
-   v1_snap_dirty[addr >> 12] = 1;
+   v1_snap_dirty[0][addr >> 12] = 1; v1_snap_dirty[1][addr >> 12] = 1;
    Vdp1MarkVramWrite(addr, 1);
 }
 
@@ -218,7 +243,8 @@ extern "C" void FASTCALL Vdp1RamWriteWord(u32 addr, u16 val) {
    addr &= 0x7FFFF;
    T1WriteWord(Vdp1Ram, addr, val);
    vdp1_clock = 0;
-   v1_snap_dirty[addr >> 12] = 1; v1_snap_dirty[((addr + 1) & 0x7FFFF) >> 12] = 1;
+   v1_snap_dirty[0][addr >> 12] = 1; v1_snap_dirty[0][((addr + 1) & 0x7FFFF) >> 12] = 1;
+   v1_snap_dirty[1][addr >> 12] = 1; v1_snap_dirty[1][((addr + 1) & 0x7FFFF) >> 12] = 1;
    Vdp1MarkVramWrite(addr, 2);
 }
 
@@ -229,7 +255,8 @@ extern "C" void FASTCALL Vdp1RamWriteLong(u32 addr, u32 val) {
    //LOG("Vdp1RamWriteLong @ %08X", CurrentSH2->regs.PC);
    T1WriteLong(Vdp1Ram, addr, val);
    vdp1_clock = 0;
-   v1_snap_dirty[addr >> 12] = 1; v1_snap_dirty[((addr + 3) & 0x7FFFF) >> 12] = 1;
+   v1_snap_dirty[0][addr >> 12] = 1; v1_snap_dirty[0][((addr + 3) & 0x7FFFF) >> 12] = 1;
+   v1_snap_dirty[1][addr >> 12] = 1; v1_snap_dirty[1][((addr + 3) & 0x7FFFF) >> 12] = 1;
    Vdp1MarkVramWrite(addr, 4);
 }
 
@@ -333,7 +360,9 @@ extern "C" int Vdp1Init(void) {
 
    /* The render pointer initially points at the real RAM; a snapshot buffer is allocated too. */
    Vdp1RamRender = Vdp1Ram;
-   if (Vdp1RamSnap == NULL) Vdp1RamSnap = T1MemoryInit(0x80000);
+   if (Vdp1RamSnap[0] == NULL) Vdp1RamSnap[0] = T1MemoryInit(0x80000);
+   if (Vdp1RamSnap[1] == NULL) Vdp1RamSnap[1] = T1MemoryInit(0x80000);
+   v1_snap_cur = 0;
 
    // Allocate enough memory for two frames
    if ((Vdp1FrameBuffer[0] = T1MemoryInit(0x40000)) == NULL)
@@ -362,9 +391,9 @@ extern "C" void Vdp1DeInit(void) {
    if (Vdp1Ram)
       T1MemoryDeInit(Vdp1Ram);
    Vdp1Ram = NULL;
-   if (Vdp1RamSnap)
-      T1MemoryDeInit(Vdp1RamSnap);
-   Vdp1RamSnap = NULL;
+   if (Vdp1RamSnap[0]) T1MemoryDeInit(Vdp1RamSnap[0]);
+   if (Vdp1RamSnap[1]) T1MemoryDeInit(Vdp1RamSnap[1]);
+   Vdp1RamSnap[0] = Vdp1RamSnap[1] = NULL;
    Vdp1RamRender = NULL;
 
    if (Vdp1FrameBuffer[0])
