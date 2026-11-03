@@ -165,6 +165,21 @@ extern "C" void Vdp2AbortJoins(int on)
    * proceeds while it is still mid-frame. */
   if (on && vdp1_rcv_evqueue != NULL)
     YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
+  /* The join waits must be woken, not merely flagged: a thread already inside
+   * pthread_cond_wait() only returns on a signal, and the signal comes from
+   * Vdp1MarkRenderRetired() -- i.e. from the renderer that is exactly the side
+   * that has stopped calling us (measured: quit from the frontend's menu hung in
+   * yab_emu_stop() with the machine thread parked in futex_wait forever). */
+  if (on)
+  {
+    pthread_mutex_lock(&vdp1_join_mtx);
+    pthread_cond_broadcast(&vdp1_join_cv);
+    pthread_mutex_unlock(&vdp1_join_mtx);
+    /* Vdp2JoinPendingVIN() waits on this token, which only vdp2VBlankIN()
+     * produces -- also on the renderer side. */
+    if (rcv_evqueue != NULL)
+      YabAddEventQueueNonBlocking(rcv_evqueue, 0);
+  }
 }
 
 /* The frameskip switch itself has no port-specific path: EnableAutoFrameSkip()
