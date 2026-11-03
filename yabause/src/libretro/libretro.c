@@ -20,9 +20,7 @@
 #include <unistd.h>
 #include <time.h>
 #include <pthread.h>
-#ifdef YAB_HANGDBG
-#include <sys/syscall.h>
-#endif
+#include <sys/syscall.h>   /* SYS_gettid: thread identity for the CPU probe */
 #include "vdp1.h"
 #include "vdp2.h"
 #include "smpc.h"
@@ -4060,6 +4058,15 @@ static void yab_ft_report(void)
     * VDP1 has no wait on this thread in the async renderer (vdp2.cpp:2028), and
     * the readback option (its only other blocking point) is off for these
     * titles, so this is the complete list. */
+   {
+      extern unsigned long long yab_joinwait_ns;
+      printf("[JW] n=%d joinwait=%.2fms (machine minus joins = %.2fms)\n",
+             n,
+             (double)yab_joinwait_ns / (double)n / 1e6,
+             (double)yab_ft_machine_ns / (double)n / 1e6 -
+             (double)yab_joinwait_ns / (double)n / 1e6);
+      yab_joinwait_ns = 0;
+   }
    printf("[MW] n=%d slotwait=%.2fms\n",
           n,
           (double)yab_ft_slotwait_ns / (double)n / 1e6);
@@ -4296,6 +4303,10 @@ static void *yab_emu_main(void *arg)
     * in thr-linux.cpp, which only the standalone compiles); it is in
     * thr-rthreads.c now. */
    YabThreadSetAffinityRaw(0xFu);
+   /* One-line identity so the host can map this thread to /proc/<tid>/stat when
+    * measuring CPU per thread (the machine thread must own a core of its own for
+    * the renderer to overlap with it). */
+   YAB_TR_L1("[THR] machine tid=%d\n", (int)syscall(SYS_gettid));
 #ifdef YAB_HANGDBG
    printf("[DBGT] emu thread tid=%d\n", (int)syscall(SYS_gettid));
    fflush(stdout);
@@ -4330,6 +4341,27 @@ static void *yab_emu_main(void *arg)
          loops++;
          if (loops <= 3 || (loops % 60) == 0)
             YK_TRACE("emu loop n=%u", loops);
+      }
+      /* Probe: the machine's own field period (loop top to loop top).  Together
+       * with [FT] machine= and [JW] joinwait= it closes the per-field arithmetic:
+       * period = machine + whatever the machine waits for outside its frame. */
+      {
+         static u64 t_prev = 0;
+         static u64 acc = 0;
+         static unsigned n = 0;
+         u64 t_now = yab_ft_now();
+         if (t_prev)
+         {
+            acc += t_now - t_prev;
+            if (++n >= 60)
+            {
+               printf("[MP] n=%u machine field period: %.2f ms (%.1f fields/s)\n",
+                      n, (double)acc / 60.0 / 1e6, 60000.0 / ((double)acc / 60.0 / 1e6));
+               fflush(stdout);
+               acc = 0; n = 0;
+            }
+         }
+         t_prev = t_now;
       }
       YABEMU("emu:handle-events");
 #if YAB_TRACE_LEVEL >= 2

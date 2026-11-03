@@ -916,7 +916,23 @@ int main(int argc, char** argv)
     }else{
       //printf("Frmae = %d \n", 0, 0, frame_cont);
       //frame_cont++;
-      YabauseExec(); // exec one frame
+      /* Probe (standalone only): the emulation cost of one field, the number the
+         libretro port prints as [FT] machine minus [JW] joinwait. */
+      {
+        static unsigned _n = 0; static unsigned long long _acc = 0;
+        struct timespec _t0, _t1;
+        clock_gettime(CLOCK_MONOTONIC, &_t0);
+        YabauseExec(); // exec one frame
+        clock_gettime(CLOCK_MONOTONIC, &_t1);
+        _acc += (unsigned long long)(_t1.tv_sec - _t0.tv_sec) * 1000000000ull +
+                (unsigned long long)(_t1.tv_nsec - _t0.tv_nsec);
+        if (++_n >= 60)
+        {
+          printf("[MEMU] n=%u frame: %.2f ms avg\n", _n, (double)_acc / 60.0 / 1e6);
+          fflush(stdout);
+          _acc = 0; _n = 0;
+        }
+      }
       RA_DoFrame();
     }
   }

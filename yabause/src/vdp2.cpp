@@ -155,6 +155,16 @@ static volatile int g_join_abort = 0;
 /* Declared here because Vdp2AbortJoins() below has to wake the join waiters. */
 static pthread_mutex_t vdp1_join_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  vdp1_join_cv  = PTHREAD_COND_INITIALIZER;
+/* Probe: time the machine spends inside a frame blocked on the renderer's
+ * retires (the two joins).  [FT] machine= includes it; subtracting it gives the
+ * machine's own compute per field.  Written on the machine thread only. */
+unsigned long long yab_joinwait_ns = 0;
+static unsigned long long yab_now_ns(void)
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
 extern "C" void Vdp2AbortJoins(int on)
 {
   g_join_abort = on;
@@ -170,7 +180,9 @@ extern "C" void Vdp2AbortJoins(int on)
    * Vdp1MarkRenderRetired() -- i.e. from the renderer that is exactly the side
    * that has stopped calling us (measured: quit from the frontend's menu hung in
    * yab_emu_stop() with the machine thread parked in futex_wait forever). */
-  if (on)
+  /* Caller mode only: the standalone's pause path (VdpRevoke/VdpResume) keeps
+   * 1.6.2 behaviour, where the renderer releases these waits as usual. */
+  if (on && vdp_on_caller)
   {
     pthread_mutex_lock(&vdp1_join_mtx);
     pthread_cond_broadcast(&vdp1_join_cv);
@@ -254,9 +266,13 @@ static int g_vin_decoupled = -1;
 static int vin_render_pending = 0;
 
 static void Vdp2JoinPendingVIN(void) {
-  if (g_join_abort) { vin_render_pending = 0; return; }
+  /* Caller mode only: the standalone keeps 1.6.2's wait, which its renderer
+   * releases as usual. */
+  if (vdp_on_caller && g_join_abort) { vin_render_pending = 0; return; }
   if (vin_render_pending) {
+    unsigned long long _t0 = yab_now_ns();
     YabWaitEventQueue(rcv_evqueue);
+    yab_joinwait_ns += yab_now_ns() - _t0;
     vin_render_pending = 0;
   }
 }
@@ -285,9 +301,12 @@ extern "C" void Vdp2AfterLoadState(void)
     * load the machine sat at stage=2 forever, i.e. inside HandleEvents before
     * the first dispatch).  The VIN token is owned by the workflow consumer, so
     * drop the expectation and pulse both queues once. */
-   vin_render_pending = 0;
-   if (rcv_evqueue != NULL) YabAddEventQueueNonBlocking(rcv_evqueue, 0);
-   if (vdp1_rcv_evqueue != NULL) YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
+   if (vdp_on_caller)
+   {
+     vin_render_pending = 0;
+     if (rcv_evqueue != NULL) YabAddEventQueueNonBlocking(rcv_evqueue, 0);
+     if (vdp1_rcv_evqueue != NULL) YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
+   }
    /* current_frame is kept: it is tied to the renderer GL buffer index */
 }
 
@@ -375,13 +394,17 @@ static void Vdp1JoinPendingRendersLead(void) {
       return;
     }
   }
-  pthread_mutex_lock(&vdp1_join_mtx);
-  while (!g_join_abort &&
-         vdp1_ev_dispatched.load(std::memory_order_relaxed) -
-         vdp1_ev_retired.load(std::memory_order_acquire) >= 2) {
-    pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+  {
+    unsigned long long _t0 = yab_now_ns();
+    pthread_mutex_lock(&vdp1_join_mtx);
+    while (!g_join_abort &&
+           vdp1_ev_dispatched.load(std::memory_order_relaxed) -
+           vdp1_ev_retired.load(std::memory_order_acquire) >= 2) {
+      pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+    }
+    pthread_mutex_unlock(&vdp1_join_mtx);
+    yab_joinwait_ns += yab_now_ns() - _t0;
   }
-  pthread_mutex_unlock(&vdp1_join_mtx);
 }
 
 extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
@@ -1341,6 +1364,15 @@ void vdp2VBlankIN(void) {
    //if (Vdp1External.manualchange) Vdp1Regs->EDSR >>= 1;
 
    VIDCore->Vdp2DrawEnd();
+   /* 1.6.2's field clock, in this exact position (after Vdp2DrawEnd, which is
+    * where the swap happens on VdpProc): sleep into the next field boundary and
+    * latch the skip decision.  In caller mode the present happens after this
+    * function returns, on the same thread, so the clock runs at the end of
+    * retro_run instead -- same call, same position relative to the swap.  Keep
+    * this call: without it the standalone/VdpProc path runs unthrottled and
+    * never decides a skip. */
+   if (!vdp_on_caller)
+     frameSkipAndLimit();
    VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would
       fire a second time. */

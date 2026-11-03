@@ -785,3 +785,13 @@ fixed32 Vdp2ReadCoefficientMode0_2FP(vdp2rotationparameterfp_struct *parameter, 
 
 //////////////////////////////////////////////////////////////////////////////
 
+//////////////////////////////////////////////////////////////////////////////
+
+/* PORT: the breadcrumb the emulation path writes (yabause.c, cs2.c, vdp2.cpp) and
+ * the libretro glue reads with its [RR] probe.  The libretro build defines it in
+ * libretro.c; the standalone only needs the symbol to exist, so it gets a
+ * zero-initialised copy here that nothing reads.  Without this the standalone
+ * fails to link once the breadcrumbs are compiled in (measured). */
+#ifndef __LIBRETRO__
+int yab_emu_stage = 0;
+#endif

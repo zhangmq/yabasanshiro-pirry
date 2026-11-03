@@ -4661,18 +4661,24 @@ static void EdgeBlack(int gw, int gh)
   glDisable(GL_SCISSOR_TEST);
 }
 
-#ifdef __LIBRETRO__
 /* probe: where the per-field composition time goes.  A = our retarget/query
  * glue, B = YglUpdateVdp2Reg, C = the layer draw, D = tail (EdgeBlack + the
- * frontend's swap stand-in).  Reported per 60 fields like [FT]/[RP]. */
+ * frontend's swap stand-in).  Reported per 60 fields like [FT]/[RP].
+ *
+ * Built in BOTH builds: the standalone runs the same composition on VdpProc, and
+ * a comparison between the two is only worth something when both report the same
+ * stages.  The cost is 4 clock_gettime() per field. */
 #include <time.h>
+/* File scope: YglRender() starts the field timer and the draw functions that
+ * follow it (YglUpdateVdp2Reg, the layer draw, the tail) consume it. */
+static unsigned long long _ygr_t0, _ygr_t1;
 static unsigned long long ygr_now(void)
 {
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (unsigned long long)ts.tv_sec * 1000000ull + (unsigned long long)(ts.tv_nsec / 1000);
 }
-static unsigned long long ygr_acc[4];
+static unsigned long long ygr_acc[5];   /* 0 glue, 1 regs, 2 draw, 3 tail, 4 swap */
 static unsigned ygr_n;
 static void ygr_add(int i, unsigned long long t0, unsigned long long t1)
 {
@@ -4682,17 +4688,17 @@ static void ygr_report(void)
 {
   if (++ygr_n >= 60)
   {
-    printf("[YGR] n=%u field: glue %.2f + regs %.2f + draw %.2f + tail %.2f = %.2f ms\n",
+    printf("[YGR] n=%u field: glue %.2f + regs %.2f + draw %.2f + tail %.2f = %.2f ms, swap %.2f ms\n",
            ygr_n,
            (double)ygr_acc[0] / 60.0 / 1000.0, (double)ygr_acc[1] / 60.0 / 1000.0,
            (double)ygr_acc[2] / 60.0 / 1000.0, (double)ygr_acc[3] / 60.0 / 1000.0,
-           (double)(ygr_acc[0] + ygr_acc[1] + ygr_acc[2] + ygr_acc[3]) / 60.0 / 1000.0);
+           (double)(ygr_acc[0] + ygr_acc[1] + ygr_acc[2] + ygr_acc[3]) / 60.0 / 1000.0,
+           (double)ygr_acc[4] / 60.0 / 1000.0);
     fflush(stdout);
-    ygr_acc[0] = ygr_acc[1] = ygr_acc[2] = ygr_acc[3] = 0;
+    ygr_acc[0] = ygr_acc[1] = ygr_acc[2] = ygr_acc[3] = ygr_acc[4] = 0;
     ygr_n = 0;
   }
 }
-#endif
 
 void YglRender(void)
 {
@@ -4700,12 +4706,12 @@ void YglRender(void)
   GLuint cprg = 0;
   int from = 0;
   int to = 0;
+  _ygr_t0 = ygr_now();
 #ifdef __LIBRETRO__
-  unsigned long long _ygr_t0 = ygr_now(), _ygr_t1;
   /* PORT: the frontend rotates its hw-render ring once per presented frame and
-   * may recreate its textures on a resolution change, so the mirror FBO (core
-   * context) has to be re-pointed at the frontend's current colour texture
-   * before anything is drawn. */
+   * may recreate its textures on a resolution change, so the render target has
+   * to be re-pointed at the frontend's current framebuffer before anything is
+   * drawn. */
   {
     extern void YuiRetargetFB(void);
     extern int YuiGetFB(void);
@@ -4717,9 +4723,9 @@ void YglRender(void)
 #ifdef __LIBRETRO__
 { static unsigned _n_after_retarget = 0; if (_n_after_retarget < 8) { _n_after_retarget++; fprintf(stderr, "YGR[after-retarget] %u\n", _n_after_retarget); fflush(stderr); } }
 #endif
+#endif /* __LIBRETRO__ (retarget glue) */
   _ygr_t1 = ygr_now();
   ygr_add(0, _ygr_t0, _ygr_t1);
-#endif
   YglMatrix mtx;
   YglMatrix dmtx;
   unsigned int i, j;
@@ -5075,10 +5081,18 @@ render_finish:
 #ifdef __LIBRETRO__
 { static unsigned _n_before_swap = 0; if (_n_before_swap < 8) { _n_before_swap++; fprintf(stderr, "YGR[before-swap] %u\n", _n_before_swap); fflush(stderr); } }
 #endif
-  YuiSwapBuffers();
-#ifdef __LIBRETRO__
-  { unsigned long long _t = ygr_now(); ygr_add(3, _ygr_t1, _t); ygr_report(); }
-#endif
+  /* Tail up to the swap, then the swap separately: in the standalone YuiSwapBuffers()
+   * blocks on vsync, in the port it only counts, so folding it into one number would
+   * make the two builds incomparable. */
+  {
+    unsigned long long _t = ygr_now();
+    unsigned long long _s;
+    ygr_add(3, _ygr_t1, _t);
+    YuiSwapBuffers();
+    _s = ygr_now();
+    ygr_add(4, _t, _s);
+    ygr_report();
+  }
   FrameProfileAdd("YglRender end");
   return;
 }
