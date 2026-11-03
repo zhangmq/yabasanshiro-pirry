@@ -151,6 +151,17 @@ static int previous_skipped = 0;
  * quit from the frontend's menu froze on pthread_join (measured). */
 static volatile int g_join_abort = 0;
 extern "C" void Vdp2AbortJoins(int on) { g_join_abort = on; }
+/* Shutdown helper: drop pending dispatch events without rendering them, so a
+ * machine thread blocked in YabAddEventQueue (the queue holds 32 and nothing
+ * consumes it once retro_run stops) can finish.  The frontend calls this while
+ * it waits for the machine thread in yab_emu_stop(). */
+extern "C" void Vdp2DrainQueueNoRender(void)
+{
+  if (evqueue == NULL)
+    return;
+  while (YaGetQueueSize(evqueue) > 0)
+    YabWaitEventQueue(evqueue);
+}
 /* Set while VIDCore's Vdp2Draw* entry points are the VIDDummy ones (a skipped
  * field).  File scope so that turning the option off mid-run can restore them. */
 static VideoInterface_struct * g_vid_saved = NULL;

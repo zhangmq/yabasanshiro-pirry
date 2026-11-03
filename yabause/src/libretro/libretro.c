@@ -82,6 +82,7 @@ static bool renderer_running = false;
 
 /* Async emulation thread control (defined next to retro_run). */
 static void yab_emu_start(void);
+static volatile int yab_emu_done = 1;   /* the machine thread has returned */
 static void yab_emu_stop(void);
 static void yab_emu_pause(void);
 static void yab_emu_resume(void);
@@ -1689,9 +1690,22 @@ static int yab_in_run = 0;
 void retro_reinit_av_info(void)
 {
     struct retro_system_av_info av_info;
+    /* minarch reacts to a geometry change by re-reading the AV info and, when
+     * the reported geometry differs, by tearing down and re-creating the sound
+     * system.  Our sound thread keeps writing meanwhile, so a spurious publish
+     * crashed the core (measured: toggling any core option -> "AV info changed,
+     * reset sound system" -> SND_init -> SIGSEGV).  Publish only a real change. */
+    static struct retro_game_geometry last;
     retro_get_system_av_info(&av_info);
-    if (yab_in_run)
-        environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &av_info);
+    if (!yab_in_run)
+        return;
+    if (av_info.geometry.base_width == last.base_width &&
+        av_info.geometry.base_height == last.base_height &&
+        av_info.geometry.max_width == last.max_width &&
+        av_info.geometry.max_height == last.max_height)
+        return;
+    environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &av_info);
+    last = av_info.geometry;
 }
 
 void retro_set_resolution()
@@ -3916,6 +3930,7 @@ static void *yab_emu_main(void *arg)
       sram_sync();
    }
    yab_emu_parked = 1;
+   yab_emu_done = 1;
    return NULL;
 }
 
@@ -3970,6 +3985,7 @@ static void yab_emu_start(void)
    yab_emu_paused = 0;
    yab_emu_parked = 0;
    yab_emu_running = 1;
+   yab_emu_done = 0;
    pthread_create(&yab_emu_tid, NULL, yab_emu_main, NULL);
 #ifdef YAB_HANGDBG
    yab_dbg_watchdog_start();
@@ -3986,6 +4002,18 @@ static void yab_emu_stop(void)
    YglVdp1ReadbackAbort();
    yab_emu_running = 0;
    yab_emu_paused = 0;
+   /* The machine may be blocked in YabAddEventQueue (queue full, and nothing
+    * consumes it once retro_run stopped).  Drain it while waiting instead of
+    * blocking in pthread_join: without this the frontend froze in
+    * context_destroy (measured: endless [Audio] underrun, no core output). */
+   {
+      extern void Vdp2DrainQueueNoRender(void);
+      while (!yab_emu_done)
+      {
+         Vdp2DrainQueueNoRender();
+         usleep(1000);
+      }
+   }
    pthread_join(yab_emu_tid, NULL);
    { extern void Vdp2AbortJoins(int); Vdp2AbortJoins(0); }
    yab_emu_parked = 1;
