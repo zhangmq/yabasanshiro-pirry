@@ -8,13 +8,23 @@
 
 void yab_frame_abort(void)
 {
-   /* The machine may be blocked in one of vdp2.cpp's dispatch joins, waiting
-    * for a retire that only retro_run produces; the frontend calls nothing
-    * after context_destroy starts, so those waits must be released here. */
+   /* Release the dispatch joins: the machine may be waiting for a retire that
+    * only retro_run produces, and the frontend is about to stop calling it
+    * (pause, savestate load, resize, shutdown). */
    extern void Vdp2AbortJoins(int);
    Vdp2AbortJoins(1);
 }
-void yab_frame_resume(void) {}
+
+/* Counterpart of yab_frame_abort(), called when the frontend resumes.  Without
+ * it the abort stayed set for the rest of the session: the joins stopped
+ * waiting, Vdp2JoinPendingVIN() dropped its token every time, and the machine
+ * ran away from the presenter (measured: far fewer presents after any pause,
+ * and a savestate load - which pauses - wedged). */
+void yab_frame_resume(void)
+{
+   extern void Vdp2AbortJoins(int);
+   Vdp2AbortJoins(0);
+}
 void YabSetRenderThread(void) {}
 void YabauseApplyCpuClock(void) {}
 

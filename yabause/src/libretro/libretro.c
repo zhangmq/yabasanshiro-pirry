@@ -3971,7 +3971,11 @@ static void yab_pace_field(u64 t_entry_ns)
    if (next_entry_ns == 0 || t_entry_ns > next_entry_ns + 2 * period_ns)
       next_entry_ns = t_entry_ns;
    next_entry_ns += period_ns;
-   yab_core_behind = (now_ns > next_entry_ns + period_ns / 2) ? 1 : 0;
+   /* "Behind" must mean a WHOLE field missed, not half: with the half-period
+    * threshold the boot phase (whose frames are short) kept the flag set, the
+    * engine's frameskip then stayed engaged, most fields went through VIDDummy
+    * and the frontend got far fewer pictures.  Half a period is jitter. */
+   yab_core_behind = (now_ns > next_entry_ns + period_ns) ? 1 : 0;
    if (next_entry_ns > now_ns)
    {
       u64 d = next_entry_ns - now_ns;
@@ -4040,7 +4044,21 @@ static void yab_emu_pause(void)
     * long call), carry on after ~300 ms rather than blocking the frontend for
     * ever.  A resize that races one frame is recoverable; a frozen frontend is
     * not (measured: cold boot froze at the BIOS->game resolution change). */
-   while (!yab_emu_parked && ++spins < 1500) usleep(200);
+   /* Drain the dispatch queue while waiting: the machine's next step may be a
+    * YabAddEventQueue() that blocks because the queue (32) is full and nobody
+    * consumes it while the frontend is parked in retro_unserialize()/pause.
+    * Without this the machine never reaches its safe point, the 300 ms bound
+    * expires, and the load continues *while the machine is mid-frame holding
+    * the VRAM lock* -- the savestate load then wedged (device: process alive,
+    * log stops, main thread in futex_wait). */
+   {
+      extern void Vdp2DrainQueueNoRender(void);
+      while (!yab_emu_parked && ++spins < 1500)
+      {
+         Vdp2DrainQueueNoRender();
+         usleep(200);
+      }
+   }
 }
 
 /* Frame CRC capture (L3 only).  YAB_VCRC=1 hashes every composed frame,
