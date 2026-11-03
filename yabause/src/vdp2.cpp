@@ -138,6 +138,8 @@ static int vdp_proc_running = 0;
 /* PORT: 1 = the VDP workflow is driven by the caller (libretro retro_run) instead
  * of the VdpProc thread; declared here because the join helpers below use it. */
 static int vdp_on_caller = 0;
+/* Breadcrumb owned by libretro.c: the last point the machine thread reached. */
+extern "C" int yab_emu_stage;
 YabMutex * vrammutex = NULL;
 int g_frame_count = 0;
 static int framestoskip = 0;
@@ -150,7 +152,17 @@ static int previous_skipped = 0;
  * context_destroy -> yab_emu_stop() joins the machine thread.  Without this the
  * quit from the frontend's menu froze on pthread_join (measured). */
 static volatile int g_join_abort = 0;
-extern "C" void Vdp2AbortJoins(int on) { g_join_abort = on; }
+extern "C" void Vdp2AbortJoins(int on)
+{
+  g_join_abort = on;
+  /* The machine's other blocking point inside a frame is Vdp2HBlankOUT's VDP1
+   * draw-end wait, and the only producer of that token is the renderer's
+   * dispatch.  Pause (before a savestate load/resize) and shutdown must release
+   * it too, otherwise the machine never reaches its safe point and the frontend
+   * proceeds while it is still mid-frame. */
+  if (on && vdp1_rcv_evqueue != NULL)
+    YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
+}
 
 /* Frameskip is applied HERE, on the machine thread, and only here.
  *
@@ -266,6 +278,15 @@ extern "C" void Vdp2AfterLoadState(void)
    Vdp1External.manualerase = 0;
    vdp1_manualerase_armed = 0; g_vbe_armed = 0;
    vdp1_evt_ridx = vdp1_evt_widx; pre_swap_frame_buffer = 0;
+   /* Wake the machine wherever it may be waiting inside the frame.  Clearing a
+    * queue does not wake a waiter, and the dispatch that would normally supply
+    * these tokens already happened for this field (device: after a savestate
+    * load the machine sat at stage=2 forever, i.e. inside HandleEvents before
+    * the first dispatch).  The VIN token is owned by the workflow consumer, so
+    * drop the expectation and pulse both queues once. */
+   vin_render_pending = 0;
+   if (rcv_evqueue != NULL) YabAddEventQueueNonBlocking(rcv_evqueue, 0);
+   if (vdp1_rcv_evqueue != NULL) YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
    /* current_frame is kept: it is tied to the renderer GL buffer index */
 }
 
@@ -348,6 +369,7 @@ static void Vdp1JoinPendingRenders(void) {
 static void Vdp1JoinPendingRendersLead(void) {
   if (!vdp_on_caller) { Vdp1JoinPendingRenders(); return; }
   if (g_join_abort) return;
+  yab_emu_stage = 21;   /* about to wait for the previous field's retire */
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_dispatched.load(std::memory_order_relaxed) -
         vdp1_ev_retired.load(std::memory_order_acquire) < 2) {
@@ -1393,7 +1415,9 @@ void Vdp2VBlankIN(void) {
     Vdp2Regs->TVSTAT |= 0x0008;
     ScuSendVBlankIN();
     FrameProfileAdd("VIN event");
+    yab_emu_stage = 11;   /* before VIN enqueue */
     YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
+    yab_emu_stage = 12;
     vin_render_pending = 1;
     FrameProfileAdd("VIN decoupled");
     return;
@@ -1655,7 +1679,9 @@ void Vdp2HBlankOUT(void) {
     Vdp2LinesSnapshot();
     Vdp2RamSnapshot();
     FRAMELOG("YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT)");
+    yab_emu_stage = 13;   /* before VOUT enqueue */
     YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
+    yab_emu_stage = 14;
     Vdp1MarkRenderDispatched();
     /* sched_yield() after every VOUT enqueue gives up the time slice of the emulation thread. */
     YabThreadYield();

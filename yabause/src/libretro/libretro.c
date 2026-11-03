@@ -83,6 +83,10 @@ static bool renderer_running = false;
 /* Async emulation thread control (defined next to retro_run). */
 static void yab_emu_start(void);
 static volatile int yab_emu_done = 1;   /* the machine thread has returned */
+/* Breadcrumb: the last point of its frame the machine thread reached.  Printed
+ * with [RR] so a machine that stops advancing names its blocking call. */
+int yab_emu_stage = 0;
+#define YAB_STAGE(n) do { yab_emu_stage = (n); } while (0)
 static void yab_emu_stop(void);
 static void yab_emu_pause(void);
 static void yab_emu_resume(void);
@@ -3893,6 +3897,7 @@ static void *yab_emu_main(void *arg)
        * J1a/J1b/J2 joins and the direct-draw ring) is abortable, so a pause
        * requested mid-frame also lands here within one frame. */
       yab_emu_parked = 1;
+      YAB_STAGE(1);
       for (;;)
       {
          if (!yab_emu_running) break;
@@ -3903,6 +3908,7 @@ static void *yab_emu_main(void *arg)
       }
       if (!yab_emu_running) break;
       yab_emu_parked = 0;
+      YAB_STAGE(2);
 
       {
          static unsigned loops = 0;
@@ -4399,8 +4405,8 @@ void retro_run(void)
       if (d > mx) mx = d;
       if (++n >= 60)
       {
-         printf("[RR] n=%u retro_run total: %.2f ms avg, %.2f ms max\n",
-                n, (double)sum / 60.0 / 1e6, (double)mx / 1e6);
+         printf("[RR] n=%u retro_run total: %.2f ms avg, %.2f ms max, machine stage=%d\n",
+                n, (double)sum / 60.0 / 1e6, (double)mx / 1e6, yab_emu_stage);
          fflush(stdout);
          sum = mx = 0; n = 0;
       }
