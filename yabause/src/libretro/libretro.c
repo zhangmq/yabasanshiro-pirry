@@ -128,8 +128,9 @@ static int g_sh2coretype = SH2CORE_INTERPRETER;
 static int g_videoformat_opt = YAB_VIDEOFORMAT_AUTO;
 static int g_videoformat_pending = -1;
 /* Auto Frameskip (core option "yabasanshiro_frameskip"): 0 = off, 1 = auto.
- * Declared here because check_variables() (below) reads it; the skip decision
- * lives in vdp2.cpp (frameSkipAndLimit at VIN, applied by the next VOUT). */
+ * Declared here because check_variables() (below) reads it; the switch and the
+ * per-field decision both belong to the engine (EnableAutoFrameSkip /
+ * frameSkipAndLimit in vdp2.cpp), applied at the next VOUT. */
 static int g_frameskip = 0;
 static int yk_no_present;
 static int yk_hold;        /* diagnostic: YK_HOLD=1 keeps the lease on the render thread */   /* diagnostic: YK_NO_PRESENT=1 skips the frontend borrow */
@@ -2209,6 +2210,10 @@ void retro_get_system_info(struct retro_system_info *info)
    info->valid_extensions = "bin|ccd|chd|cue|iso|mds|m3u|zip";
 }
 
+/* Defined with the machine-thread command channel (see the state buffer block):
+ * the only path a live configuration change takes into the engine. */
+static void yab_cfg_push(void);
+
 void check_variables(void)
 {
    struct retro_variable var;
@@ -2411,8 +2416,10 @@ void check_variables(void)
 
    /* There is no "Async Renderer" option any more: the model is fixed
     * (design §1), so g_vdp_async is latched to 1 in retro_load_game(). */
-   /* Frameskip is not implemented in this model yet and the core option stays
-    * off (design §5.4: mechanism only, default unchanged). */
+   /* Frameskip: the option only sets g_frameskip here.  The switch itself is
+    * applied by the machine thread through EnableAutoFrameSkip()/
+    * DisableAutoFrameSkip() -- the standalone's own calls -- via yab_cfg_push()
+    * at the end of this function. */
    /* 每次解析选项后打一行"生效配置"，测量日志里能自证：这轮跑的是不是
     * 关跳帧 + 100% 时钟（历史上有过拿错 cfg 测出假结论的教训）。 */
 #if YAB_TRACE_LEVEL >= 1
@@ -2445,20 +2452,6 @@ void check_variables(void)
    if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
       if (strcmp(var.value, "auto") == 0 || strcmp(var.value, "enabled") == 0)
          g_frameskip = 1;
-   /* Hand the decision to the renderer: it latches it in VIN and skips the next
-    * VDP2 compose (design §5.4).  Only on change, so the drift accounting is
-    * not restarted by every option refresh. */
-   {
-      static int applied = -1;
-      if (applied != g_frameskip)
-      {
-         applied = g_frameskip;
-         /* Applied by the machine thread at its next VOUT: it is the only thread
-          * that rewrites VIDCore->Vdp2Draw*, so the request must not be applied
-          * here (live toggle used to crash). */
-         { extern void Vdp2SetFrameSkipEnabled(int); Vdp2SetFrameSkipEnabled(g_frameskip); }
-      }
-   }
 
    /* SH-2 CPU clock percentage ("cycle rate").  Applied live: the per-line
     * SH-2 budget is re-derived between frames, the counters are untouched. */
@@ -2517,6 +2510,11 @@ void check_variables(void)
             g_scsp_dsp_off = (e[0] == '0') ? 1 : 0;
       }
    }
+
+   /* Everything above only *parses* the options into the same variables the
+    * standalone's Preference object feeds.  This is the single hand-off that
+    * turns a change into an engine call, through the module that owns it. */
+   yab_cfg_push();
 }
 
 void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -2600,10 +2598,99 @@ void retro_set_controller_port_device(unsigned port, unsigned device)
  * caller's size out of a freshly allocated buffer with no bounds check. */
 static size_t g_serialize_size = 0;
 
-static const void *yab_st_load_buf; static size_t yab_st_load_size;
-static void       *yab_st_save_buf; static size_t yab_st_save_size;
-static volatile int yab_st_req;        /* 0 none, 1 load, 2 save */
-static volatile int yab_st_done;       /* 0 pending, 1 ok, -1 failed */
+/* ---------------------------------------------------------------------------
+ * The machine-thread command channel.
+ *
+ * Every request that has to touch the *machine* -- a savestate, or a setting the
+ * standalone changes only while its machine is stopped at the menu -- is posted
+ * here by the frontend's thread and executed by the machine thread at its safe
+ * point (the top of yab_emu_main's loop, where it is parked between fields and
+ * holds no engine lock).  That is this port's stand-in for the standalone's menu
+ * moment, and it calls the *same module functions* the standalone calls there:
+ * YabSaveStateBuffer()/YabLoadStateBuffer() (YabSaveStateSlot/YabLoadStateSlot),
+ * EnableAutoFrameSkip()/DisableAutoFrameSkip(), PERCore->Init().
+ *
+ * The frontend itself never touches engine state, and there is no second
+ * mechanism: no per-feature request flags, no polling, no "deferred apply" of
+ * its own.  One queue, one service point.
+ * ------------------------------------------------------------------------- */
+enum { YAB_CMD_SAVE = 1, YAB_CMD_LOAD = 2, YAB_CMD_CFG = 3 };
+
+/* One configuration change.  Only the items whose value actually changed are
+ * marked in `mask`; each is applied through the module that owns it:
+ *
+ *   YAB_CFG_FRAMESKIP  EnableAutoFrameSkip()/DisableAutoFrameSkip()   [machine]
+ *   YAB_CFG_DSP        g_scsp_dsp_off (scsp.c reads it per sample)    [machine]
+ *   YAB_CFG_PADS       PERCore->Init() (multitap / ST-V service keys) [machine]
+ *   YAB_CFG_RESOLUTION VideoSetSetting(VDP_SETTING_RESOLUTION_MODE),
+ *                      wrapped in the port's frame-size bookkeeping   [GL side]
+ *   YAB_CFG_RBG_RES    VideoSetSetting(VDP_SETTING_RBG_RESOLUTION_MODE)  [GL]
+ *   YAB_CFG_RBG_CS     VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER)[GL]
+ *   YAB_CFG_POLYGON    VideoSetSetting(VDP_SETTING_POLYGON_MODE)      [GL side]
+ *
+ * The split is by ownership: the video settings are applied by the thread that
+ * owns the GL context (retro_run here, the menu thread in the standalone, both
+ * with the machine at a frame boundary and GL current), everything else by the
+ * thread that runs the machine.  `mask` keeps the two halves apart. */
+#define YAB_CFG_FRAMESKIP  0x01
+#define YAB_CFG_DSP        0x02
+#define YAB_CFG_PADS       0x04
+#define YAB_CFG_RESOLUTION 0x08
+#define YAB_CFG_RBG_RES    0x10
+#define YAB_CFG_RBG_CS     0x20
+#define YAB_CFG_POLYGON    0x40
+
+typedef struct {
+   unsigned mask;
+   int frameskip;        /* 0/1 */
+   int dsp_off;          /* 0/1, 1 = DSP off */
+   int resolution_mode;  /* engine resolution_mode (1/2/4) */
+   int rbg_res;          /* VDP_SETTING_RBG_RESOLUTION_MODE value */
+   int rbg_cs;           /* VDP_SETTING_RBG_USE_COMPUTESHADER value */
+   int polygon;          /* VDP_SETTING_POLYGON_MODE value */
+} yab_cfg;
+
+/* Result of an in-flight state command.  It lives on the frontend's stack: the
+ * frontend waits for `done` before returning, so the pointer stays valid. */
+typedef struct {
+   volatile int done;    /* 0 pending, 1 ok, -1 failed */
+   volatile int cancel;  /* frontend gave up before the machine got here */
+   void *save_buf;       /* YabSaveStateBuffer() result, freed by the frontend */
+   size_t save_size;
+} yab_state_res;
+
+typedef struct {
+   int type;
+   yab_cfg cfg;                    /* YAB_CMD_CFG */
+   const void *load_buf;           /* YAB_CMD_LOAD; owned by the machine once queued */
+   size_t load_size;
+   yab_state_res *res;             /* YAB_CMD_SAVE / YAB_CMD_LOAD */
+} yab_cmd;
+
+#define YAB_CMD_QUEUE 8
+
+static yab_cmd yab_cmd_q[YAB_CMD_QUEUE];
+static int yab_cmd_head, yab_cmd_tail;                 /* guarded by yab_cmd_mx */
+static pthread_mutex_t yab_cmd_mx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Results of a state command.  YAB_ST_OK: done.  YAB_ST_FAILED: the engine
+ * rejected it.  YAB_ST_DROPPED: the command was never queued, so the caller
+ * still owns its buffer.  YAB_ST_TIMEOUT: the command is queued but the frontend
+ * gave up -- the machine owns the buffer and drops the request when it gets
+ * there. */
+#define YAB_ST_OK       1
+#define YAB_ST_FAILED   0
+#define YAB_ST_DROPPED -1
+#define YAB_ST_TIMEOUT -2
+
+static int  yab_cmd_post(int type, const yab_cfg *cfg,
+                         const void *load_buf, size_t load_size,
+                         yab_state_res *res);          /* frontend thread */
+static void yab_cmd_service(void);                     /* machine thread */
+static int  yab_state_call(int type, const void *load_buf, size_t load_size,
+                           void **save_buf, size_t *save_size);
+static void yab_state_execute(yab_cmd *c);
+
 static volatile int yab_st_need_res;   /* ask retro_run to refresh the video size */
 
 size_t retro_serialize_size(void)
@@ -2615,9 +2702,12 @@ size_t retro_serialize_size(void)
    if (g_serialize_size != 0)
       return g_serialize_size;
 
-   ScspMuteAudio(SCSP_MUTE_SYSTEM);
-   error = YabSaveStateBuffer (&buffer, &size);
-   ScspUnMuteAudio(SCSP_MUTE_SYSTEM);
+   /* Same hand-off as retro_serialize(): the engine work belongs to the machine
+    * thread (one implementation, see yab_state_execute). */
+   if (yab_state_call(YAB_CMD_SAVE, NULL, 0, &buffer, &size) != YAB_ST_OK)
+      error = 1;
+   else
+      error = 0;
 
    free(buffer);
 
@@ -2629,37 +2719,181 @@ size_t retro_serialize_size(void)
    return g_serialize_size;
 }
 
+/* One state command is in flight at a time (the frontend blocks on it).  The
+ * result struct is static, not on the frontend's stack, because a command that
+ * timed out is still queued: the machine thread must be able to dereference it
+ * after the frontend has given up.  Handing it a freed buffer is what produced
+ * the "load err=-2 (YSS signature mismatch)" -- the machine serviced a request
+ * whose buffer the frontend had already released.
+ *
+ * Ownership: once a command is queued, the machine thread owns the load buffer
+ * and frees it (loaded or cancelled).  The frontend never frees it again. */
+static yab_state_res yab_st_res;     /* guarded by yab_st_busy */
+static volatile int yab_st_busy;     /* 1 while a command is queued or running */
+
+/* The engine work of a state command.  Runs on the machine thread normally, and
+ * on the frontend's thread only when the machine is not running at all (before
+ * retro_run: nothing can race then). */
+static void yab_state_execute(yab_cmd *c)
+{
+   if (c->type == YAB_CMD_SAVE)
+   {
+      void *buf = NULL;
+      size_t size = 0;
+      int err = YabSaveStateBuffer(&buf, &size);
+      if (c->res && c->res->cancel)
+      {
+         /* The frontend gave up waiting; the result has no owner. */
+         free(buf);
+         buf = NULL;
+         size = 0;
+         err = -1;
+         YAB_TR_L1("[STATE] save cancelled by the frontend\n");
+      }
+      if (c->res)
+      {
+         c->res->save_buf = buf;
+         c->res->save_size = size;
+         c->res->done = (err == 0) ? 1 : -1;
+         yab_st_busy = 0;
+      }
+      else
+         free(buf);
+      return;
+   }
+
+   if (c->type == YAB_CMD_LOAD)
+   {
+      const unsigned char *h = (const unsigned char *)c->load_buf;
+      int err = -1;
+      if (c->res && c->res->cancel)
+         YAB_TR_L1("[STATE] load cancelled by the frontend\n");
+      else if (h == NULL)
+         YAB_TR_L1("[STATE] load request carried no buffer\n");
+      else
+      {
+         YAB_TR_L1("[STATE] load buffer head=%02X %02X %02X size=%lu\n",
+                   h[0], h[1], h[2], (unsigned long)c->load_size);
+         err = YabLoadStateBuffer(c->load_buf, c->load_size);
+         YAB_TR_L1("[STATE] load %lu bytes -> %s err=%d (68k PC=%08X SR=%04X)\n",
+                   (unsigned long)c->load_size, err == 0 ? "ok" : "FAILED", err,
+                   (unsigned)(M68K->GetPC()), (unsigned)(M68K->GetSR()));
+         if (err == 0)
+         {
+            Vdp2AfterLoadState();
+            yab_audio_drop_pending();
+            yab_st_need_res = 1;   /* applied by retro_run, which owns GL */
+         }
+      }
+      /* Owned by the machine from the moment the command was queued. */
+      free((void *)c->load_buf);
+      if (c->res)
+      {
+         c->res->done = (err == 0) ? 1 : -1;
+         yab_st_busy = 0;
+      }
+   }
+}
+
+static int yab_state_call(int type, const void *load_buf, size_t load_size,
+                          void **save_buf, size_t *save_size)
+{
+   int spins = 0;
+   if (yab_st_busy)
+      return YAB_ST_DROPPED;
+   yab_st_res.done = 0;
+   yab_st_res.cancel = 0;
+   yab_st_res.save_buf = NULL;
+   yab_st_res.save_size = 0;
+   /* Set before publishing: the machine can service the command the moment it is
+    * in the queue, and clearing `busy` from under it would latch it at 1. */
+   yab_st_busy = 1;
+   if (!yab_emu_running)
+   {
+      /* No machine thread to hand it to (before the first retro_run, or after
+       * shutdown): nothing can race, so run the engine call here. */
+      yab_cmd c;
+      memset(&c, 0, sizeof(c));
+      c.type = type;
+      c.load_buf = load_buf;
+      c.load_size = load_size;
+      c.res = &yab_st_res;
+      yab_state_execute(&c);
+      return yab_st_res.done == 1 ? YAB_ST_OK : YAB_ST_FAILED;
+   }
+   if (!yab_cmd_post(type, NULL, load_buf, load_size, &yab_st_res))
+   {
+      yab_st_busy = 0;
+      return YAB_ST_DROPPED;
+   }
+   /* While the machine finishes the request, keep playing VdpProc's role: with
+    * no consumer the machine blocks on a full dispatch queue (32 fields) and
+    * never reaches the frame boundary where yab_cmd_service() runs it -- that is
+    * exactly the shape that timed out here (frontend: "Error serializing save
+    * state").  Draining a field is the same call retro_run makes, on this same
+    * thread, so the machine stays at its own pace and lands on its safe point.
+    *
+    * Do NOT stop the machine for this (yab_emu_pause): aborting the joins in the
+    * middle of a field leaves the CD block wedged (measured: machine stage=72,
+    * Cs2Area->cdi->GetStatus()), and a state that was taken mid-frame is not what
+    * the standalone saves either. */
+   while (yab_st_res.done == 0 && ++spins < 3000)
+   {
+      extern int Vdp2DrainOneField(void);
+      if (yab_emu_running && yk_attach() == 0)
+      {
+         Vdp2DrainOneField();
+         yk_detach();
+      }
+      usleep(500);
+   }
+   if (yab_st_res.done == 0)
+   {
+      /* Timed out.  The command is still queued, so it must be dropped when the
+       * machine reaches it -- never applied to a buffer nobody owns any more. */
+      YAB_TR_L1("[STATE] command %d timed out; cancelling\n", type);
+      yab_st_res.cancel = 1;
+      return YAB_ST_TIMEOUT;
+   }
+   if (yab_st_res.done == 1 && save_buf)
+   {
+      *save_buf = yab_st_res.save_buf;
+      *save_size = yab_st_res.save_size;
+      yab_st_res.save_buf = NULL;
+   }
+   else
+   {
+      free(yab_st_res.save_buf);
+      yab_st_res.save_buf = NULL;
+   }
+   return yab_st_res.done == 1 ? YAB_ST_OK : YAB_ST_FAILED;
+}
+
 bool retro_serialize(void *data, size_t size)
 {
    /* The engine work runs on the machine thread, at its frame boundary -- the
-    * same place the standalone's menu performs YabSaveStateSlot().  See
-    * yab_state_service(). */
-   int spins = 0;
-   yab_st_save_buf = NULL; yab_st_save_size = 0;
-   yab_st_done = 0;
-   yab_st_req = 2;
-   while (yab_st_done == 0 && ++spins < 3000)
-      usleep(1000);
-   if (yab_st_done != 1 || yab_st_save_buf == NULL)
+    * same place the standalone's menu performs YabSaveStateSlot().  The frontend
+    * only posts the request and waits for the result. */
+   void *buf = NULL;
+   size_t bytes = 0;
+   int r = yab_state_call(YAB_CMD_SAVE, NULL, 0, &buf, &bytes);
+   if (r != YAB_ST_OK || buf == NULL)
    {
-      free(yab_st_save_buf);
-      yab_st_save_buf = NULL;
+      free(buf);
       return false;
    }
-   if (yab_st_save_size > size)
+   if (bytes > size)
    {
       /* State grew past the cached upper bound -- fail rather than truncate. */
-      free(yab_st_save_buf);
-      yab_st_save_buf = NULL;
+      free(buf);
       return false;
    }
-   memcpy(data, yab_st_save_buf, yab_st_save_size);
-   if (yab_st_save_size < size)
-      memset((unsigned char *)data + yab_st_save_size, 0, size - yab_st_save_size);
+   memcpy(data, buf, bytes);
+   if (bytes < size)
+      memset((unsigned char *)data + bytes, 0, size - bytes);
    YAB_TR_L1("[STATE] save %lu bytes (buffer %lu)\n",
-             (unsigned long)yab_st_save_size, (unsigned long)size);
-   free(yab_st_save_buf);
-   yab_st_save_buf = NULL; yab_st_save_size = 0;
+             (unsigned long)bytes, (unsigned long)size);
+   free(buf);
    return true;
 }
 
@@ -2686,26 +2920,18 @@ bool retro_serialize(void *data, size_t size)
 
 bool retro_unserialize(const void *data, size_t size)
 {
-   /* Same hand-off as the save side: the frontend copies nothing and touches no
-    * engine state, it only waits for the machine thread to report. */
-   int spins = 0;
-   /* Copy: the buffer belongs to the frontend and the machine thread reads it
-    * later; handing the pointer over directly made the load see something that
-    * did not start with "YSS" (err=-2), so copy once here. */
+   /* Same hand-off as the save side: the frontend touches no engine state, it
+    * only posts the buffer and waits for the machine thread to report.  The copy
+    * is needed because the frontend's buffer is only valid during this call. */
    void *copy = malloc(size);
+   int r;
    if (!copy)
       return false;
    memcpy(copy, data, size);
-   yab_st_load_buf = copy; yab_st_load_size = size;
-   yab_st_done = 0;
-   yab_st_req = 1;
-   while (yab_st_done == 0 && ++spins < 3000)
-      usleep(1000);
-   if (yab_st_done == 0)
-      yab_st_req = 0;      /* cancel: the machine must not service it later */
-   free(copy);
-   yab_st_load_buf = NULL;
-   return yab_st_done == 1;
+   r = yab_state_call(YAB_CMD_LOAD, copy, size, NULL, NULL);
+   if (r == YAB_ST_DROPPED)
+      free(copy);       /* never queued: still ours; otherwise the machine owns it */
+   return r == YAB_ST_OK;
 }
 
 void retro_cheat_reset(void)
@@ -3845,60 +4071,203 @@ static void yab_ft_report(void)
 #endif /* YAB_TRACE_LEVEL >= 2 */
 
 /* ---------------------------------------------------------------------------
- * Save/load hand-off.
+ * Save/load hand-off and configuration changes -- the machine's side of the
+ * command channel declared above.
  *
- * The standalone performs both at its frame boundary, on the thread that runs
- * the machine: its menu handler calls YabSaveStateSlot()/YabLoadStateSlot()
- * from the same loop as YabauseExec().  libretro calls retro_serialize()/
- * retro_unserialize() from the frontend's thread instead, and doing the engine
- * work there (the old shape: yab_emu_pause + VdpRevoke/VdpResume + GL lease)
- * raced the machine: after a load it wedged inside the CD block
+ * The standalone performs all of these at its frame boundary, on the thread that
+ * runs the machine, with the machine stopped by the menu: its menu handler calls
+ * YabSaveStateSlot()/YabLoadStateSlot() and EnableAutoFrameSkip() from the same
+ * loop as YabauseExec().  libretro calls retro_serialize()/retro_unserialize()
+ * and the option refresh from the frontend's thread instead, and doing the
+ * engine work there (the old shape: yab_emu_pause + VdpRevoke/VdpResume + GL
+ * lease) raced the machine: after a load it wedged inside the CD block
  * (machine stage=72, Cs2Area->cdi->GetStatus()).
  *
- * So the frontend only copies the buffer and waits; the machine thread runs the
- * very same YabLoadStateBuffer()/YabSaveStateBuffer() the standalone uses.
+ * So the frontend only posts; the machine thread runs the very same
+ * YabLoadStateBuffer()/YabSaveStateBuffer()/EnableAutoFrameSkip() the standalone
+ * uses, at its safe point.
  * ------------------------------------------------------------------------- */
 
-static void yab_state_service(void)
+static int yab_cmd_post(int type, const yab_cfg *cfg,
+                        const void *load_buf, size_t load_size,
+                        yab_state_res *res)
 {
-   int req = yab_st_req;
-   if (req == 0)
+   int ok = 0;
+   pthread_mutex_lock(&yab_cmd_mx);
+   if (((yab_cmd_head + 1) % YAB_CMD_QUEUE) != yab_cmd_tail)
+   {
+      yab_cmd *c = &yab_cmd_q[yab_cmd_head];
+      memset(c, 0, sizeof(*c));
+      c->type = type;
+      if (cfg) c->cfg = *cfg;
+      c->load_buf = load_buf;
+      c->load_size = load_size;
+      c->res = res;
+      yab_cmd_head = (yab_cmd_head + 1) % YAB_CMD_QUEUE;
+      ok = 1;
+   }
+   pthread_mutex_unlock(&yab_cmd_mx);
+   return ok;
+}
+
+/* Machine thread.  The settings the standalone changes with the machine stopped
+ * and that the machine then reads while it runs. */
+static void yab_cfg_apply_machine(const yab_cfg *c)
+{
+   if (c->mask & YAB_CFG_FRAMESKIP)
+   {
+      if (c->frameskip) EnableAutoFrameSkip();
+      else              DisableAutoFrameSkip();
+      YAB_TR_L1("[CFG] frameskip=%s\n", c->frameskip ? "on" : "off");
+   }
+   if (c->mask & YAB_CFG_DSP)
+   {
+      extern int g_scsp_dsp_off;
+      g_scsp_dsp_off = c->dsp_off ? 1 : 0;
+      YAB_TR_L1("[CFG] sound dsp=%s\n", c->dsp_off ? "off" : "on");
+   }
+   if (c->mask & YAB_CFG_PADS)
+   {
+      if (PERCore) PERCore->Init();
+      YAB_TR_L1("[CFG] pads rebuilt\n");
+   }
+}
+
+/* The GL-owning thread (retro_run here, the menu thread in the standalone).
+ * Same facility the standalone's menu uses: VideoSetSetting() ->
+ * VIDCore->SetSettingValue(). */
+static void yab_cfg_apply_gl(const yab_cfg *c)
+{
+   if (c->mask & YAB_CFG_RESOLUTION)
+   {
+      /* The engine rebuilds its framebuffers, so this needs the lease.  It also
+       * has to re-report the frame size to the frontend, which is what
+       * retro_set_resolution() adds on top of the standalone's call. */
+      if (yk_attach() == 0)
+      {
+         retro_set_resolution();
+         yk_detach();
+         YAB_TR_L1("[CFG] resolution mode=%d -> %dx%d\n",
+                   c->resolution_mode, current_width, current_height);
+      }
+      else
+         yk_res_wanted = 1;   /* lease busy: the retry point re-runs it */
+   }
+   if (c->mask & YAB_CFG_RBG_RES)
+      VideoSetSetting(VDP_SETTING_RBG_RESOLUTION_MODE, c->rbg_res);
+   if (c->mask & YAB_CFG_RBG_CS)
+      VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER, c->rbg_cs);
+   if (c->mask & YAB_CFG_POLYGON)
+      VideoSetSetting(VDP_SETTING_POLYGON_MODE, c->polygon);
+}
+
+/* Frontend thread: the one place where a parsed option becomes an engine change.
+ * Called from check_variables(); `applied` is the option set the engine is
+ * currently running with, so only real changes are handed on. */
+static void yab_cfg_push(void)
+{
+   extern int g_scsp_dsp_off;
+   static yab_cfg applied;
+   static int applied_mt[2], applied_service;
+   static int baseline;
+   yab_cfg cur, d;
+   int pads;
+
+   memset(&cur, 0, sizeof(cur));
+   cur.frameskip       = g_frameskip ? 1 : 0;
+   cur.dsp_off         = g_scsp_dsp_off ? 1 : 0;
+   cur.resolution_mode = resolution_mode;
+   cur.rbg_res         = g_rbg_resolution_mode;
+   cur.rbg_cs          = g_rbg_use_compute_shader;
+   cur.polygon         = polygon_mode;
+
+   if (!baseline)
+   {
+      /* First refresh: these are the values the engine is initialised with
+       * (retro_load_game hands them to yinit, and YabauseInit applies them), so
+       * there is nothing to apply -- only a baseline to compare against. */
+      baseline = 1;
+      applied = cur;
+      applied_mt[0] = multitap[0];
+      applied_mt[1] = multitap[1];
+      applied_service = service_enabled ? 1 : 0;
       return;
-   if (req == 1)
+   }
+
+   memset(&d, 0, sizeof(d));
+   if (cur.frameskip != applied.frameskip)
+   { d.mask |= YAB_CFG_FRAMESKIP; d.frameskip = cur.frameskip; }
+   if (cur.dsp_off != applied.dsp_off)
+   { d.mask |= YAB_CFG_DSP; d.dsp_off = cur.dsp_off; }
+   if (cur.resolution_mode != applied.resolution_mode)
+   { d.mask |= YAB_CFG_RESOLUTION; d.resolution_mode = cur.resolution_mode; }
+   if (cur.rbg_res != applied.rbg_res)
+   { d.mask |= YAB_CFG_RBG_RES; d.rbg_res = cur.rbg_res; }
+   if (cur.rbg_cs != applied.rbg_cs)
+   { d.mask |= YAB_CFG_RBG_CS; d.rbg_cs = cur.rbg_cs; }
+   if (cur.polygon != applied.polygon)
+   { d.mask |= YAB_CFG_POLYGON; d.polygon = cur.polygon; }
+
+   pads = (multitap[0] != applied_mt[0] || multitap[1] != applied_mt[1] ||
+           (service_enabled ? 1 : 0) != applied_service);
+   if (pads)
+      d.mask |= YAB_CFG_PADS;
+
+   if (d.mask == 0)
+      return;
+
+   applied = cur;
+   applied_mt[0] = multitap[0];
+   applied_mt[1] = multitap[1];
+   applied_service = service_enabled ? 1 : 0;
+
+   if (!yab_emu_running)
    {
-      const unsigned char *h = (const unsigned char *)yab_st_load_buf;
-      if (!h)
-      {
-         /* The frontend gave up (it clears the request on timeout) or the
-          * pointer was already consumed: never feed a NULL buffer to the
-          * loader, it reports -2 (signature mismatch) and hides the real one. */
-         yab_st_req = 0;
-         yab_st_done = -1;
+      /* Before YabauseInit() there is nothing to apply: the load path hands these
+       * same values to yinit and yabause.c applies them there.  Once the engine
+       * is up but the machine has not started, no thread can race, so both halves
+       * run here (the load/settings-before-first-retro_run case). */
+      if (VIDCore == NULL)
          return;
-      }
-      if (h)
-         YAB_TR_L1("[STATE] load buffer head=%02X %02X %02X size=%lu\n",
-                   h[0], h[1], h[2], (unsigned long)yab_st_load_size);
-      int err = YabLoadStateBuffer(yab_st_load_buf, yab_st_load_size);
-      YAB_TR_L1("[STATE] load %lu bytes -> %s err=%d (68k PC=%08X SR=%04X)\n",
-                (unsigned long)yab_st_load_size, err == 0 ? "ok" : "FAILED", err,
-                (unsigned)(M68K->GetPC()), (unsigned)(M68K->GetSR()));
-      if (err == 0)
-      {
-         Vdp2AfterLoadState();
-         yab_audio_drop_pending();
-         yab_st_need_res = 1;      /* applied by retro_run, which owns GL */
-      }
-      yab_st_done = (err == 0) ? 1 : -1;
+      if (d.mask & ~(YAB_CFG_FRAMESKIP | YAB_CFG_DSP | YAB_CFG_PADS))
+         yab_cfg_apply_gl(&d);
+      yab_cfg_apply_machine(&d);
+      return;
    }
-   else if (req == 2)
+
+   /* Video settings are applied here, by the thread that owns the GL context;
+    * the rest goes to the machine thread, the only thread allowed to touch them
+    * while it runs. */
+   if (d.mask & ~(YAB_CFG_FRAMESKIP | YAB_CFG_DSP | YAB_CFG_PADS))
+      yab_cfg_apply_gl(&d);
+   if (!yab_cmd_post(YAB_CMD_CFG, &d, NULL, 0, NULL))
+      YAB_TR_L1("[CFG] queue full, change dropped (mask=%02X)\n", d.mask);
+}
+
+/* Machine thread, at its safe point: run everything the frontend posted. */
+static void yab_cmd_service(void)
+{
+   for (;;)
    {
-      void *buf = NULL; size_t size = 0;
-      int err = YabSaveStateBuffer(&buf, &size);
-      yab_st_save_buf = buf; yab_st_save_size = size;
-      yab_st_done = (err == 0) ? 1 : -1;
+      yab_cmd c;
+      int have = 0;
+
+      pthread_mutex_lock(&yab_cmd_mx);
+      if (yab_cmd_tail != yab_cmd_head)
+      {
+         c = yab_cmd_q[yab_cmd_tail];
+         yab_cmd_tail = (yab_cmd_tail + 1) % YAB_CMD_QUEUE;
+         have = 1;
+      }
+      pthread_mutex_unlock(&yab_cmd_mx);
+      if (!have)
+         break;
+
+      if (c.type == YAB_CMD_CFG)
+         yab_cfg_apply_machine(&c.cfg);
+      else
+         yab_state_execute(&c);
    }
-   yab_st_req = 0;
 }
 
 static void *yab_emu_main(void *arg)
@@ -3940,13 +4309,16 @@ static void *yab_emu_main(void *arg)
        * requested mid-frame also lands here within one frame. */
       yab_emu_parked = 1;
       YAB_STAGE(1);
-      yab_state_service();             /* save/load handed over by the frontend */
+      /* Parked between fields: the machine's safe point.  State commands and the
+       * machine's half of a configuration change are executed here, exactly where
+       * the standalone executes them (its menu, with the machine stopped). */
+      yab_cmd_service();
       for (;;)
       {
          if (!yab_emu_running) break;
-         if (yab_emu_paused) { yab_state_service(); usleep(500); continue; }
+         if (yab_emu_paused) { yab_cmd_service(); usleep(500); continue; }
          /* Frontend away (menu): park the machine, not just this thread's cycle. */
-         if (yab_front_pause_poll()) { yab_state_service(); usleep(1000); continue; }
+         if (yab_front_pause_poll()) { yab_cmd_service(); usleep(1000); continue; }
          break;
       }
       if (!yab_emu_running) break;
@@ -3983,65 +4355,6 @@ static void *yab_emu_main(void *arg)
    yab_emu_parked = 1;
    yab_emu_done = 1;
    return NULL;
-}
-
-/* Field clock, owned by the thread that presents -- in the standalone that is
- * VdpProc, here it is the frontend's thread inside retro_run.
- *
- * VdpProc's cycle is work + sleep + SwapWindow = one field period.  Our swap and
- * the frontend's quad/shader pass happen after retro_run returns, on the same
- * thread, so they have to come out of the core's share: the gap between two
- * retro_run entries is exactly the frontend's per-frame cost, and the sleep is
- * `period - gap - work`.  Without that subtraction the core paced itself to a
- * full period on top of the frontend's work (measured: 16.7 + 2-3 ms per frame).
- */
-/* Consumed by the engine's frameskip decision (vdp2.cpp Vdp2FrameSkipDecide):
- * 1 when the field did not fit its period, i.e. the same "behind" the
- * standalone's frameSkipAndLimit() derives from its own clock. */
-int yab_core_behind = 0;
-
-static void yab_pace_field(u64 t_entry_ns)
-{
-   /* Pace ENTRY to ENTRY, not "core work + sleep".
-    *
-    * The previous version targeted `entry + period - gap`, where gap was the
-    * measured frontend present cost.  That double-counts as soon as the
-    * frontend's swap starts blocking on vsync: the swap already provides the
-    * period, so our sleep pushed the entry-to-entry interval past it (measured
-    * 59.1-59.8 instead of 60.0).  Targeting the NEXT ENTRY directly is exact
-    * whatever spends the time: machine, rendering, present or swap.
-    *
-    * Fully conditional: when the loop already used the period, the deadline has
-    * passed and nothing sleeps -- there is no unconditional sleep here. */
-   static u64 next_entry_ns;
-   struct timespec ts;
-   u64 now_ns, period_ns;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   now_ns = (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
-   period_ns = (u64)(1000000000.0 / (yabsys.IsPal ? 50.0 : 60.0));
-   if (next_entry_ns == 0 || t_entry_ns > next_entry_ns + 2 * period_ns)
-      next_entry_ns = t_entry_ns;
-   next_entry_ns += period_ns;
-   /* "Behind" must mean a WHOLE field missed, not half: with the half-period
-    * threshold the boot phase (whose frames are short) kept the flag set, the
-    * engine's frameskip then stayed engaged, most fields went through VIDDummy
-    * and the frontend got far fewer pictures.  Half a period is jitter. */
-   yab_core_behind = (now_ns > next_entry_ns + period_ns) ? 1 : 0;
-   /* Phase bias: the caller's arrival races the machine's VIN dispatch, and
-    * losing that race costs a whole picture (a dupe).  Arriving a few ms after
-    * the field boundary removes the race and keeps the period unchanged (only
-    * the phase moves).  HEAD has no such race because its worker runs free. */
-   /* No phase bias: measured, shifting the arrival by 3 ms did not reduce the
-    * dupes (still 77 per 5 s in the heaviest scenes), so the loss is not a race
-    * between the caller and the VIN dispatch.  Those scenes need the machine to
-    * run a field ahead (double-buffered snapshots) instead. */
-   if (next_entry_ns > now_ns)
-   {
-      u64 d = next_entry_ns - now_ns;
-      ts.tv_sec = (time_t)(d / 1000000000ull);
-      ts.tv_nsec = (long)(d % 1000000000ull);
-      nanosleep(&ts, NULL);
-   }
 }
 
 static void yab_emu_start(void)
@@ -4227,12 +4540,6 @@ void retro_run(void)
 
    one_frame_rendered = false;
    yab_in_run = 1;          /* SET_GEOMETRY is legal only while this is set */
-   u64 _rr_entry_ns;
-   {
-      struct timespec _ts;
-      clock_gettime(CLOCK_MONOTONIC, &_ts);
-      _rr_entry_ns = (u64)_ts.tv_sec * 1000000000ull + (u64)_ts.tv_nsec;
-   }
 #if YAB_TRACE_LEVEL >= 2
    u64 _rr_t0 = yab_ft_now();
 #endif
@@ -4292,27 +4599,22 @@ void retro_run(void)
        * almost every field look like a duplicate. */
       if (yk.res_pending)
       {
-         /* The render thread performs the rebuild at the top of its own loop
-          * (machine parked there by design); this thread only asks. */
+         /* A rebuild asked for by a thread that cannot touch GL (the machine's
+          * video-mode change) is performed here, at the top of the field, by the
+          * only thread that owns the context. */
          yk.res_pending = 0;
          yk_res_wanted = 1;
       }
+      if (yk_res_wanted)
+         YuiResizeIfWanted();
       if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       {
-         /* Option changes rebuild GL objects and may resize the engine's
-          * framebuffers: park the machine so it is not mid-frame. */
-         int prev_resolution_mode = resolution_mode;
-         int prev_multitap[2] = {multitap[0],multitap[1]};
-         bool prev_service_enabled = service_enabled;
+         /* Parse, then hand each change to the thread that owns it, through the
+          * one channel: yab_cfg_push() inside check_variables().  The video half
+          * runs here (this thread owns GL), the machine's half on the machine
+          * thread at its frame boundary.  No option is applied twice. */
          check_variables();
          yk_seg_hit(7);
-         if(prev_resolution_mode != resolution_mode)
-            yk_res_wanted = 1;   /* the render thread performs it */
-         VIDCore->SetSettingValue(VDP_SETTING_RBG_RESOLUTION_MODE, g_rbg_resolution_mode);
-         VIDCore->SetSettingValue(VDP_SETTING_RBG_USE_COMPUTESHADER, g_rbg_use_compute_shader);
-         if(PERCore && (prev_multitap[0] != multitap[0] || prev_multitap[1] != multitap[1]
-                        || prev_service_enabled != service_enabled))
-            PERCore->Init();
          yk_seg_hit(6);        /* option block finished */
       }
 
@@ -4328,9 +4630,15 @@ void retro_run(void)
       if (yab_st_need_res)
       {
          /* A savestate may carry another video mode; the rebuild has to run on
-          * this thread (it owns GL and the lease). */
+          * this thread (it owns GL). */
          yab_st_need_res = 0;
-         retro_set_resolution();
+         if (yk_attach() == 0)
+         {
+            retro_set_resolution();
+            yk_detach();
+         }
+         else
+            yk_res_wanted = 1;
       }
       /* One field per call, never wait: the frontend is the pacer and the
        * machine's retire join holds it to one field of lead.  Waiting for a
@@ -4345,10 +4653,8 @@ void retro_run(void)
          unsigned before = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
          /* One field per call, never the backlog: the drain consumes VOUT(a)
           * and VIN(a+1) and stops at the VIN, so a call never touches a second
-          * field.  The field clock is inside the workflow
-          * (frameSkipAndLimit), exactly as on VdpProc, so this call spans the
-          * field period and the frontend's next retro_run finds the next field
-          * ready. */
+          * field.  The field clock runs at the end of this function, after the
+          * present, exactly where VdpProc calls it. */
          Vdp2DrainOneField();
          now = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
          /* Default: every composed field is a picture (the standalone's
@@ -4470,9 +4776,15 @@ void retro_run(void)
       }
    }
 #endif
+   /* The field clock, on the thread that presents -- the standalone's VdpProc
+    * calls frameSkipAndLimit() right after its SwapWindow, and that call is both
+    * the sleep into the next field boundary and the skip decision for the next
+    * VOUT.  Here the swap is the frontend's present above, so the clock runs
+    * after it, once per retro_run call: including calls that composed nothing,
+    * because VdpProc's cycle is per event, not per composed field.  It is the
+    * engine's own limiter, not a port-side pacer. */
+   { extern void Vdp2FieldClock(void); Vdp2FieldClock(); }
    yab_in_run = 0;
-   if (yk_caller_mode)
-      yab_pace_field(_rr_entry_ns);
 }
 
 #ifdef ANDROID

@@ -152,6 +152,9 @@ static int previous_skipped = 0;
  * context_destroy -> yab_emu_stop() joins the machine thread.  Without this the
  * quit from the frontend's menu froze on pthread_join (measured). */
 static volatile int g_join_abort = 0;
+/* Declared here because Vdp2AbortJoins() below has to wake the join waiters. */
+static pthread_mutex_t vdp1_join_mtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  vdp1_join_cv  = PTHREAD_COND_INITIALIZER;
 extern "C" void Vdp2AbortJoins(int on)
 {
   g_join_abort = on;
@@ -164,30 +167,13 @@ extern "C" void Vdp2AbortJoins(int on)
     YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
 }
 
-/* Frameskip is applied HERE, on the machine thread, and only here.
- *
- * The option handler runs on the frontend's thread (check_variables in
- * retro_run) and EnableAutoFrameSkip()/DisableAutoFrameSkip() rewrite
- * VIDCore->Vdp2Draw{Start,End,Screens}; the dummies are installed and removed
- * by vdp2VBlankOUT(), i.e. by the machine.  Rewriting those pointers from the
- * other thread meant the machine could call a half-installed table (this is the
- * live-toggle crash).  Both the switch and the per-field decision are therefore
- * turned into requests and applied at the top of vdp2VBlankOUT(). */
-static volatile int g_fs_enable_req = -1;   /* -1 = not requested yet */
-static volatile int g_fs_applied    = -1;
-static volatile int g_fs_decide_req = 0;
+/* The frameskip switch itself has no port-specific path: EnableAutoFrameSkip()
+ * and DisableAutoFrameSkip() are called on the thread that runs the machine, at
+ * its frame boundary -- the same functions, at the same moment, as the
+ * standalone's menu toggle (retro_arena/main.cpp, evToggleFrameSkip).  In the
+ * libretro build that call arrives through the machine-thread command channel in
+ * libretro.c.  The per-field decision stays inside frameSkipAndLimit() below. */
 
-extern "C" void Vdp2SetFrameSkipEnabled(int on)
-{
-  g_fs_enable_req = on ? 1 : 0;
-}
-
-/* Called from the caller's thread (Vdp2FrameSkipDecide): record the decision,
- * never touch the skip state itself. */
-extern "C" void Vdp2RequestFrameSkip(void)
-{
-  g_fs_decide_req = 1;
-}
 /* Shutdown helper: drop pending dispatch events without rendering them, so a
  * machine thread blocked in YabAddEventQueue (the queue holds 32 and nothing
  * consumes it once retro_run stops) can finish.  The frontend calls this while
@@ -301,8 +287,6 @@ int g_perline_requested = 0;
 // (mixed frames).
 static std::atomic<int> vdp1_ev_dispatched{0};
 static std::atomic<int> vdp1_ev_retired{0};
-static pthread_mutex_t vdp1_join_mtx = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  vdp1_join_cv  = PTHREAD_COND_INITIALIZER;
 
 extern "C" void Vdp1JoinPendingRendersC(void);
 extern "C" void Vdp1RamSnapshot(void);
@@ -1257,20 +1241,13 @@ void VDP2SetFrameLimit(int mode) {
   }
 }
 
-/* Caller mode: frameSkipAndLimit() does two jobs -- it SLEEPS into the next
- * field boundary and it DECIDES the skip.  The sleep moved to retro_run
- * (yab_pace_field) because only the frontend's thread can see the present cost
- * that has to come out of the period; the decision stays here, fed with the
- * lateness that same function measures.  Gated by the same switch as the
- * standalone's "frame skip" option (EnableAutoFrameSkip / yinit.frameskip). */
-extern "C" int yab_core_behind;
-extern "C" void Vdp2FrameSkipDecide(void)
-{
-  if (!autoframeskipenab)
-    return;
-  if (yab_core_behind)
-    Vdp2RequestFrameSkip();
-}
+void frameSkipAndLimit();
+
+/* The engine's field clock, reachable from the C side (libretro.c).  Same
+ * function, same place in the cycle as on the standalone's VdpProc: after the
+ * swap/present, once per field -- sleep into the next boundary and latch the
+ * skip decision for the next VOUT. */
+extern "C" void Vdp2FieldClock(void) { frameSkipAndLimit(); }
 
 void frameSkipAndLimit() {
   if (FrameAdvanceVariable == 0 && enableFrameLimit )
@@ -1349,17 +1326,6 @@ void vdp2VBlankIN(void) {
    //if (Vdp1External.manualchange) Vdp1Regs->EDSR >>= 1;
 
    VIDCore->Vdp2DrawEnd();
-   /* The field clock lives in retro_run (yab_pace_field): it has to subtract the
-    * frontend's own present cost, which this function cannot see.  The engine
-    * limiter's accounting is kept for frameskip, its sleep is not. */
-   {
-     static int limit_on = -1;
-     if (limit_on < 0) limit_on = vdp_on_caller ? 0 : 1;
-     if (limit_on)
-       frameSkipAndLimit();        /* worker model: sleep AND decide here */
-     else
-       Vdp2FrameSkipDecide();      /* caller model: only decide, see above */
-   }
    VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would
       fire a second time. */
@@ -2013,27 +1979,6 @@ static void vdp2_restore_vidcore(void)
 }
 
 void vdp2VBlankOUT(void) {
-  /* Frameskip switch + decision are applied here, on the machine thread: it is
-   * the only thread that rewrites VIDCore->Vdp2Draw* (see the block below). */
-  {
-    if (g_fs_applied < 0)
-      g_fs_applied = autoframeskipenab ? 1 : 0;
-    if (g_fs_enable_req >= 0 && g_fs_enable_req != g_fs_applied)
-    {
-      g_fs_applied = g_fs_enable_req;
-      if (g_fs_applied) EnableAutoFrameSkip();
-      else              DisableAutoFrameSkip();
-    }
-    if (g_fs_decide_req)
-    {
-      g_fs_decide_req = 0;
-      if (autoframeskipenab)
-      {
-        skipnextframe = 1;
-        framestoskip = 1;
-      }
-    }
-  }
   int isrender = 0;
 #if PROFILE_RENDERING
   u64 starttime = YabauseGetTicks();
