@@ -707,6 +707,7 @@ int g_perline_parts = 2;   /* SH2Exec slices per line in the per-line path */
 int YabauseEmulate(void) {
    int oneframeexec = 0;
    yabsys.frame_count++;
+   { extern int yab_emu_stage; yab_emu_stage = 30; }
    /* The replay recorder is a standalone feature (it needs jsoncpp); the
       libretro build does not have it. */
    #if !(defined(__LIBRETRO__))
@@ -954,19 +955,25 @@ int YabauseEmulate(void) {
       } /* end of line_boundary block */
 
       PROFILE_START("SCU");
+      { extern int yab_emu_stage; yab_emu_stage = 45; }
       ScuExec(sh2cycles >> 1);
+      { extern int yab_emu_stage; yab_emu_stage = 44; }
       PROFILE_STOP("SCU");
       PROFILE_START("68K");
+      { extern int yab_emu_stage; yab_emu_stage = 46; }
       M68KSync();  // Wait for the previous iteration to finish
+      { extern int yab_emu_stage; yab_emu_stage = 47; }
       PROFILE_STOP("68K");
 
       yabsys.UsecFrac += usecinc;
       {
       const u32 us_ = yabsys.UsecFrac >> YABSYS_TIMING_BITS;
       PROFILE_START("SMPC");
+      { extern int yab_emu_stage; yab_emu_stage = 48; }
       SmpcExec(us_);
       PROFILE_STOP("SMPC");
       PROFILE_START("CDB");
+      { extern int yab_emu_stage; yab_emu_stage = 49; }
       Cs2Exec(us_);
       PROFILE_STOP("CDB");
       }
