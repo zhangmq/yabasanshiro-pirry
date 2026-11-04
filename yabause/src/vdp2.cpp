@@ -1564,7 +1564,14 @@ void Vdp2VBlankIN(void) {
     evqueue = YabThreadCreateQueue(32);
   }
 
-  if (g_vin_decoupled < 0) g_vin_decoupled = 1;   /* fixed on */
+  /* ALIGN: the decoupled VIN is a caller-mode shape and nothing else.  There the
+   * renderer is the frontend's thread, so the machine must not wait for it --
+   * retro_run consumes the token at the machine's loop top.  The standalone keeps
+   * 1.6.2's path: post the event, then wait for the renderer's token.  The
+   * decoupled branch consumes no token, so forcing it on in the standalone left
+   * the renderer blocked on a full rcv_evqueue after eight fields (measured: the
+   * standalone froze right after boot). */
+  if (g_vin_decoupled < 0) g_vin_decoupled = vdp_on_caller ? 1 : 0;
 
   if (g_vin_decoupled) {
     /* Collect the token of the previous frame, then set status and interrupt here and continue
