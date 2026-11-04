@@ -107,6 +107,7 @@ SOURCES_C := $(SOURCE_DIR)/osdcore.c \
 	$(SOURCE_DIR)/ygles.c \
 	$(SOURCE_DIR)/yglshaderes.c \
 	$(SOURCE_DIR)/snddummy.c \
+	$(SOURCE_DIR)/sndstretch.c \
 	$(SOURCE_DIR)/vidshared.c \
 	$(SOURCE_DIR)/vidsoft.c \
 	$(SOURCE_DIR)/titan/titan.c \
