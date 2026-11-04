@@ -42,6 +42,7 @@
 
 #include "ygl.h"
 #include "yab_trace.h"   /* YAB_TRACE_LEVEL: compile-time probe levels */
+#include "../sndstretch.h" /* the decoupled audio path, shared with sndsdl.c */
 
 /* Core options v2 table ported from the reference libretro core
  * (lr-yabasanshiro) -- same keys, defaults, categories and descriptions. */
@@ -677,177 +678,296 @@ PerInterface_struct PERLIBRETROJoy = {
 #define SNDCORE_LIBRETRO   11
 #define SAMPLERATE         44100
 
-static u32 audio_size;
-static u32 soundlen;
-static u32 soundbufsize;
-static s16 *sound_buf;
+static u32 audio_size;      /* what the SCSP may still hand over this field */
+static u32 audio_per_frame;  /* sample_rate / fps: 735 at 60 Hz, 882 at 50 */
 
-/* ALIGN P7: decouple the machine from the frontend's audio device.
+/* Audio: pirry's decoupled model (sndstretch.c) behind the libretro contract.
  *
- * Until now SNDLIBRETROUpdateAudio() called audio_batch_cb() on the thread that
- * runs the machine, and minarch's write BLOCKS while its ring is full (up to
- * 20 ms per wait, api.c SND_batchSamples), so the sound card could hold a field.
- * The standalone has the same shape but its ring DROPS when full
- * (sndsdl.c:638-677), which is why its machine is never paced by audio.  This is
- * that property adapted to libretro: a small ring the machine writes (drop on
- * full) and a pump thread that hands it to the frontend.  The machine therefore
- * never waits for audio, and the frontend's write can only block the pump.
+ * Two properties have to hold at once, and they are not the same property:
+ *
+ *  - the machine must never wait for the sound card.  SndStretchWrite() fills a
+ *    ring on the SCSP side and drops what does not fit, exactly like the
+ *    standalone's SDL ring (sndsdl.c:638-677 does the same through this module).
+ *    No lock the frontend can hold is taken there.
+ *
+ *  - the frontend's blocking write must happen on the thread that runs
+ *    retro_run(), because that is how both frontends pace a loop: RetroArch sets
+ *    AUDIO_FLAG_WROTE there (audio/audio_driver.c, read by runloop.c) and minarch
+ *    sets ma_audio_wrote_frame there (MA_pace_frame returns early when it is set).
+ *    A core-owned writer thread sets those flags from the wrong thread: the front
+ *    end then cannot be paced by audio at all.  Measured on RetroArch with a pump
+ *    thread: PAL ran at ~57 fps instead of 50.
+ *
+ * sndstretch.c also carries the resampling-ratio regulator and the PLC, which is
+ * what makes SndStretchRead() always deliver a whole field: when the SCSP is
+ * short (measured: 184 and 551 samples in the two fields after a resume) the gap
+ * is concealed instead of being handed to the frontend as a short block.
+ *
+ * Why the cushion matters (.notes/AUDIO-SINK-DESIGN-20261105.md §2 has the
+ * source references): a frontend's dynamic rate control holds its OWN ring near
+ * 50% and corrects the playback rate by up to 1% (minarch api.c
+ * calculateBufferAdjustment; RetroArch audio_driver.c rate_control_delta).  A menu
+ * pause drains that ring to 0, and refilling it at the controller's 0.5-1%
+ * surplus takes 5-11 s -- the audible "detune for ten seconds" after a pause.
+ * The core cannot stop the controller from reacting, but it can hand the cushion
+ * back in one write at the moment it sees the resume.
+ *
+ * The cushion is silence (SndStretchPrefill).  It cannot come from production:
+ * scsp2.c:1371-1382 generates exactly the space the sink grants, so granting
+ * more runs the SCSP's audio timeline ahead of the emulated one -- that is the
+ * 9 fps storm, which the per-field budget below keeps filtered out.
  */
-#define YAB_AUD_RING 4096              /* frames (stereo), ~93 ms at 44.1 kHz */
-static int16_t yab_aud_ring[YAB_AUD_RING][2];
-static volatile unsigned yab_aud_w, yab_aud_r;
-static volatile int yab_aud_run;
-static pthread_t yab_aud_tid;
-static pthread_mutex_t yab_aud_mx = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t  yab_aud_cv = PTHREAD_COND_INITIALIZER;
-static unsigned yab_aud_dropped = 0;
+#define YAB_AUD_FILL_FIELDS 2          /* cushion: 2 fields ~= 33 ms at 60 Hz */
+#define YAB_AUD_OUT_MAX 4096           /* one write: a carry plus a whole cushion */
+#define YAB_AUD_STALL_NS 150000000ull  /* > 150 ms without a field = the frontend stopped */
+#define YAB_AUD_CATCHUP_FIELDS 4       /* frames spent answering a stall */
+/* Both frontends call < 25% occupancy a low-water mark and their rate control
+ * holds the ring near 50% (RA runloop.c:9863, minarch ma_audio.c:154). */
+#define YAB_AUD_OCC_LOW 25            /* their low-water mark */
+#define YAB_AUD_OCC_NEAR 40           /* within reach of the setpoint: leave it alone */
+static int16_t yab_aud_out[YAB_AUD_OUT_MAX][2];
+static int16_t yab_aud_carry[YAB_AUD_OUT_MAX][2];
+static unsigned yab_aud_carry_n;       /* frames a short write left behind */
+static u64 yab_aud_last_ns;            /* audio clock: the last relay */
+static unsigned yab_aud_catchup;       /* frames left to answer a stall with */
+static volatile int yab_aud_occ = -1;  /* the frontend's ring occupancy, -1 unknown */
+static unsigned yab_aud_produced;      /* frames the SCSP handed over, per probe window */
+static volatile int yab_aud_underrun;  /* the frontend reported a starved ring */
+static volatile int yab_aud_starved;   /* ... and the cushion has not answered it yet */
+/* The frontend's audio write must run on the thread that calls retro_run: both
+ * frontends use it as their audio pace (RA: AUDIO_FLAG_WROTE, minarch:
+ * ma_audio_wrote_frame).  Recorded on the first retro_run, checked in the flush. */
+static pthread_t yab_frame_tid;
+static int yab_frame_tid_valid;
 
-static void *yab_audio_pump(void *arg)
+/* Forward declaration: the monotonic clock used by the [FT] probe below. */
+static u64 yab_ft_now(void);
+
+/* RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK: both frontends publish
+ * their own ring's occupancy once per frame (RetroArch runloop.c:9858-9893,
+ * minarch ma_audio.c:121-158) and both mark < 25% as an underrun.  Read-only
+ * here: it tells the probe whether the cushion actually landed. */
+static void RETRO_CALLCONV yab_audio_status_cb(bool active, unsigned occupancy, bool underrun)
 {
-   static int16_t out[1024][2];
-   (void)arg;
-   for (;;)
+   if (!active) { yab_aud_occ = -1; return; }
+   yab_aud_occ = (int)occupancy;
+   if (underrun)
    {
-      unsigned n = 0, r, w;
-      pthread_mutex_lock(&yab_aud_mx);
-      while (yab_aud_run && yab_aud_w == yab_aud_r)
-         pthread_cond_wait(&yab_aud_cv, &yab_aud_mx);
-      if (!yab_aud_run) { pthread_mutex_unlock(&yab_aud_mx); break; }
-      r = yab_aud_r;
-      w = yab_aud_w;
-      while (r != w && n < 1024)
-      {
-         out[n][0] = yab_aud_ring[r][0];
-         out[n][1] = yab_aud_ring[r][1];
-         r = (r + 1) % YAB_AUD_RING;
-         n++;
-      }
-      yab_aud_r = r;
-      pthread_mutex_unlock(&yab_aud_mx);
-      if (n && audio_batch_cb)
-         audio_batch_cb((const int16_t *)out, n);   /* may block: the pump only */
+      yab_aud_underrun = 1;    /* for the probe */
+      yab_aud_starved  = 1;    /* for the cushion: this is what it is for */
    }
-   return NULL;
+}
+
+static void yab_audio_status_register(void)
+{
+   static int done;
+   struct retro_audio_buffer_status_callback cb;
+   if (done) return;
+   cb.callback = yab_audio_status_cb;
+   if (environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_BUFFER_STATUS_CALLBACK, &cb))
+      done = 1;
+}
+
+/* Frame thread, after present, before retro_run returns.  The frontend's write
+ * may block here: that IS the backpressure the frontends pace with.
+ *
+ * Normal field: one field of audio (735 at 60 Hz, 882 at 50), the shape libretro
+ * documents.  After the frontend stopped calling us (its menu, a load) its own
+ * ring has been drained meanwhile, and its rate control can only refill it at
+ * 0.5-1% per second -- the ten-second detune.  So for the next few fields one
+ * extra field goes along, sized by the occupancy the frontend reports, until its
+ * ring is back at the setpoint.  The extra frames are concealed by the module,
+ * not produced: production must stay one field per field (see GetAudioSpace). */
+static void yab_audio_flush(void)
+{
+   unsigned field = audio_per_frame ? audio_per_frame : 735u;
+   unsigned n = 0, want, room;
+   size_t took;
+   u64 now, gap;
+   int stalled;
+
+   if (!audio_batch_cb)
+      return;
+   if (yab_frame_tid_valid && !pthread_equal(pthread_self(), yab_frame_tid))
+   {
+      static int warned = 0;
+      if (!warned++)
+         log_cb(RETRO_LOG_ERROR, "audio flush off the retro_run thread\n");
+   }
+
+   /* A short write last field: that audio still belongs to the frontend. */
+   if (yab_aud_carry_n)
+   {
+      memcpy(yab_aud_out, yab_aud_carry, yab_aud_carry_n * 4);
+      n = yab_aud_carry_n;
+   }
+
+   now = yab_ft_now();
+   gap = yab_aud_last_ns ? now - yab_aud_last_ns : 0;
+   yab_aud_last_ns = now;
+   stalled = (gap > YAB_AUD_STALL_NS);
+   if (stalled)
+   {
+      yab_aud_catchup = YAB_AUD_CATCHUP_FIELDS;   /* frames, not samples */
+      yab_aud_occ = -1;            /* the last reading predates the stall */
+      yab_aud_starved = 0;         /* the stall itself explains the underruns */
+      log_cb(RETRO_LOG_INFO, "audio resume after a %.0f ms gap (frontend occupancy %d%%)\n",
+             (double)gap / 1e6, yab_aud_occ);
+   }
+
+   want = field;
+   if (yab_aud_catchup)
+   {
+      /* Give the frontend's ring back the buffering the pause took out of it.
+       * The ring is ~100 ms deep (what we asked for), so half of it is three
+       * fields; a starved frontend reports occupancy < 25 or its own underrun
+       * flag, and then 1.5 fields of silence lands it back at the ~50% setpoint
+       * its rate control holds.  Frontends that publish nothing get two fields
+       * once.  The padding is silence, not concealment: the machine produced
+       * nothing while the frontend was away, and a repeated pitch period is a
+       * worse answer than a gap that is 35 ms long. */
+      unsigned pad = 0;
+      if (yab_aud_occ < 0)
+         pad = field * 3 / 2;                          /* no telemetry: let it be */
+      else if (yab_aud_occ < YAB_AUD_OCC_LOW ||
+               (yab_aud_starved && yab_aud_occ < YAB_AUD_OCC_NEAR))
+         pad = field * 3 / 2;
+      yab_aud_starved = 0;
+      yab_aud_catchup--;
+      if (pad)
+      {
+         /* Handed over as literal silence, *beside* the field, so the sink's own
+          * reserve is not spent refilling the frontend: it has to survive to
+          * absorb the machine's jitter (measured: 184 and 551 sample fields). */
+         if (n + field + pad > YAB_AUD_OUT_MAX) pad = 0;
+         else
+         {
+            memset((int16_t *)yab_aud_out + (size_t)(n + field) * 2, 0, pad * 4);
+            log_cb(RETRO_LOG_INFO, "audio cushion: %u frames of silence back (occ %d%%)\n",
+                   pad, yab_aud_occ);
+            want = field + pad;
+         }
+      }
+   }
+
+   room = YAB_AUD_OUT_MAX - n;
+   if (want > room) want = room;
+   if (want)
+   {
+      SndStretchRead((int16_t *)yab_aud_out + (size_t)n * 2, want);
+      n += want;
+   }
+   if (!n)
+      return;
+
+#if YAB_TRACE_LEVEL >= 2
+   {
+      struct timespec t0, t1;
+      u64 d;
+      static u64 sum_ns, max_ns, frames;
+      static unsigned calls;
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+      took = audio_batch_cb((const int16_t *)yab_aud_out, n);
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      d = (u64)(t1.tv_sec - t0.tv_sec) * 1000000000ull +
+          (u64)(t1.tv_nsec - t0.tv_nsec);
+      sum_ns += d;
+      if (d > max_ns) max_ns = d;
+      frames += (u64)took;
+      if (++calls >= 60)          /* ~1 s at 60 Hz: the rate has to be visible per second */
+      {
+         static u64 t_last;
+         u64 t = (u64)t1.tv_sec * 1000000000ull + (u64)t1.tv_nsec;
+         double secs = t_last ? (double)(t - t_last) / 1e9 : 0.0;
+         unsigned prod = yab_aud_produced;
+         yab_aud_produced = 0;
+         printf("[AUD] rate=%.0f/s prod=%.0f/s fill=%u/%u ratio=%.4f occ=%d concealed=%u"
+                " underrun=%d max=%.2fms\n",
+                secs > 0.0 ? (double)frames / secs : 0.0,
+                secs > 0.0 ? (double)prod / secs : 0.0,
+                SndStretchFill(), (unsigned)SNDSTRETCH_RING_FRAMES, SndStretchRatio(),
+                yab_aud_occ, SndStretchTakeConcealed(),
+                (int)yab_aud_underrun, (double)max_ns / 1e6);
+         fflush(stdout);
+         yab_aud_underrun = 0;
+         t_last = t;
+         calls = 0; sum_ns = max_ns = frames = 0;
+      }
+   }
+#else
+   took = audio_batch_cb((const int16_t *)yab_aud_out, n);
+#endif
+   if (took > n)
+      took = n;
+   if (took < n)
+   {
+      /* The frontend took a prefix only.  Keep the rest for the next field
+       * instead of dropping it: a short write is legal, silence is not the
+       * answer.  (RetroArch's sample_batch always takes everything; minarch's
+       * blocking path does too unless the device is gone.) */
+      unsigned left = n - (unsigned)took;
+      memcpy(yab_aud_carry, yab_aud_out + took, left * 4);
+      yab_aud_carry_n = left;
+   }
+   else
+      yab_aud_carry_n = 0;
 }
 
 static int SNDLIBRETROInit(void) {
     /* yabsys.IsPal is not set yet: YabauseSetVideoFormat() runs after ScspInit()
        inside YabauseInit().  Use the format latched by retro_load_game(). */
     int vertfreq = (g_videoformat_pending == VIDEOFORMATTYPE_PAL) ? 50 : 60;
-    soundlen = (SAMPLERATE * 100 + (vertfreq >> 1)) / vertfreq;
-    log_cb(RETRO_LOG_INFO, "SNDLIBRETROInit: %d Hz -> scratch buffer %u samples\n", vertfreq, soundlen);
-    soundbufsize = (soundlen<<2 * sizeof(s16));
-    if ((sound_buf = (s16 *)malloc(soundbufsize)) == NULL)
-        return -1;
-    memset(sound_buf, 0, soundbufsize);
-    /* ALIGN P7: the pump owns the frontend write from now on. */
-    if (!yab_aud_run)
-    {
-       yab_aud_w = yab_aud_r = 0;
-       yab_aud_run = 1;
-       if (pthread_create(&yab_aud_tid, NULL, yab_audio_pump, NULL) != 0)
-       {
-          yab_aud_run = 0;
-          log_cb(RETRO_LOG_ERROR, "audio pump thread failed; audio will be silent\n");
-       }
-    }
+    audio_per_frame = (SAMPLERATE + (vertfreq >> 1)) / vertfreq;
+    SndStretchInit(SAMPLERATE, vertfreq);
+    SndStretchSetFillTarget(audio_per_frame * YAB_AUD_FILL_FIELDS);
+    SndStretchPrefill();
+    yab_aud_carry_n = 0;
+    yab_aud_last_ns = 0;
+    log_cb(RETRO_LOG_INFO, "SNDLIBRETROInit: %d Hz -> %u samples per field, %u-frame cushion\n",
+           vertfreq, audio_per_frame, SndStretchFillTarget());
     return 0;
 }
 
 static void SNDLIBRETRODeInit(void) {
-   /* ALIGN P7: stop the pump before the buffer it reads goes away. */
-   if (yab_aud_run)
-   {
-      pthread_mutex_lock(&yab_aud_mx);
-      yab_aud_run = 0;
-      pthread_cond_broadcast(&yab_aud_cv);
-      pthread_mutex_unlock(&yab_aud_mx);
-      pthread_join(yab_aud_tid, NULL);
-   }
-   if (sound_buf)
-      free(sound_buf);
+   SndStretchDeInit();
+   yab_aud_carry_n = 0;
+   yab_aud_last_ns = 0;
 }
 
-static int SNDLIBRETROReset(void) { return 0; }
+static int SNDLIBRETROReset(void) { SndStretchReset(); return 0; }
 
 static int SNDLIBRETROChangeVideoFormat(int vertfreq)
 {
-    soundlen = (SAMPLERATE * 100 + (vertfreq >> 1)) / vertfreq;
-    log_cb(RETRO_LOG_INFO, "SNDLIBRETROChangeVideoFormat: %d Hz -> scratch buffer %u samples\n", vertfreq, soundlen);
-    soundbufsize = (soundlen<<2 * sizeof(s16));
-    if (sound_buf)
-        free(sound_buf);
-    if ((sound_buf = (s16 *)malloc(soundbufsize)) == NULL)
-        return -1;
-    memset(sound_buf, 0, soundbufsize);
+    audio_per_frame = (SAMPLERATE + (vertfreq >> 1)) / vertfreq;
+    SndStretchInit(SAMPLERATE, vertfreq);
+    SndStretchSetFillTarget(audio_per_frame * YAB_AUD_FILL_FIELDS);
+    SndStretchPrefill();
+    yab_aud_carry_n = 0;
+    yab_aud_last_ns = 0;
+    log_cb(RETRO_LOG_INFO, "SNDLIBRETROChangeVideoFormat: %d Hz -> %u per field, %u-frame cushion\n",
+           vertfreq, audio_per_frame, SndStretchFillTarget());
     return 0;
 }
 
-static void sdlConvert32uto16s(int32_t *srcL, int32_t *srcR, int16_t *dst, size_t len)
-{
-   u32 i;
-
-   for (i = 0; i < len; i++)
-   {
-      // Left Channel
-      if (*srcL > 0x7FFF)
-         *dst = 0x7FFF;
-      else if (*srcL < -0x8000)
-         *dst = -0x8000;
-      else
-         *dst = *srcL;
-      srcL++;
-      dst++;
-
-      // Right Channel
-      if (*srcR > 0x7FFF)
-         *dst = 0x7FFF;
-      else if (*srcR < -0x8000)
-         *dst = -0x8000;
-      else
-         *dst = *srcR;
-      srcR++;
-      dst++;
-   }
-}
-
 /* ---------------------------------------------------------------------------
- * Audio: pirry's model -- the sound thread hands its own audio to the frontend.
+ * The sink's producer side: the SCSP hands its field to the shared module.
  *
- * pirry's wall-clock SCSP thread calls SNDCore->UpdateAudio() itself
- * (scsp.c:6364 in 1.6.2) and the SDL ring behind it blocks when full, so the
- * sound card paces the SOUND thread and the frame path never waits for audio.
- * libretro does not require the audio callback to come from the retro_run
- * thread: retro_audio_sample_batch_t (:7589-7601) says nothing about threads,
- * and the only "must be thread-safe" wording is about callbacks the FRONTEND
- * invokes (:1119-1120).  This frontend's write is mutex-protected (minarch
- * SND_batchSamples), so the same shape is available here.
- *
- * This replaces the ring + per-retro_run flush: that shape made the machine
- * wait for the frontend's blocking write (a backlog of several fields became
- * ~43 ms inside retro_run; PERF-REGRESS §10), needed a one-field cap and still
- * dropped stale audio on pause/load.  With the write moved onto the sound
- * thread, backpressure lands where pirry puts it -- on the sound thread -- and
- * the frame path never pays for audio.
- *
- * Deliberate trade-off to watch: the frontend's "audio wrote this frame" pacing
- * flag (minarch ma_audio_wrote_frame, MA_pace_frame/PACE_AUDIO) is now set from
- * this thread, i.e. asynchronously.  If the frontend loses its audio clock the
- * frame rate runs away -- measure fps before judging anything else.
+ * sndstretch.c does the s16 conversion and the clamp (the SCSP's output is 32-bit
+ * and does exceed the s16 range, so the clamp is not cosmetic), the resampling
+ * step and the ring.  One implementation for both sinks -- sndsdl.c calls the
+ * same three functions from its SDL ring.
  * ------------------------------------------------------------------------- */
 static volatile int yab_audio_live;    /* 0 while the frontend is tearing down */
-static u64 yab_ft_now(void);           /* defined next to the [FT] probe below */
-/* Probe: cost of the frontend's write, counted on the sound thread. */
-static u64 yab_audio_cb_ns;
-static u32 yab_audio_cb_calls;
-static u32 yab_audio_cb_max_ns;
-static u32 yab_audio_write_max;
 
-/* vdp2.cpp calls this on pause-resume / load / reset to drop audio that belongs
- * to the timeline being replaced.  With no ring nothing is queued: the sound
- * thread only ever holds the field it is converting, so this is a no-op and the
- * call sites stay as they are. */
-void yab_audio_drop_pending(void) { }
+/* vdp2.cpp calls this on pause-resume / load / reset: the queued audio belongs
+ * to the timeline being replaced, so drop it and put the cushion back. */
+void yab_audio_drop_pending(void)
+{
+   SndStretchReset();
+   SndStretchPrefill();
+   yab_aud_carry_n = 0;
+   yab_aud_last_ns = 0;
+}
 
 static void SNDLIBRETROUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer, u32 num_samples)
 {
@@ -858,56 +978,36 @@ static void SNDLIBRETROUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer, u3
       log_cb(RETRO_LOG_INFO, "SNDLIBRETROUpdateAudio: %u samples/frame (%d Hz, queued for the frontend)\n",
              num_samples, g_videoformat_pending == VIDEOFORMATTYPE_PAL ? 50 : 60);
    }
-   if (num_samples > soundbufsize / 4) num_samples = soundbufsize / 4;   /* scratch size (stereo s16) */
-   sdlConvert32uto16s((int32_t*)leftchanbuffer, (int32_t*)rightchanbuffer, sound_buf, num_samples);
-
-   /* ALIGN P7: hand it to the ring; the pump thread talks to the frontend. */
-   if (yab_audio_live && audio_batch_cb && num_samples)
-   {
-      unsigned w, r, i;
-      pthread_mutex_lock(&yab_aud_mx);
-      w = yab_aud_w;
-      r = yab_aud_r;
-      for (i = 0; i < num_samples; i++)
-      {
-         unsigned next = (w + 1) % YAB_AUD_RING;
-         if (next == r) { yab_aud_dropped++; continue; }   /* full: drop (sndsdl.c) */
-         yab_aud_ring[w][0] = sound_buf[2 * i + 0];
-         yab_aud_ring[w][1] = sound_buf[2 * i + 1];
-         w = next;
-      }
-      yab_aud_w = w;
-      pthread_cond_signal(&yab_aud_cv);
-      pthread_mutex_unlock(&yab_aud_mx);
-   }
-
+   if (!num_samples || !yab_audio_live || !audio_batch_cb)
+      return;
+   /* Machine thread: fill the ring and return.  It never waits for the frontend;
+    * a full ring drops, the property sndsdl.c has always relied on. */
+   SndStretchWrite((const int32_t *)leftchanbuffer, (const int32_t *)rightchanbuffer, num_samples);
    audio_size -= num_samples;
-
-#if YAB_TRACE_LEVEL >= 2
-   {
-      static u32 calls = 0;
-      if (++calls >= 600)
-      {
-         u64 ns = __atomic_exchange_n(&yab_audio_cb_ns, 0, __ATOMIC_RELAXED);
-         u32 nc = (u32)__atomic_exchange_n(&yab_audio_cb_calls, 0, __ATOMIC_RELAXED);
-         printf("[AUD] writes=%u cb_avg=%.2fms cb_max=%.2fms max_frames=%u (sound thread)\n",
-                nc, nc ? (double)ns / 1e6 / nc : 0.0,
-                (double)__atomic_exchange_n(&yab_audio_cb_max_ns, 0, __ATOMIC_RELAXED) / 1e6,
-                (unsigned)__atomic_exchange_n(&yab_audio_write_max, 0, __ATOMIC_RELAXED));
-         fflush(stdout);
-         calls = 0;
-      }
-   }
-#endif
+   yab_aud_produced += num_samples;
 }
 
-static u32 SNDLIBRETROGetAudioSpace(void) { return audio_size; }
+static u32 SNDLIBRETROGetAudioSpace(void)
+{
+   /* Two bounds, and both matter:
+    *  - audio_size is the field's budget.  scsp2.c:1371-1382 generates exactly the
+    *    space it is granted, so granting more than one field runs the SCSP's audio
+    *    timeline ahead of the emulated one (that was the 4410-samples/frame storm
+    *    and the ~100 ms flush behind it: 9 fps).
+    *  - SndStretchSpaceIn() is the ring's real free space, ratio-corrected.
+    * The old code returned the scratch size (73500) as if it were free space. */
+   u32 budget = audio_size;
+   u32 free_ring = SndStretchSpaceIn();
+   return (budget < free_ring) ? budget : free_ring;
+}
 
-void SNDLIBRETROMuteAudio(void) {}
+/* scsp2.c calls these from the machine thread when the game mutes a slot or
+ * changes the SCSP volume; the module applies them where the samples are made. */
+void SNDLIBRETROMuteAudio(void) { SndStretchSetMuted(1); }
 
-void SNDLIBRETROUnMuteAudio(void) {}
+void SNDLIBRETROUnMuteAudio(void) { SndStretchSetMuted(0); }
 
-void SNDLIBRETROSetVolume(int volume) {}
+void SNDLIBRETROSetVolume(int volume) { SndStretchSetVolume(volume); }
 
 SoundInterface_struct SNDLIBRETRO = {
     SNDCORE_LIBRETRO,
@@ -3662,6 +3762,24 @@ bool retro_load_game(const struct retro_game_info *info)
              source, region, stv_mode ? 1 : 0);
    }
 
+   /* Tell the frontend how much audio to keep ahead of the device.  This core
+    * hands the frontend one whole field per retro_run -- 735 frames at 60 Hz or
+    * 882 at 50 -- so a ring shorter than a field underruns on the first one.
+    * Six fields is the request Genesis Plus GX makes; RetroArch folds it into
+    * its runloop audio latency and minarch sizes its ring from it
+    * (SND_setLatencyTarget).  Reported here because the video standard, and so
+    * the field length, is only known after the disc header has been read. */
+   {
+      unsigned latency_ms = (unsigned)(6000.0f /
+            (g_videoformat_pending == VIDEOFORMATTYPE_PAL ? 50.0f : 60.0f) + 0.5f);
+      if (environ_cb(RETRO_ENVIRONMENT_SET_MINIMUM_AUDIO_LATENCY, &latency_ms))
+         log_cb(RETRO_LOG_INFO, "audio latency: requested %u ms (6 fields of %s)\n",
+                latency_ms, g_videoformat_pending == VIDEOFORMATTYPE_PAL ? "882" : "735");
+   }
+   /* Read-only telemetry: the frontend's own ring occupancy, so the [AUD] probe
+    * shows whether the cushion landed (it is what the resume path is for). */
+   yab_audio_status_register();
+
    snprintf(bios_path, sizeof(bios_path), "%s%csaturn_bios.bin", g_system_dir, slash);
    if (does_file_exist(bios_path) != 1)
    {
@@ -4810,12 +4928,43 @@ static void yab_emu_resume(void)
    yab_emu_paused = 0;
 }
 
+/* TEST HOOK (trace level 2, removed before the branch is closed): write the
+ * number of seconds to /tmp/yab_pause_req and the next retro_run stops for that
+ * long.  That is what a frontend menu does to a core -- no retro_run, while the
+ * frontend's own audio thread keeps draining its ring -- and unlike SIGSTOP it
+ * leaves that thread running, so the drained ring is real.  Driven by
+ * .notes/tools/ra-baseline.sh. */
+#if YAB_TRACE_LEVEL >= 2
+static void yab_test_pause_hook(void)
+{
+   FILE *f = fopen("/tmp/yab_pause_req", "r");
+   unsigned secs = 5;
+   if (!f)
+      return;
+   if (fscanf(f, "%u", &secs) != 1 || !secs || secs > 30)
+      secs = 5;
+   fclose(f);
+   unlink("/tmp/yab_pause_req");
+   log_cb(RETRO_LOG_INFO, "audio test: holding retro_run for %u s\n", secs);
+   while (secs--)
+      sleep(1);
+}
+#endif
+
 void retro_run(void)
 {
    bool updated  = false;
 
+#if YAB_TRACE_LEVEL >= 2
+   yab_test_pause_hook();
+#endif
    one_frame_rendered = false;
    yab_in_run = 1;          /* SET_GEOMETRY is legal only while this is set */
+   if (!yab_frame_tid_valid)          /* audio flush must come back to this thread */
+   {
+      yab_frame_tid = pthread_self();
+      yab_frame_tid_valid = 1;
+   }
 #if YAB_TRACE_LEVEL >= 2
    u64 _rr_t0 = yab_ft_now();
 #endif
@@ -4927,7 +5076,15 @@ void retro_run(void)
        * the frontend grants it, and a frameskip field must not starve the
        * sound (our fork's model; without this the thread produces nothing and
        * UpdateAudio is never called -- measured: silent core). */
-      audio_size = soundlen;
+      /* Grant one field of audio space.  It has to *accumulate*: the machine's
+       * SCSP call for a field can land before this grant, and a plain assignment
+       * then threw the unclaimed grant away -- measured as a 1.7% production
+       * deficit (prod=43012/s while the loop consumed 43789/s), which drained the
+       * sink's ring into permanent PLC concealment.  The cap keeps a stalled
+       * machine from banking a burst. */
+      audio_size += audio_per_frame;
+      if (audio_size > 2 * audio_per_frame)
+         audio_size = 2 * audio_per_frame;
 #if YAB_TRACE_LEVEL >= 2
       {
          static u64 sum, mx;
@@ -4957,6 +5114,10 @@ void retro_run(void)
          if (!yab_field_presented)
             video_cb(NULL, current_width, current_height, 0);
       }
+      /* ALIGN: hand this field's audio to the frontend here -- on the retro_run
+       * thread, which is where both frontends take their audio pace (RetroArch's
+       * AUDIO_FLAG_WROTE, minarch's ma_audio_wrote_frame).  See yab_audio_flush(). */
+      yab_audio_flush();
       /* the next field picks the slot the frontend advanced to */
 #if YAB_TRACE_LEVEL >= 2
       /* L2 probe [V1]: the numbers the standalone's OSD shows, measured the same
