@@ -92,6 +92,10 @@ static void yab_emu_resume(void);
 static bool hle_bios_force = false;
 static bool one_frame_rendered = false;
 static volatile unsigned yab_swap_count = 0;   /* pictures drawn by the worker */
+/* ALIGN P2: set by YuiSwapBuffers() when the field it just composed was handed
+ * to the frontend.  retro_run resets it at entry and presents a dupe when the
+ * field was skipped (no composition -> no swap, exactly like the standalone). */
+static int yab_field_presented = 0;
 static int yab_vcrc_nopresent = 0;
 /* 最近一次合成（YglRender 末尾）的画面 CRC，见 yab_after_compose()。 */
 static unsigned yab_last_crc = 0;
@@ -129,7 +133,19 @@ static int g_videoformat_pending = -1;
  * Declared here because check_variables() (below) reads it; the switch and the
  * per-field decision both belong to the engine (EnableAutoFrameSkip /
  * frameSkipAndLimit in vdp2.cpp), applied at the next VOUT. */
+/* ALIGN P6: SCSP mix-level setters live in scsp.c without a header entry. */
+extern void ScspSetCddaVolume(int v);
+extern void ScspSetSfxVolume(int v);
+static void yab_apply_options_initial(void);
 static int g_frameskip = 0;
+/* ALIGN P6: the standalone menu's remaining settings, now core options. */
+static int g_interlace_half = 0;      /* g_interlace_half_menu, GL side */
+static int g_rotate_screen = 0;       /* VDP_SETTING_ROTATE_SCREEN, GL side */
+static int g_texcache_persist_opt = 1;/* g_texcache_persist, GL side */
+static int g_sys_language = 0;        /* SmpcSetSystemLanguage, machine */
+static int g_mute_cdda = 0;           /* ScspSetCddaMute, machine */
+static int g_cd_volume = 100;         /* ScspSetCddaVolume, machine */
+static int g_sfx_volume = 100;        /* ScspSetSfxVolume, machine */
 static int yk_no_present;
 static int yk_hold;        /* diagnostic: YK_HOLD=1 keeps the lease on the render thread */   /* diagnostic: YK_NO_PRESENT=1 skips the frontend borrow */
 static int g_rbg_resolution_mode = 0;
@@ -401,10 +417,21 @@ static yab_input_port_t yab_input_buf[2][YAB_INPUT_PORTS];
 static volatile int yab_input_cur = -1;   /* index of the last COMPLETE snapshot */
 
 /* Frontend thread: poll + snapshot. */
-static void yab_input_snapshot(void)
+static int yab_in_run;   /* defined below; the input publish is gated on retro_run */
+
+void yab_input_publish(void)
 {
-   int cur = yab_input_cur;
-   int next = (cur == 0) ? 1 : 0;
+   /* ALIGN P5: published right before the field token (vdp2.cpp, at the end of the
+    * VIN handler), so the machine's NEXT field reads the input sampled after this
+    * field's present -- the standalone's "poll at the loop top, then run a field".
+    * Only inside retro_run: the state pump also processes VIN events, and a second
+    * poll per frame would run the frontend's shortcut stage twice. */
+   int cur;
+   int next;
+   if (!yab_in_run)
+      return;
+   cur = yab_input_cur;
+   next = (cur == 0) ? 1 : 0;
    unsigned i;
 
    if (input_poll_cb) input_poll_cb();
@@ -655,6 +682,54 @@ static u32 soundlen;
 static u32 soundbufsize;
 static s16 *sound_buf;
 
+/* ALIGN P7: decouple the machine from the frontend's audio device.
+ *
+ * Until now SNDLIBRETROUpdateAudio() called audio_batch_cb() on the thread that
+ * runs the machine, and minarch's write BLOCKS while its ring is full (up to
+ * 20 ms per wait, api.c SND_batchSamples), so the sound card could hold a field.
+ * The standalone has the same shape but its ring DROPS when full
+ * (sndsdl.c:638-677), which is why its machine is never paced by audio.  This is
+ * that property adapted to libretro: a small ring the machine writes (drop on
+ * full) and a pump thread that hands it to the frontend.  The machine therefore
+ * never waits for audio, and the frontend's write can only block the pump.
+ */
+#define YAB_AUD_RING 4096              /* frames (stereo), ~93 ms at 44.1 kHz */
+static int16_t yab_aud_ring[YAB_AUD_RING][2];
+static volatile unsigned yab_aud_w, yab_aud_r;
+static volatile int yab_aud_run;
+static pthread_t yab_aud_tid;
+static pthread_mutex_t yab_aud_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  yab_aud_cv = PTHREAD_COND_INITIALIZER;
+static unsigned yab_aud_dropped = 0;
+
+static void *yab_audio_pump(void *arg)
+{
+   static int16_t out[1024][2];
+   (void)arg;
+   for (;;)
+   {
+      unsigned n = 0, r, w;
+      pthread_mutex_lock(&yab_aud_mx);
+      while (yab_aud_run && yab_aud_w == yab_aud_r)
+         pthread_cond_wait(&yab_aud_cv, &yab_aud_mx);
+      if (!yab_aud_run) { pthread_mutex_unlock(&yab_aud_mx); break; }
+      r = yab_aud_r;
+      w = yab_aud_w;
+      while (r != w && n < 1024)
+      {
+         out[n][0] = yab_aud_ring[r][0];
+         out[n][1] = yab_aud_ring[r][1];
+         r = (r + 1) % YAB_AUD_RING;
+         n++;
+      }
+      yab_aud_r = r;
+      pthread_mutex_unlock(&yab_aud_mx);
+      if (n && audio_batch_cb)
+         audio_batch_cb((const int16_t *)out, n);   /* may block: the pump only */
+   }
+   return NULL;
+}
+
 static int SNDLIBRETROInit(void) {
     /* yabsys.IsPal is not set yet: YabauseSetVideoFormat() runs after ScspInit()
        inside YabauseInit().  Use the format latched by retro_load_game(). */
@@ -665,10 +740,30 @@ static int SNDLIBRETROInit(void) {
     if ((sound_buf = (s16 *)malloc(soundbufsize)) == NULL)
         return -1;
     memset(sound_buf, 0, soundbufsize);
+    /* ALIGN P7: the pump owns the frontend write from now on. */
+    if (!yab_aud_run)
+    {
+       yab_aud_w = yab_aud_r = 0;
+       yab_aud_run = 1;
+       if (pthread_create(&yab_aud_tid, NULL, yab_audio_pump, NULL) != 0)
+       {
+          yab_aud_run = 0;
+          log_cb(RETRO_LOG_ERROR, "audio pump thread failed; audio will be silent\n");
+       }
+    }
     return 0;
 }
 
 static void SNDLIBRETRODeInit(void) {
+   /* ALIGN P7: stop the pump before the buffer it reads goes away. */
+   if (yab_aud_run)
+   {
+      pthread_mutex_lock(&yab_aud_mx);
+      yab_aud_run = 0;
+      pthread_cond_broadcast(&yab_aud_cv);
+      pthread_mutex_unlock(&yab_aud_mx);
+      pthread_join(yab_aud_tid, NULL);
+   }
    if (sound_buf)
       free(sound_buf);
 }
@@ -766,30 +861,24 @@ static void SNDLIBRETROUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer, u3
    if (num_samples > soundbufsize / 4) num_samples = soundbufsize / 4;   /* scratch size (stereo s16) */
    sdlConvert32uto16s((int32_t*)leftchanbuffer, (int32_t*)rightchanbuffer, sound_buf, num_samples);
 
-   /* pirry shape: hand it over right here, on the sound thread.  The frontend's
-    * write blocks while its ring is full, and that blocks this thread -- not
-    * retro_run (minarch SND_batchSamples; the same backpressure pirry gets from
-    * SDL's ring). */
+   /* ALIGN P7: hand it to the ring; the pump thread talks to the frontend. */
    if (yab_audio_live && audio_batch_cb && num_samples)
    {
-#if YAB_TRACE_LEVEL >= 2
-      /* L2 probe [AUD]: callback timing.  Costs two clock reads plus four
-       * atomics per callback (~600/s), so it is compiled out at level 0/1. */
-      u64 t0 = yab_ft_now();
-      audio_batch_cb((const int16_t *)sound_buf, num_samples);
+      unsigned w, r, i;
+      pthread_mutex_lock(&yab_aud_mx);
+      w = yab_aud_w;
+      r = yab_aud_r;
+      for (i = 0; i < num_samples; i++)
       {
-         u64 dt = yab_ft_now() - t0;
-         u32 prev;
-         __atomic_add_fetch(&yab_audio_cb_ns, dt, __ATOMIC_RELAXED);
-         __atomic_add_fetch(&yab_audio_cb_calls, 1, __ATOMIC_RELAXED);
-         prev = __atomic_load_n(&yab_audio_cb_max_ns, __ATOMIC_RELAXED);
-         if (dt > prev) __atomic_store_n(&yab_audio_cb_max_ns, dt, __ATOMIC_RELAXED);
-         prev = __atomic_load_n(&yab_audio_write_max, __ATOMIC_RELAXED);
-         if (num_samples > prev) __atomic_store_n(&yab_audio_write_max, num_samples, __ATOMIC_RELAXED);
+         unsigned next = (w + 1) % YAB_AUD_RING;
+         if (next == r) { yab_aud_dropped++; continue; }   /* full: drop (sndsdl.c) */
+         yab_aud_ring[w][0] = sound_buf[2 * i + 0];
+         yab_aud_ring[w][1] = sound_buf[2 * i + 1];
+         w = next;
       }
-#else
-      audio_batch_cb((const int16_t *)sound_buf, num_samples);
-#endif
+      yab_aud_w = w;
+      pthread_cond_signal(&yab_aud_cv);
+      pthread_mutex_unlock(&yab_aud_mx);
    }
 
    audio_size -= num_samples;
@@ -1905,6 +1994,19 @@ void YuiSwapBuffers(void)
       __atomic_add_fetch(&yab_swap_count, 1, __ATOMIC_RELEASE);
       one_frame_rendered = true;
       yk_n_swap++;
+      /* ALIGN P2: this is the standalone's SDL_GL_SwapWindow() point -- the
+       * frontend's present.  In caller mode the whole composition runs on the
+       * thread that calls retro_run, so video_cb belongs here and nowhere else:
+       * one call per field, at the same position relative to the composition as
+       * the standalone's swap.  Outside retro_run (the state pump) yab_in_run is
+       * 0 and the field is advanced without presenting. */
+      if (yab_in_run)
+      {
+         yab_field_presented = 1;
+         yk_n_vcb++;
+         video_cb(yk_no_present ? NULL : RETRO_HW_FRAME_BUFFER_VALID,
+                  current_width, current_height, 0);
+      }
       /* the lease is released at the top of the render thread's loop */
    }
 }
@@ -2082,6 +2184,7 @@ static void context_reset(void)
       }
       OSDChangeCore(OSDCORE_DUMMY);
       set_memory_maps();   /* HighWram/LowWram exist only after YabauseInit() */
+      yab_apply_options_initial();   /* ALIGN P6: the options that have no yinit field */
    }
    else
    {
@@ -2451,6 +2554,36 @@ void check_variables(void)
       if (strcmp(var.value, "auto") == 0 || strcmp(var.value, "enabled") == 0)
          g_frameskip = 1;
 
+   /* ALIGN P6: the standalone menu's remaining settings. */
+   var.key = "yabasanshiro_interlace_half"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      g_interlace_half = (strcmp(var.value, "enabled") == 0) ? 1 : 0;
+   var.key = "yabasanshiro_rotate_screen"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      g_rotate_screen = (strcmp(var.value, "enabled") == 0) ? 1 : 0;
+   var.key = "yabasanshiro_texcache_persist"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      g_texcache_persist_opt = (strcmp(var.value, "disabled") == 0) ? 0 : 1;
+   var.key = "yabasanshiro_system_language"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+   {
+      if      (strcmp(var.value, "english") == 0) g_sys_language = 1;
+      else if (strcmp(var.value, "german")  == 0) g_sys_language = 2;
+      else if (strcmp(var.value, "french")  == 0) g_sys_language = 3;
+      else if (strcmp(var.value, "spanish") == 0) g_sys_language = 4;
+      else if (strcmp(var.value, "italian") == 0) g_sys_language = 5;
+      else                                        g_sys_language = 0;
+   }
+   var.key = "yabasanshiro_mute_cdda"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      g_mute_cdda = (strcmp(var.value, "enabled") == 0) ? 1 : 0;
+   var.key = "yabasanshiro_cd_volume"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      g_cd_volume = atoi(var.value);
+   var.key = "yabasanshiro_sfx_volume"; var.value = NULL;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+      g_sfx_volume = atoi(var.value);
+
    /* SH-2 CPU clock percentage ("cycle rate").  Applied live: the per-line
     * SH-2 budget is re-derived between frames, the counters are untouched. */
    var.key = "yabasanshiro_cpu_clock";
@@ -2612,7 +2745,8 @@ static size_t g_serialize_size = 0;
  * mechanism: no per-feature request flags, no polling, no "deferred apply" of
  * its own.  One queue, one service point.
  * ------------------------------------------------------------------------- */
-enum { YAB_CMD_SAVE = 1, YAB_CMD_LOAD = 2, YAB_CMD_CFG = 3 };
+enum { YAB_CMD_SAVE = 1, YAB_CMD_LOAD = 2, YAB_CMD_CFG = 3,
+       YAB_CMD_RESET = 4, YAB_CMD_DISC = 5 };
 
 /* One configuration change.  Only the items whose value actually changed are
  * marked in `mask`; each is applied through the module that owns it:
@@ -2637,6 +2771,17 @@ enum { YAB_CMD_SAVE = 1, YAB_CMD_LOAD = 2, YAB_CMD_CFG = 3 };
 #define YAB_CFG_RBG_RES    0x10
 #define YAB_CFG_RBG_CS     0x20
 #define YAB_CFG_POLYGON    0x40
+#define YAB_CFG_INTERLACE  0x80
+#define YAB_CFG_ROTATE     0x100
+#define YAB_CFG_TEXCACHE   0x200
+#define YAB_CFG_LANG       0x400
+#define YAB_CFG_MUTE_CDDA  0x800
+#define YAB_CFG_CDVOL      0x1000
+#define YAB_CFG_SFXVOL     0x2000
+/* the half that runs on the machine thread (everything else is GL) */
+#define YAB_CFG_MACHINE_MASK (YAB_CFG_FRAMESKIP | YAB_CFG_DSP | YAB_CFG_PADS | \
+                              YAB_CFG_LANG | YAB_CFG_MUTE_CDDA | \
+                              YAB_CFG_CDVOL | YAB_CFG_SFXVOL)
 
 typedef struct {
    unsigned mask;
@@ -2646,6 +2791,13 @@ typedef struct {
    int rbg_res;          /* VDP_SETTING_RBG_RESOLUTION_MODE value */
    int rbg_cs;           /* VDP_SETTING_RBG_USE_COMPUTESHADER value */
    int polygon;          /* VDP_SETTING_POLYGON_MODE value */
+   int interlace_half;   /* 0/1 */
+   int rotate_screen;    /* 0/1 */
+   int texcache_persist; /* 0/1 */
+   int sys_language;     /* SMPC language id 0..5 */
+   int mute_cdda;        /* 0/1 */
+   int cd_volume;        /* 0..100 */
+   int sfx_volume;       /* 0..100 */
 } yab_cfg;
 
 /* Result of an in-flight state command.  It lives on the frontend's stack: the
@@ -2662,7 +2814,9 @@ typedef struct {
    yab_cfg cfg;                    /* YAB_CMD_CFG */
    const void *load_buf;           /* YAB_CMD_LOAD; owned by the machine once queued */
    size_t load_size;
-   yab_state_res *res;             /* YAB_CMD_SAVE / YAB_CMD_LOAD */
+   yab_state_res *res;             /* YAB_CMD_SAVE / LOAD / RESET / DISC */
+   int disc_ejected;               /* YAB_CMD_DISC */
+   char disc_path[256];            /* YAB_CMD_DISC (close) */
 } yab_cmd;
 
 #define YAB_CMD_QUEUE 8
@@ -2685,6 +2839,8 @@ static int  yab_cmd_post(int type, const yab_cfg *cfg,
                          const void *load_buf, size_t load_size,
                          yab_state_res *res);          /* frontend thread */
 static void yab_cmd_service(void);                     /* machine thread */
+static int  yab_cmd_post_disc(int ejected, const char *path);
+static int  yab_cmd_wait_ack(int *out_ok);             /* frontend thread */
 static int  yab_state_call(int type, const void *load_buf, size_t load_size,
                            void **save_buf, size_t *save_size);
 static void yab_state_execute(yab_cmd *c);
@@ -2760,6 +2916,33 @@ static void yab_state_execute(yab_cmd *c)
       return;
    }
 
+   if (c->type == YAB_CMD_RESET)
+   {
+      /* ALIGN P4: the engine call happens on the machine thread, at its field
+       * boundary -- the standalone's menu does exactly this with the machine
+       * stopped (retro_arena/main.cpp:800-804). */
+      YAB_TR_L1("[CMD] reset\n");
+      YabauseReset();
+      Vdp2AfterLoadState();
+      yab_audio_drop_pending();
+      if (c->res) { c->res->done = 1; yab_st_busy = 0; }
+      return;
+   }
+
+   if (c->type == YAB_CMD_DISC)
+   {
+      /* ALIGN P4: CD ownership is the machine thread's (Cs2Exec runs there), so
+       * the tray is driven from here, not from disk_*() on the frontend thread. */
+      int ok = 1;
+      if (c->disc_ejected)
+         Cs2ForceOpenTray();
+      else
+         ok = (Cs2ForceCloseTray(CDCORE_ISO, c->disc_path) == 0);
+      YAB_TR_L1("[CMD] disc %s -> %d\n", c->disc_ejected ? "open" : "close", ok);
+      if (c->res) { c->res->done = ok ? 1 : -1; yab_st_busy = 0; }
+      return;
+   }
+
    if (c->type == YAB_CMD_LOAD)
    {
       const unsigned char *h = (const unsigned char *)c->load_buf;
@@ -2824,27 +3007,11 @@ static int yab_state_call(int type, const void *load_buf, size_t load_size,
       yab_st_busy = 0;
       return YAB_ST_DROPPED;
    }
-   /* While the machine finishes the request, keep playing VdpProc's role: with
-    * no consumer the machine blocks on a full dispatch queue (32 fields) and
-    * never reaches the frame boundary where yab_cmd_service() runs it -- that is
-    * exactly the shape that timed out here (frontend: "Error serializing save
-    * state").  Draining a field is the same call retro_run makes, on this same
-    * thread, so the machine stays at its own pace and lands on its safe point.
-    *
-    * Do NOT stop the machine for this (yab_emu_pause): aborting the joins in the
-    * middle of a field leaves the CD block wedged (measured: machine stage=72,
-    * Cs2Area->cdi->GetStatus()), and a state that was taken mid-frame is not what
-    * the standalone saves either. */
-   while (yab_st_res.done == 0 && ++spins < 3000)
-   {
-      extern int Vdp2DrainOneField(void);
-      if (yab_emu_running && yk_attach() == 0)
-      {
-         Vdp2DrainOneField();
-         yk_detach();
-      }
-      usleep(500);
-   }
+   /* ALIGN P4: no pumping.  The machine services commands inside its loop-top
+    * wait (yab_emu_main), so a parked machine answers in ~200 us and a running one
+    * at its next field boundary.  yab_cmd_wait_ack() only drains as the fallback
+    * for the hardware draw-end wait, and that drain does not present. */
+   (void)yab_cmd_wait_ack(NULL);
    if (yab_st_res.done == 0)
    {
       /* Timed out.  The command is still queued, so it must be dropped when the
@@ -3061,14 +3228,26 @@ static void disk_set_label_from_path(unsigned idx)
 
 static bool disk_set_eject_state(bool ejected)
 {
-   if (ejected)
-      Cs2ForceOpenTray();
-   else
+   /* ALIGN P4: CD state belongs to the machine thread (Cs2Exec runs there), so the
+    * tray is driven through the same command channel as reset/save.  The call is
+    * synchronous by contract, so this is "post and wait for the boundary". */
+   int ok = 0;
+   if (!ejected && (disk_index >= disk_count || disk_paths[disk_index][0] == '\0'))
+      return false;
+
+   yab_st_res.done = 0;
+   yab_st_res.cancel = 0;
+   yab_st_busy = 1;
+   if (!yab_cmd_post_disc(ejected ? 1 : 0,
+                          ejected ? NULL : disk_paths[disk_index]))
    {
-      if (disk_index >= disk_count || disk_paths[disk_index][0] == '\0')
-         return false;
-      if (Cs2ForceCloseTray(CDCORE_ISO, disk_paths[disk_index]) != 0)
-         return false;
+      yab_st_busy = 0;
+      return false;
+   }
+   if (yab_cmd_wait_ack(&ok) != 0 || !ok)
+      return false;
+   if (!ejected)
+   {
       /* keep yabause's notion of the loaded image in sync */
       snprintf(full_path, sizeof(full_path), "%s", disk_paths[disk_index]);
    }
@@ -3874,14 +4053,20 @@ void retro_deinit(void)
 
 void retro_reset(void)
 {
-   yab_emu_pause();
-   YabauseReset();
-   Vdp2AfterLoadState();      /* PORT: pirry's reset of Vdp1External/waits after a load */
-   yab_audio_drop_pending();  /* the queued audio is from the state being reset */
-   yab_emu_resume();
-   VdpResume();
-   // The following function crashes the core when you use "restart"
-   //YabauseResetButton();
+   /* ALIGN P4: one channel.  The reset runs on the machine thread at its field
+    * boundary (the standalone's menu does the same with the machine stopped),
+    * not here on the frontend thread. */
+   yab_st_res.done = 0;
+   yab_st_res.cancel = 0;
+   yab_st_busy = 1;
+   if (!yab_cmd_post(YAB_CMD_RESET, NULL, NULL, 0, &yab_st_res))
+   {
+      yab_st_busy = 0;
+      return;
+   }
+   (void)yab_cmd_wait_ack(NULL);
+   /* The following function crashes the core when you use "restart" */
+   /* YabauseResetButton(); */
 }
 
 void reset_global_gl_state()
@@ -3922,84 +4107,6 @@ static pthread_t yab_emu_tid;
 static volatile int yab_emu_running = 0;
 static volatile int yab_emu_paused = 0;
 static volatile int yab_emu_parked = 1;
-
-/* ---------------------------------------------------------------------------
- * Frontend pause (menu).
- *
- * libretro has no pause event: a frontend pauses content by not calling
- * retro_run() at all (minarch-gl blocks its main loop while its menu is up, see
- * minarch-gl/minarch.c:415-432, because it does not composite the game frame
- * under the menu).  With only yab_emu_paused -- which save/reset/resize set
- * explicitly -- the machine thread kept running through that: the game advanced
- * behind the menu, the SCSP kept producing and the CPU stayed busy, and coming
- * back from the menu jumped the game forward.
- *
- * Detection is a heartbeat: retro_run() stamps yab_front_beat_ms every frame.
- * Once the stamp is older than YAB_PAUSE_MS (default 150) the machine parks at
- * its safe point and the sound thread is parked too, through the same
- * ScspMuteAudio()/g_scsp_lock handshake pirry's own menu uses
- * (retro_arena/main.cpp:768).  The next beat resumes: the audio queued before
- * the pause is dropped (it belongs to the old timeline) and the frameskip debt
- * is cleared, so the pause is not paid back in skipped fields.
- * ------------------------------------------------------------------------- */
-static volatile unsigned long long yab_front_beat_ms = 0;
-static volatile int yab_front_paused = 0;
-static int yab_front_pause_logs = 0;
-
-static unsigned long long yab_now_ms(void)
-{
-   struct timespec ts;
-   clock_gettime(CLOCK_MONOTONIC, &ts);
-   return (unsigned long long)ts.tv_sec * 1000ULL + (unsigned long long)(ts.tv_nsec / 1000000L);
-}
-
-static int yab_pause_ms(void)
-{
-   static int ms = -1;
-   if (ms < 0)
-   {
-      const char *e = getenv("YAB_PAUSE_MS");
-      ms = (e && *e) ? atoi(e) : 150;
-      if (ms < 20) ms = 20;      /* never trip on a single heavy field */
-   }
-   return ms;
-}
-
-/* retro_run() and the sim hook below: the frontend is alive. */
-void yab_front_beat(void)
-{
-   __atomic_store_n(&yab_front_beat_ms, yab_now_ms(), __ATOMIC_RELEASE);
-   if (__atomic_exchange_n(&yab_front_paused, 0, __ATOMIC_ACQ_REL))
-   {
-      yab_audio_drop_pending();                 /* pre-pause audio is stale */
-      ScspUnMuteAudio(SCSP_MUTE_SYSTEM);        /* unparks the sound thread */
-      if (g_frameskip) EnableAutoFrameSkip();   /* the pause is not paid in skips */
-      if (yab_front_pause_logs < 8)
-      {
-         yab_front_pause_logs++;
-         YAB_TR_L1("[PAUSE] frontend resumed: sound unparked, frameskip debt cleared\n");
-      }
-   }
-}
-
-/* Machine safe point: returns 1 while the frontend is away, parking on entry. */
-static int yab_front_pause_poll(void)
-{
-   unsigned long long beat = __atomic_load_n(&yab_front_beat_ms, __ATOMIC_ACQUIRE);
-   if (!__atomic_load_n(&yab_front_paused, __ATOMIC_ACQUIRE) && beat &&
-       (yab_now_ms() - beat) > (unsigned long long)yab_pause_ms())
-   {
-      __atomic_store_n(&yab_front_paused, 1, __ATOMIC_RELEASE);
-      ScspMuteAudio(SCSP_MUTE_SYSTEM);          /* parks the sound thread */
-      if (yab_front_pause_logs < 8)
-      {
-         yab_front_pause_logs++;
-         YAB_TR_L1("[PAUSE] frontend paused (%llu ms without retro_run): machine parked, sound parked\n",
-                   yab_now_ms() - beat);
-      }
-   }
-   return __atomic_load_n(&yab_front_paused, __ATOMIC_ACQUIRE);
-}
 
 /* L2 probe [FT] (+[MW]): per-frame cost split, printed every <n> frames.
  * n defaults to 60 at level 2 and 1 at level 3; YAB_FT=<n> overrides it.
@@ -4117,6 +4224,54 @@ static int yab_cmd_post(int type, const yab_cfg *cfg,
    return ok;
 }
 
+/* ALIGN P4: the tray commands carry their own payload (open/close + path). */
+static int yab_cmd_post_disc(int ejected, const char *path)
+{
+   int ok = 0;
+   pthread_mutex_lock(&yab_cmd_mx);
+   if (((yab_cmd_head + 1) % YAB_CMD_QUEUE) != yab_cmd_tail)
+   {
+      yab_cmd *c = &yab_cmd_q[yab_cmd_head];
+      memset(c, 0, sizeof(*c));
+      c->type = YAB_CMD_DISC;
+      c->disc_ejected = ejected;
+      if (path) snprintf(c->disc_path, sizeof(c->disc_path), "%s", path);
+      c->res = &yab_st_res;
+      yab_cmd_head = (yab_cmd_head + 1) % YAB_CMD_QUEUE;
+      ok = 1;
+   }
+   pthread_mutex_unlock(&yab_cmd_mx);
+   return ok;
+}
+
+/* ALIGN P4: post a command and wait for the machine to run it at its field
+ * boundary.  The machine services commands inside its loop-top wait (see
+ * yab_emu_main), so a parked machine answers within ~200 us and no pumping is
+ * needed; the drain below is only the fallback for the one case where the machine
+ * cannot reach the boundary by itself (the hardware draw-end wait, i.e. the
+ * frontend stopped calling retro_run mid-field).  It does not present: video_cb
+ * only runs inside retro_run (yab_in_run). */
+static int yab_cmd_wait_ack(int *out_ok)
+{
+   unsigned spins = 0;
+   while (yab_st_res.done == 0 && ++spins < 3000)
+   {
+      if (spins >= 20 && yab_emu_running)
+      {
+         extern int Vdp2DrainOneField(void);
+         if (yk_attach() == 0)
+         {
+            Vdp2DrainOneField();
+            yk_detach();
+         }
+      }
+      usleep(500);
+   }
+   yab_st_busy = 0;
+   if (out_ok) *out_ok = (yab_st_res.done == 1);
+   return yab_st_res.done == 1 ? 0 : -1;
+}
+
 /* Machine thread.  The settings the standalone changes with the machine stopped
  * and that the machine then reads while it runs. */
 static void yab_cfg_apply_machine(const yab_cfg *c)
@@ -4138,6 +4293,20 @@ static void yab_cfg_apply_machine(const yab_cfg *c)
       if (PERCore) PERCore->Init();
       YAB_TR_L1("[CFG] pads rebuilt\n");
    }
+   if (c->mask & YAB_CFG_LANG)
+   {
+      SmpcSetSystemLanguage(c->sys_language);
+      YAB_TR_L1("[CFG] language=%d\n", c->sys_language);
+   }
+   if (c->mask & YAB_CFG_MUTE_CDDA)
+   {
+      ScspSetCddaMute(c->mute_cdda);
+      YAB_TR_L1("[CFG] mute cdda=%d\n", c->mute_cdda);
+   }
+   if (c->mask & YAB_CFG_CDVOL)
+      ScspSetCddaVolume(c->cd_volume);
+   if (c->mask & YAB_CFG_SFXVOL)
+      ScspSetSfxVolume(c->sfx_volume);
 }
 
 /* The GL-owning thread (retro_run here, the menu thread in the standalone).
@@ -4166,6 +4335,43 @@ static void yab_cfg_apply_gl(const yab_cfg *c)
       VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER, c->rbg_cs);
    if (c->mask & YAB_CFG_POLYGON)
       VideoSetSetting(VDP_SETTING_POLYGON_MODE, c->polygon);
+   if (c->mask & YAB_CFG_INTERLACE)
+   {
+      extern int g_interlace_half_menu;
+      g_interlace_half_menu = c->interlace_half;
+   }
+   if (c->mask & YAB_CFG_ROTATE)
+      VideoSetSetting(VDP_SETTING_ROTATE_SCREEN, c->rotate_screen);
+   if (c->mask & YAB_CFG_TEXCACHE)
+   {
+      extern int g_texcache_persist;
+      g_texcache_persist = c->texcache_persist;
+   }
+}
+
+/* ALIGN P6: apply the new options once, right after the engine is up.  The first
+ * yab_cfg_push() only records a baseline, so without this the initial values would
+ * never reach the engine.  Runs on the frontend thread with GL current, before the
+ * machine thread exists -- no half to route. */
+static void yab_apply_options_initial(void)
+{
+   extern int g_interlace_half_menu;
+   extern int g_texcache_persist;
+   extern void ScspSetCddaVolume(int);
+   extern void ScspSetSfxVolume(int);
+   g_interlace_half_menu = g_interlace_half;
+   g_texcache_persist    = g_texcache_persist_opt;
+   VideoSetSetting(VDP_SETTING_ROTATE_SCREEN, g_rotate_screen);
+   SmpcSetSystemLanguage(g_sys_language);
+   ScspSetCddaMute(g_mute_cdda);
+   ScspSetCddaVolume(g_cd_volume);
+   ScspSetSfxVolume(g_sfx_volume);
+#if YAB_TRACE_LEVEL >= 1
+   printf("[CFG] options: interlace_half=%d rotate=%d texcache=%d lang=%d mute_cdda=%d cdvol=%d sfxvol=%d\n",
+          g_interlace_half, g_rotate_screen, g_texcache_persist_opt, g_sys_language,
+          g_mute_cdda, g_cd_volume, g_sfx_volume);
+   fflush(stdout);
+#endif
 }
 
 /* Frontend thread: the one place where a parsed option becomes an engine change.
@@ -4187,6 +4393,13 @@ static void yab_cfg_push(void)
    cur.rbg_res         = g_rbg_resolution_mode;
    cur.rbg_cs          = g_rbg_use_compute_shader;
    cur.polygon         = polygon_mode;
+   cur.interlace_half  = g_interlace_half;
+   cur.rotate_screen   = g_rotate_screen;
+   cur.texcache_persist= g_texcache_persist_opt;
+   cur.sys_language    = g_sys_language;
+   cur.mute_cdda       = g_mute_cdda;
+   cur.cd_volume       = g_cd_volume;
+   cur.sfx_volume      = g_sfx_volume;
 
    if (!baseline)
    {
@@ -4214,6 +4427,20 @@ static void yab_cfg_push(void)
    { d.mask |= YAB_CFG_RBG_CS; d.rbg_cs = cur.rbg_cs; }
    if (cur.polygon != applied.polygon)
    { d.mask |= YAB_CFG_POLYGON; d.polygon = cur.polygon; }
+   if (cur.interlace_half != applied.interlace_half)
+   { d.mask |= YAB_CFG_INTERLACE; d.interlace_half = cur.interlace_half; }
+   if (cur.rotate_screen != applied.rotate_screen)
+   { d.mask |= YAB_CFG_ROTATE; d.rotate_screen = cur.rotate_screen; }
+   if (cur.texcache_persist != applied.texcache_persist)
+   { d.mask |= YAB_CFG_TEXCACHE; d.texcache_persist = cur.texcache_persist; }
+   if (cur.sys_language != applied.sys_language)
+   { d.mask |= YAB_CFG_LANG; d.sys_language = cur.sys_language; }
+   if (cur.mute_cdda != applied.mute_cdda)
+   { d.mask |= YAB_CFG_MUTE_CDDA; d.mute_cdda = cur.mute_cdda; }
+   if (cur.cd_volume != applied.cd_volume)
+   { d.mask |= YAB_CFG_CDVOL; d.cd_volume = cur.cd_volume; }
+   if (cur.sfx_volume != applied.sfx_volume)
+   { d.mask |= YAB_CFG_SFXVOL; d.sfx_volume = cur.sfx_volume; }
 
    pads = (multitap[0] != applied_mt[0] || multitap[1] != applied_mt[1] ||
            (service_enabled ? 1 : 0) != applied_service);
@@ -4236,7 +4463,7 @@ static void yab_cfg_push(void)
        * run here (the load/settings-before-first-retro_run case). */
       if (VIDCore == NULL)
          return;
-      if (d.mask & ~(YAB_CFG_FRAMESKIP | YAB_CFG_DSP | YAB_CFG_PADS))
+      if (d.mask & ~YAB_CFG_MACHINE_MASK)
          yab_cfg_apply_gl(&d);
       yab_cfg_apply_machine(&d);
       return;
@@ -4245,7 +4472,7 @@ static void yab_cfg_push(void)
    /* Video settings are applied here, by the thread that owns the GL context;
     * the rest goes to the machine thread, the only thread allowed to touch them
     * while it runs. */
-   if (d.mask & ~(YAB_CFG_FRAMESKIP | YAB_CFG_DSP | YAB_CFG_PADS))
+   if (d.mask & ~YAB_CFG_MACHINE_MASK)
       yab_cfg_apply_gl(&d);
    if (!yab_cmd_post(YAB_CMD_CFG, &d, NULL, 0, NULL))
       YAB_TR_L1("[CFG] queue full, change dropped (mask=%02X)\n", d.mask);
@@ -4324,13 +4551,30 @@ static void *yab_emu_main(void *arg)
        * machine's half of a configuration change are executed here, exactly where
        * the standalone executes them (its menu, with the machine stopped). */
       yab_cmd_service();
-      for (;;)
+      /* ALIGN P3b: the field token.  vdp2VBlankIN() emits one per presented
+       * field, after the present/clock/Sync; the machine takes one here, at the
+       * field boundary, before it starts the next field.  Depth 1 => at most one
+       * field of lead, and this is also the point where frontend commands are
+       * serviced (the command service above runs before the wait). */
       {
-         if (!yab_emu_running) break;
-         if (yab_emu_paused) { yab_cmd_service(); usleep(500); continue; }
-         /* Frontend away (menu): park the machine, not just this thread's cycle. */
-         if (yab_front_pause_poll()) { yab_cmd_service(); usleep(1000); continue; }
-         break;
+         extern YabEventQueue *rcv_evqueue;
+         for (;;)
+         {
+            if (!yab_emu_running) break;
+            if (yab_emu_paused) { yab_cmd_service(); usleep(500); continue; }
+            if (rcv_evqueue && YaGetQueueSize(rcv_evqueue) > 0)
+            {
+               YabWaitEventQueue(rcv_evqueue);
+               break;
+            }
+            /* ALIGN P4: this wait IS the command point.  The machine is parked at
+             * the field boundary here, so a request posted by the frontend is run
+             * within ~200 us -- there is no "frontend must pump" case any more,
+             * and no periodic escape that would let the machine creep forward
+             * while the frontend is away (the old 1 s break did exactly that). */
+            yab_cmd_service();
+            usleep(200);
+         }
       }
       if (!yab_emu_running) break;
       yab_emu_parked = 0;
@@ -4583,10 +4827,9 @@ void retro_run(void)
                   n, yk_n_retarget, yk_n_swap, yk_n_present, yk_n_vcb);
    }
 
-   /* Tell the machine (and the sound thread) that the frontend is running
-    * again: this is the only "the frontend is not paused" signal a libretro
-    * core gets.  See the pause block in vdp2.cpp. */
-   yab_front_beat();
+   /* ALIGN P4: the heartbeat is gone -- the machine parks at its field token and
+    * needs no "the frontend is away" signal (see the loop-top wait in
+    * yab_emu_main). */
    { extern void YabSetRenderThread(void); YabSetRenderThread(); }
 
 #ifdef YAB_HANGDBG
@@ -4605,10 +4848,9 @@ void retro_run(void)
       set_descriptors();
    }
 
-   /* Input: every libretro input callback happens HERE, on the frontend thread
-    * (design §7 #4).  Audio no longer passes through this thread at all -- the
-    * sound thread writes it itself (pirry's shape, see SNDLIBRETROUpdateAudio). */
-   yab_input_snapshot();
+   /* ALIGN P5: input is sampled and published at the END of the field (just before
+    * the field token), see yab_input_publish(); polling it here would hand the
+    * machine input that is one field older than the field that consumes it. */
    yk_seg_hit(1);
 
    /* Renderer (design §1/§5): the machine runs on the emu thread and dispatches
@@ -4622,9 +4864,6 @@ void retro_run(void)
        * a field at its VOUT point; this thread is the workflow's consumer (the
        * standalone's VdpProc runs on it), rasterises that field into the
        * frontend's current colour texture and presents it. */
-      static unsigned swap_seen = 0;
-      unsigned now;
-      int yk_new_pic = 0;
       /* Wait for a *picture* (YuiSwapBuffers on the worker), not for a retire:
        * VOUT retires every field, but only fields that reach YglRender produce
        * a new picture, and the flag/false race between the two threads made
@@ -4672,31 +4911,16 @@ void retro_run(void)
          else
             yk_res_wanted = 1;
       }
-      /* One field per call, never wait: the frontend is the pacer and the
-       * machine's retire join holds it to one field of lead.  Waiting for a
-       * picture here (the earlier shape) made the core the pacer: the machine
-       * free-ran, the queue backed up and commands drained 2-3 fields per call
-       * (measured [RP]=18-23 ms against ~5 ms of work per field, swap running
-       * ~100 ahead of present).  See Vdp2DrainOneField(). */
+      /* ALIGN P2: one call = one field.  Block until this field's VIN has been
+       * handled -- compose, present (video_cb inside YuiSwapBuffers, which is the
+       * standalone's swap point), clock decision, Sync and the VIN token all live
+       * in that handler.  The old shape polled the queue and returned on empty,
+       * which is what produced the "empty queue -> dupe" state and let the call
+       * touch 0..N events.  See Vdp2RunOneField() and ALIGN-SPEC §3.1. */
       {
-         extern int Vdp2DrainOneField(void);
-         extern int YabVdp1FrameCount(void);
-         int v1_before = YabVdp1FrameCount();
-         unsigned before = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
-         /* One field per call, never the backlog: the drain consumes VOUT(a)
-          * and VIN(a+1) and stops at the VIN, so a call never touches a second
-          * field.  The field clock runs at the end of this function, after the
-          * present, exactly where VdpProc calls it. */
-         Vdp2DrainOneField();
-         now = __atomic_load_n(&yab_swap_count, __ATOMIC_ACQUIRE);
-         /* Default: every composed field is a picture (the standalone's
-          * YuiSwapBuffers runs once per field, unconditionally).  A VDP1-change
-          * trigger is available for A/B -- measured on Daytona it drops the
-          * picture rate to the vdp1= value (13-31/s) and the frontend then
-          * re-presents the same frame for the rest of the second, so VDP2-only
-          * motion (scrolling backgrounds) updates at that rate too. */
-         yk_new_pic = (now != before);   /* a field was composed this call */
-         if (yk_new_pic) swap_seen = now;
+         extern int Vdp2RunOneField(void);
+         yab_field_presented = 0;
+         Vdp2RunOneField();
       }
       /* One field of audio space per field, whether or not this field produced
        * a picture: the SCSP thread blocks in SNDLIBRETROGetAudioSpace() until
@@ -4722,43 +4946,16 @@ void retro_run(void)
 #endif
       yk_seg_hit(4);
       yk_n_present++;
-      yk_seg_hit(9);
-      yk_attach();          /* borrow for the present */
       yk_seg_hit(8);
       {
-         /* Present every field the worker composed -- that is what the standalone
-          * does, and the earlier "only present when VDP1 produced a new frame"
-          * gate was based on a premise that does not hold:
-          *
-          *   - ygles.c:4952 calls YuiSwapBuffers() UNCONDITIONALLY at the end of
-          *     YglRender(), and VIDOGLVdp2DrawEnd() (vidogl.c:7028) calls
-          *     YglRender() on every VIN, so the standalone swaps the display 60
-          *     times/s regardless of VDP1 frame changes.
-          *   - vdp2.cpp's Vdp2VBlankOUT runs VIDCore->Vdp2DrawScreens() on every
-          *     field too (only the VDP1 layer is double-buffered), so the
-          *     composition IS a new picture even when VDP1 did not swap: the VDP2
-          *     backgrounds/line-scroll move on.
-          *   - No intermediate VDP1 state can reach the screen: the composition
-          *     samples vdp1FrameBuff[_Ygl->readframe], the buffer VDP1 finished
-          *     writing, never the one it is drawing into.
-          *
-          * Measured with the gate (device log SATURN.txt, v1gate core): in a
-          * static scene [V1] shows vdp1=0/cmds=0 for seconds and the frontend
-          * reports "6 new, 296 dupe (M:60.0 P:43.6)" -- i.e. the display stopped
-          * updating while the machine kept running.  Without it the same log
-          * shows "298 new, 0 dupe (M:60.4 P:60.4)". */
-         yk_seg_hit(6);
-         if (yk_new_pic)
-         {
-            yk_n_vcb++;
-            video_cb(yk_no_present ? NULL : RETRO_HW_FRAME_BUFFER_VALID, current_width, current_height, 0);
-         }
-         else
-         {
-            /* No field was ready to compose this call (the machine is still
-             * emulating): hand the frontend a dupe so its clock stays alive. */
+         /* The present already happened in the drain (YuiSwapBuffers), at the
+          * standalone's swap point.  The only case left here is a *skipped*
+          * field: autoframeskip switches VIDCore to VIDDummy, the VOUT renders
+          * nothing, YglRender never runs and therefore no swap happens -- the
+          * standalone does not swap then either.  Tell the frontend "no new
+          * picture" once so its clock keeps running; this is the only dupe. */
+         if (!yab_field_presented)
             video_cb(NULL, current_width, current_height, 0);
-         }
       }
       /* the next field picks the slot the frontend advanced to */
 #if YAB_TRACE_LEVEL >= 2
@@ -4808,14 +5005,11 @@ void retro_run(void)
       }
    }
 #endif
-   /* The field clock, on the thread that presents -- the standalone's VdpProc
-    * calls frameSkipAndLimit() right after its SwapWindow, and that call is both
-    * the sleep into the next field boundary and the skip decision for the next
-    * VOUT.  Here the swap is the frontend's present above, so the clock runs
-    * after it, once per retro_run call: including calls that composed nothing,
-    * because VdpProc's cycle is per event, not per composed field.  It is the
-    * engine's own limiter, not a port-side pacer. */
-   { extern void Vdp2FieldClock(void); Vdp2FieldClock(); }
+   /* ALIGN P1: no field clock here any more.  frameSkipAndLimit() -- the
+    * accounting and the skip latch, without the sleep -- runs inside the VIN
+    * handler, i.e. right after the present and before the field token, which is
+    * where 1.6.2 runs it.  The SLEEP is the frontend's (MA_pace_frame): with both
+    * sides sleeping the field period measured 19-22 ms instead of 16.7. */
    yab_in_run = 0;
 }
 

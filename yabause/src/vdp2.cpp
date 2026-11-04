@@ -259,9 +259,16 @@ static volatile u8 vdp1_evt_erase[64];
 static volatile u8 vdp1_evt_manualerase[64];
 static volatile u8 vdp1_evt_swap[64];
 static volatile u8 vdp1_evt_snap[64];   /* which Vdp1RamSnap slot this VOUT belongs to */
-/* Consumer side: the VDP2 snapshot slot the next VBLANK_IN composes from.  VOUT
- * publishes it, the VIN that follows in the queue uses it. */
-static u8 v2_slot_next_vin = 0;
+/* ALIGN P3a: the VDP2 snapshot slot rides the same VOUT entry.  It used to be one
+ * global latch (v2_slot_next_vin), which only worked while the machine could not
+ * run past the VIN of the field it had just dispatched: one write per VOUT and one
+ * read per VIN, never interleaved.  With a one-field lead the machine dispatches
+ * VOUT(k+1) while the consumer is still composing VIN(k), so the latch would hand
+ * VIN(k) the wrong slot.  Per-event now, exactly like vdp1_evt_snap. */
+static volatile u8 v2_evt_snap[64];
+/* Consumer side: slot taken from the VOUT entry it just consumed; the VIN that
+ * follows in the queue composes from it. */
+static u8 v2_slot_for_vin = 0;
 static volatile u32 vdp1_evt_widx = 0;
 static volatile u32 vdp1_evt_ridx = 0;
 static int vdp1_manualerase_armed = 0;  // emulation thread: armed until the next swap
@@ -288,36 +295,22 @@ static inline unsigned int counter_delta(unsigned int now_val, unsigned int *pre
 }
 
 static int g_vin_decoupled = -1;
-static int vin_render_pending = 0;
-
-/* How many VINs may be outstanding.  One is 1.6.2's handshake: the machine waits
- * for the renderer to consume the previous VIN.  That works when the renderer is
- * a thread answering in microseconds; here it is the frontend's thread and its
- * latency is one field, so a depth-1 handshake costs the machine a whole field per
- * field (measured 12-16 ms).  With the VDP1/VDP2 snapshots double-buffered the
- * older field is still intact while the machine runs the next one, so two may be
- * in flight; the machine then only waits when the renderer is a full two fields
- * behind. */
-#define YAB_VIN_DEPTH 2
-
-static void Vdp2JoinPendingVIN(void) {
-  /* Caller mode only: the standalone keeps 1.6.2's wait, which its renderer
-   * releases as usual. */
-  if (vdp_on_caller && g_join_abort) { vin_render_pending = 0; return; }
-  if (!vin_render_pending) return;
-  if (!vdp_on_caller) {
-    unsigned long long _t0 = yab_now_ns();
-    YabWaitEventQueue(rcv_evqueue);
-    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_vin += _d; }
-    vin_render_pending = 0;
-    return;
-  }
-  while (vin_render_pending >= YAB_VIN_DEPTH) {
-    unsigned long long _t0 = yab_now_ns();
-    YabWaitEventQueue(rcv_evqueue);
-    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_vin += _d; }
-    vin_render_pending--;
-  }
+/* ALIGN P3b: the field token (rcv_evqueue) is the machine's ONLY pacing
+ * relationship with the frontend.  vdp2VBlankIN() emits one at the end of the VIN
+ * handler -- after the present, the clock decision and Sync() -- and the machine
+ * waits for one at the top of its loop, i.e. at the field boundary.  Depth 1:
+ * the machine may run exactly one field ahead of the presented frame, which is
+ * what the standalone's VIN handshake gives it (and why its storefront never
+ * waits on the renderer mid-field).
+ *
+ * Priming: one token is put in the queue when the queues are (re)created, so the
+ * first field can run before anything has been presented.
+ */
+extern "C" void Vdp2PrimeFieldToken(void)
+{
+  if (rcv_evqueue == NULL) return;
+  YabClearEventQueue(rcv_evqueue);
+  YabAddEventQueueNonBlocking(rcv_evqueue, 0);
 }
 
 /* Cleanup after loading a save state. yabsys.wait_line_count is not saved or restored, while
@@ -346,16 +339,15 @@ extern "C" void Vdp2AfterLoadState(void)
     * drop the expectation and pulse both queues once. */
    if (vdp_on_caller)
    {
-     vin_render_pending = 0;
-     if (rcv_evqueue != NULL) YabAddEventQueueNonBlocking(rcv_evqueue, 0);
+     Vdp2PrimeFieldToken();
      if (vdp1_rcv_evqueue != NULL) YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
    }
    /* current_frame is kept: it is tied to the renderer GL buffer index */
 }
 
-/* Needed before loading a save state: the whole state is overwritten while the VIN token is still
-   pending, and the next join would wait for an event that never comes. */
-extern "C" void Vdp2DrainPendingVIN(void) { Vdp2JoinPendingVIN(); }
+/* Needed before loading a save state: the whole state is overwritten while the field
+   token is still pending, so the queue is re-primed here (depth 1, see above). */
+extern "C" void Vdp2DrainPendingVIN(void) { Vdp2PrimeFieldToken(); }
 
 int g_perline_requested = 0;
 
@@ -423,39 +415,10 @@ static void Vdp1JoinPendingRenders(void) {
 }
 
 
-/* Caller mode needs ONE field of lead at the VBlank-IN join: the caller drains
- * VOUT(a) + VIN(a+1) in a single retro_run, so both events must already be
- * queued when it runs.  With the strict join the machine stopped at
- * VBlankIN(a+1) until VOUT(a) was retired, the caller got one event per call
- * and only half the calls produced a picture (measured: M:60.0 P:30.0,
- * "150 new, 150 dupe").  The VOUT *dispatch* keeps the strict join, and the
- * retire now happens after the composition, so the snapshots are still copied
- * only when no reader is active. */
-static void Vdp1JoinPendingRendersLead(void) {
-  if (!vdp_on_caller) { Vdp1JoinPendingRenders(); return; }
-  if (g_join_abort) return;
-  yab_emu_stage = 21;   /* about to wait for the previous field's retire */
-  for (int i = 0; i < 2000; i++) {
-    if (vdp1_ev_dispatched.load(std::memory_order_relaxed) -
-        vdp1_ev_retired.load(std::memory_order_acquire) < 2) {
-      return;
-    }
-  }
-  {
-    unsigned long long _t0 = yab_now_ns();
-    pthread_mutex_lock(&vdp1_join_mtx);
-    while (!g_join_abort &&
-           vdp1_ev_dispatched.load(std::memory_order_relaxed) -
-           vdp1_ev_retired.load(std::memory_order_acquire) >= 2) {
-      pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
-    }
-    pthread_mutex_unlock(&vdp1_join_mtx);
-    { unsigned long long _d = yab_now_ns() - _t0; yab_joinwait_ns += _d; yab_jw_lead += _d; }
-  }
-}
-
+/* Vdp1JoinPendingRenders() is now only used by the standalone path (the VOUT
+ * dispatch joins there); caller mode relies on the field token and the double
+ * buffers instead (ALIGN P3b). */
 extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
-extern "C" void Vdp1JoinPendingRendersLeadC(void) { Vdp1JoinPendingRendersLead(); }
 
 /* PORT: the libretro frontend thread waits for "the worker retired a field"
  * (retro_run -> video_cb); the counter itself stays private. */
@@ -482,8 +445,7 @@ extern "C" int YabVdp1RetiredCount(void) {
  * (libretro calls this from context_destroy, before VIDCore->DeInit()). */
 extern "C" void Vdp2StopRenderThread(void) {
 #if defined(YAB_ASYNC_RENDERING)
-   if (vdp_proc_running == 1) {
-      Vdp2JoinPendingVIN();
+   if (vdp_proc_running == 1 && !vdp_on_caller) {   /* caller mode has no worker */
       YabAddEventQueue(evqueue, VDPEV_FINSH);
       YabThreadWait(YAB_THREAD_VDP);
       vdp_proc_running = 0;
@@ -848,6 +810,7 @@ int Vdp2Init(void) {
    yabsys.wait_line_count = -1;
    vdp1_ev_dispatched.store(0, std::memory_order_relaxed);
    vdp1_evt_widx = 0; vdp1_evt_ridx = 0;
+   v2_slot_for_vin = 0;          /* ALIGN P3a: no VOUT entry consumed yet */
    vdp1_ev_retired.store(0, std::memory_order_relaxed);
 #endif
 
@@ -868,8 +831,7 @@ int Vdp2Init(void) {
 
 void Vdp2DeInit(void) {
 #if defined(YAB_ASYNC_RENDERING)
-   if (vdp_proc_running == 1) {
-   	Vdp2JoinPendingVIN();   /* drain before shutdown */
+   if (vdp_proc_running == 1 && !vdp_on_caller) {   /* caller mode has no worker */
    	YabAddEventQueue(evqueue,VDPEV_FINSH);
    	//vdp_proc_running = 0;
    	YabThreadWait(YAB_THREAD_VDP);
@@ -991,11 +953,11 @@ void Vdp2Reset(void) {
    Vdp2External.cpu_cycle_b = 0;
 
 #if defined(YAB_ASYNC_RENDERING)
-   Vdp2JoinPendingVIN();   /* drain, otherwise an orphaned token remains */
    if (rcv_evqueue != NULL){
      YabThreadDestoryQueue(rcv_evqueue);
      rcv_evqueue = YabThreadCreateQueue(8);
    }
+   Vdp2PrimeFieldToken();   /* ALIGN P3b: the first field needs one token */
    if (vdp1_rcv_evqueue != NULL){
      YabThreadDestoryQueue(vdp1_rcv_evqueue);
      vdp1_rcv_evqueue = YabThreadCreateQueue(8);
@@ -1003,6 +965,7 @@ void Vdp2Reset(void) {
    yabsys.wait_line_count = -1;
    vdp1_ev_dispatched.store(0, std::memory_order_relaxed);
    vdp1_evt_widx = 0; vdp1_evt_ridx = 0;
+   v2_slot_for_vin = 0;          /* ALIGN P3a: no VOUT entry consumed yet */
    vdp1_ev_retired.store(0, std::memory_order_relaxed);
 #endif
 
@@ -1094,6 +1057,96 @@ extern "C" int Vdp2DrainOneField(void)
       break;              /* one field per call: see the comment above */
   }
   return got_picture;
+}
+
+/* ALIGN P2: caller mode's one-field driver -- what retro_run calls once per
+ * frontend frame.  It takes events from the queue and BLOCKS when there is
+ * nothing to take, exactly like VdpProc's loop; it returns only after the
+ * field's VIN has been handled, because the VIN handler is where the field is
+ * composed, presented (video_cb inside YuiSwapBuffers) and closed out (clock
+ * decision, Sync, VIN token).  "One call = one field" therefore means "one
+ * present", which is the frontend's contract for a video frame.
+ *
+ * The wait is bounded on purpose: the current shape still lets the machine block
+ * on a mid-field join (ALIGN-STATUS "障碍"), and a plain blocking wait would
+ * turn that into a frozen frontend with no menu.  On timeout the caller gets
+ * "no field" and presents a dupe; the frontend stays alive and the log says so.
+ * Once the joins are gone (ALIGN-SPEC §3.3) this timeout must never fire. */
+static int vdp2_wait_event(void)
+{
+   unsigned spins = 0;
+   for (;;)
+   {
+      if (YaGetQueueSize(evqueue) > 0)
+         return YabWaitEventQueue(evqueue);
+      if (!vdp_proc_running)
+         return VDPEV_FINSH;          /* no producer left: do not wait */
+      if (++spins > 5000)              /* ~1 s at 200 us */
+      {
+         static unsigned n = 0;
+         if (n < 8)
+         {
+            n++;
+            fprintf(stderr, "[WAIT] no event for 1 s in caller mode (machine stuck?)\n");
+            fflush(stderr);
+         }
+         return -1;
+      }
+      YabThreadUSleep(200);
+   }
+}
+
+extern "C" int Vdp2RunOneField(void)
+{
+   if (!vdp_on_caller || !evqueue)
+      return 0;
+   for (;;)
+   {
+      int ev = vdp2_wait_event();
+      struct timespec _ts0, _ts1;
+      clock_gettime(CLOCK_MONOTONIC, &_ts0);
+      switch (ev)
+      {
+      case VDPEV_VBLANK_OUT:
+         FrameProfileAdd("VOUT start");
+         vdp2VBlankOUT();
+         FrameProfileAdd("VOUT end");
+         Vdp1MarkRenderRetired();
+         break;
+      case VDPEV_DIRECT_DRAW:
+         FrameProfileAdd("DirectDraw start");
+         Vdp1Draw();
+         VIDCore->Vdp1DrawEnd();
+         Vdp1External.frame_change_plot = 0;
+         FrameProfileAdd("DirectDraw end");
+         Vdp1RcvSignal();
+         Vdp1MarkRenderRetired();
+         break;
+      case VDPEV_VBLANK_IN:
+         FrameProfileAdd("VIN start");
+         vdp2VBlankIN();
+         FrameProfileAdd("VIN end");
+         return 1;
+      case VDPEV_FINSH:
+         return 0;
+      default:                        /* -1 (timeout) or an unexpected event */
+         if (ev < 0)
+            return 0;
+         break;
+      }
+      clock_gettime(CLOCK_MONOTONIC, &_ts1);
+      {
+         double _ms = (double)(_ts1.tv_sec - _ts0.tv_sec) * 1000.0 +
+                      (double)(_ts1.tv_nsec - _ts0.tv_nsec) / 1e6;
+         static int _n = 0;
+         if (_ms > 3.0 && _n < 400)
+         {
+            _n++;
+            fprintf(stderr, "[EV] code=%d took %.2f ms\n", ev, _ms);
+            fflush(stderr);
+         }
+      }
+   }
 }
 
 extern "C" void * VdpProc( void *arg ){
@@ -1362,6 +1415,18 @@ void frameSkipAndLimit() {
     const u32 fps = (yabsys.IsPal ? 50 : 60) << frameLimitShift ;
     framecount++;
     curticks = YabauseGetTicks();
+    /* A long gap (menu pause, load, stall) must not be paid back as skipped
+     * fields: re-anchor the timeline instead.  The old frontend heartbeat did
+     * this with EnableAutoFrameSkip() on resume; it is now in the one place that
+     * owns the accounting. */
+    if (lastticks && (curticks - lastticks) > (s64)(yabsys.OneFrameTime * 30))
+    {
+      framecount = 0;
+      onesecondticks = 0;
+      skipnextframe = 0;
+      framestoskip = 0;
+      lastticks = curticks;
+    }
     if (framecount > fps)
     {
       onesecondticks -= yabsys.tickfreq;
@@ -1395,7 +1460,14 @@ void frameSkipAndLimit() {
 
     // just wait for next vsync
     targetTime -= 1000;
-    if ((s64)(onesecondticks + diffticks) < targetTime)
+    /* ALIGN P1: in caller mode the SLEEP belongs to the frontend (MA_pace_frame,
+     * an absolute 60 Hz timeline right after retro_run returns).  The accounting
+     * above and the skip latch below stay here, at the same point as 1.6.2 --
+     * after the present, before the VIN token -- so the skip decision keeps the
+     * same field it had in the standalone.  Sleeping here as well would make the
+     * core and the frontend two independent clocks (measured: field period
+     * 19-22 ms instead of 16.7). */
+    if (!vdp_on_caller && (s64)(onesecondticks + diffticks) < targetTime)
     {
 
       s64 sleeptime = (targetTime - (onesecondticks + diffticks));
@@ -1423,9 +1495,16 @@ void frameSkipAndLimit() {
 
 
 //////////////////////////////////////////////////////////////////////////////
+#ifdef __LIBRETRO__
+/* ALIGN P5: implemented in libretro.c; polls the frontend once per frame and
+ * publishes the pad snapshot (no-op outside retro_run). */
+extern "C" void yab_input_publish(void);
+#endif
+
 void vdp2VBlankIN(void) {
-   /* Compose from the VDP2 snapshot slot the preceding VOUT published. */
-   Vdp2SelectSnapshot(v2_slot_next_vin);
+   /* Compose from the VDP2 snapshot slot of the VOUT this consumer consumed just
+    * before (same field; per-event, see v2_evt_snap). */
+   Vdp2SelectSnapshot(v2_slot_for_vin);
    /* this should be done after a frame change or a plot trigger */
    //Vdp1Regs->COPR = 0;
    //printf("COPR = 0 at %d\n", __LINE__);
@@ -1442,8 +1521,7 @@ void vdp2VBlankIN(void) {
     * retro_run instead -- same call, same position relative to the swap.  Keep
     * this call: without it the standalone/VdpProc path runs unthrottled and
     * never decides a skip. */
-   if (!vdp_on_caller)
-     frameSkipAndLimit();
+   frameSkipAndLimit();
    VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would
       fire a second time. */
@@ -1457,6 +1535,12 @@ void vdp2VBlankIN(void) {
    //   SH2SendInterrupt(SSH2, 0x43, 0x6);
    FrameProfileAdd("VIN flag");
    FRAMELOG("**** VIN(T) *****\n");
+#ifdef __LIBRETRO__
+   /* ALIGN P5: sample and publish the pad state right before the token that
+    * releases the machine's next field, so the input belongs to that field (the
+    * standalone polls at the loop top, immediately before its field). */
+   yab_input_publish();
+#endif
    YabAddEventQueue(rcv_evqueue, 0);
    
 
@@ -1485,15 +1569,12 @@ void Vdp2VBlankIN(void) {
   if (g_vin_decoupled) {
     /* Collect the token of the previous frame, then set status and interrupt here and continue
        without waiting for the render thread. */
-    Vdp2JoinPendingVIN();
-    /* Wait until the backgrounds are drawn BEFORE the VBlank interrupt reaches the game. The game's
-       VBlank routine writes scroll registers and line scroll tables and DMAs new data into VDP2 VRAM;
-       if the render thread reads the tables line by line meanwhile, black bands appear during movement.
-       VDP2 RAM writes do not take VdpLockVram(), so the lock does not protect VDP2. This wait ends
-       with Vdp1MarkRenderRetired() after Vdp2DrawScreens and does not include Vdp2DrawEnd,
-       frameSkipAndLimit or Sync. This join is the only protection of the line scroll tables against
-       the reading render thread; do not remove it. */
-    Vdp1JoinPendingRendersLead();   /* one field of lead in caller mode */
+    /* ALIGN P3b: no joins here any more.  The retire join protected a single
+     * snapshot buffer; both the VDP1 command RAM and the VDP2 RAM/line registers
+     * are double buffered now, and the slot discipline (one field of lead, the
+     * writer always uses the slot the reader is not reading) replaces it.  The
+     * machine therefore reaches its loop top -- the only place a frontend command
+     * is serviced -- without waiting for the renderer. */
     g_tvmd_vin = Vdp2Regs->TVMD;   /* state before the game's VBlank routine */
     g_tvmd_vin_valid = 1;
     Vdp2Regs->TVSTAT |= 0x0008;
@@ -1502,7 +1583,6 @@ void Vdp2VBlankIN(void) {
     yab_emu_stage = 11;   /* before VIN enqueue */
     YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
     yab_emu_stage = 12;
-    vin_render_pending++;
     FrameProfileAdd("VIN decoupled");
     return;
   }
@@ -1672,13 +1752,9 @@ void Vdp2HBlankOUT(void) {
     FrameProfileAdd("VOUT event");
     Vdp2External.frame_render_flg = 1;
 #if defined(YAB_ASYNC_RENDERING)
-    /* This join guards the single VDP1 snapshot buffer. */
-    /* Two snapshot slots (vdp1.cpp/vdp2.cpp): one field of lead no longer
-     * overwrites what the renderer is reading, so the lead join is the right
-     * protection here.  Caller mode only; the standalone keeps the strict join. */
-    if (vdp_on_caller)
-      Vdp1JoinPendingRendersLead();
-    else
+    /* ALIGN P3b: no retire join -- the double-buffered snapshots plus the field
+     * token (depth 1) are the protection (see Vdp2VBlankIN above). */
+    if (!vdp_on_caller)
       Vdp1JoinPendingRenders();
 #endif
     // Manual Change
@@ -1774,7 +1850,7 @@ void Vdp2HBlankOUT(void) {
     Vdp2RamSnapshot();
     /* Which slot these snapshots landed in: the consumer's next VIN composes from
      * it (the VOUT event and the following VIN belong to the same field). */
-    v2_slot_next_vin = (u8)(Vdp2SnapshotSlot() & 1);
+    v2_evt_snap[(vdp1_evt_widx - 1) & 63] = (u8)(Vdp2SnapshotSlot() & 1);
     FRAMELOG("YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT)");
     yab_emu_stage = 13;   /* before VOUT enqueue */
     YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
@@ -2116,7 +2192,11 @@ void vdp2VBlankOUT(void) {
    * draw sees the command list that belongs to this field and not whatever the
    * machine snapshotted last. */
   if (vdp1_evt_ridx != vdp1_evt_widx)
+  {
     Vdp1SelectSnapshot(vdp1_evt_snap[vdp1_evt_ridx & 63]);
+    /* the VIN that follows this VOUT in the queue composes from this slot */
+    v2_slot_for_vin = v2_evt_snap[vdp1_evt_ridx & 63];
+  }
 #if PROFILE_RENDERING
   u64 starttime = YabauseGetTicks();
 #endif

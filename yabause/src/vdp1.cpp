@@ -601,16 +601,9 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
       if (val == 1){ 
         g_ptmr_this_frame = 1;   /* VOUT dispatch ordering, see Vdp2HBlankOUT */
         FRAMELOG("[VDP1] VDPEV_DIRECT_DRAW %d/%d", YaGetQueueSize(vdp1_rcv_evqueue), yabsys.LineCount);
-        {
-          { extern void Vdp1JoinPendingRendersC(void); extern void Vdp1JoinPendingRendersLeadC(void);
-            Vdp1JoinPendingRendersLeadC(); }
-          if ( YaGetQueueSize(vdp1_rcv_evqueue) > 0){
-            yabsys.wait_line_count = -1;
-            do{
-              YabWaitEventQueue(vdp1_rcv_evqueue);
-            } while (YaGetQueueSize(vdp1_rcv_evqueue) != 0);
-          }
-        }
+        /* ALIGN P3b: no retire join and no token drain here any more.  The field
+         * token (depth 1) plus the double-buffered snapshots protect the data; the
+         * machine only waits where the hardware waits (wait_line_count, below). */
         Vdp1Regs->EDSR >>= 1;
         yabsys.wait_line_count = yabsys.LineCount + 50;
         yabsys.wait_line_count %= yabsys.MaxLineCount;

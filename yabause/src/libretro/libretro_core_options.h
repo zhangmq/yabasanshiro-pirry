@@ -302,6 +302,114 @@ struct retro_core_option_v2_definition option_defs_us[] = {
       },
       "disabled"
    },
+{
+      "yabasanshiro_interlace_half",
+      "Interlace: Half Height",
+      NULL,
+      "Draw interlaced modes at half height (the standalone's per-game 'interlace half' key). Applied live.",
+      NULL,
+      "video",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+{
+      "yabasanshiro_rotate_screen",
+      "Rotate Screen (vertical titles)",
+      NULL,
+      "Engine-side screen rotation for vertical titles (the standalone's 'Rotate screen' key). This is not the frontend's RETRO_ENVIRONMENT_SET_ROTATION.",
+      NULL,
+      "video",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+{
+      "yabasanshiro_texcache_persist",
+      "Texture Cache: Persistent",
+      NULL,
+      "Keep the renderer's texture cache across frames (the standalone's 'texcache persist' key). Applied live.",
+      NULL,
+      "video",
+      {
+         { "enabled",  NULL },
+         { "disabled", NULL },
+         { NULL, NULL },
+      },
+      "enabled"
+   },
+{
+      "yabasanshiro_system_language",
+      "System Language",
+      NULL,
+      "SMPC system language reported to the game (the standalone's 'system language' key). Applied live.",
+      NULL,
+      "system",
+      {
+         { "japanese", NULL },
+         { "english",  NULL },
+         { "german",   NULL },
+         { "french",   NULL },
+         { "spanish",  NULL },
+         { "italian",  NULL },
+         { NULL, NULL },
+      },
+      "japanese"
+   },
+{
+      "yabasanshiro_mute_cdda",
+      "Mute CD Audio",
+      NULL,
+      "Mute the CD-DA stream, keep the sound effects (the standalone's 'mute cdda' key). Applied live.",
+      NULL,
+      "audio",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+{
+      "yabasanshiro_cd_volume",
+      "CD Audio Volume",
+      NULL,
+      "SCSP CD-DA mix level, 0-100 (the standalone's 'cd volume' key). Applied live.",
+      NULL,
+      "audio",
+      {
+         { "100", NULL }, { "95", NULL }, { "90", NULL }, { "85", NULL }, { "80", NULL },
+         { "75",  NULL }, { "70", NULL }, { "65", NULL }, { "60", NULL }, { "55", NULL },
+         { "50",  NULL }, { "45", NULL }, { "40", NULL }, { "35", NULL }, { "30", NULL },
+         { "25",  NULL }, { "20", NULL }, { "15", NULL }, { "10", NULL }, { "5",  NULL },
+         { "0",   NULL },
+         { NULL, NULL },
+      },
+      "100"
+   },
+{
+      "yabasanshiro_sfx_volume",
+      "Sound Effect Volume",
+      NULL,
+      "SCSP sound-effect mix level, 0-100 (the standalone's 'sfx volume' key). Applied live.",
+      NULL,
+      "audio",
+      {
+         { "100", NULL }, { "95", NULL }, { "90", NULL }, { "85", NULL }, { "80", NULL },
+         { "75",  NULL }, { "70", NULL }, { "65", NULL }, { "60", NULL }, { "55", NULL },
+         { "50",  NULL }, { "45", NULL }, { "40", NULL }, { "35", NULL }, { "30", NULL },
+         { "25",  NULL }, { "20", NULL }, { "15", NULL }, { "10", NULL }, { "5",  NULL },
+         { "0",   NULL },
+         { NULL, NULL },
+      },
+      "100"
+   },
    { NULL, NULL, NULL, NULL, NULL, NULL, {{NULL, NULL}}, NULL }
 };
 
