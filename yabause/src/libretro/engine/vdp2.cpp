@@ -797,6 +797,9 @@ extern "C" int YabIsRenderThread(void)
    thread that calls retro_run is the renderer.  It drains the same event queue the
    worker used to drain, executing exactly the same switch body. */
 static int g_vdp_frontend_consumer = 0;
+static void (*g_ev_posted_hook)(void) = NULL;
+extern "C" void Vdp2SetEventPostedHook(void (*fn)(void)) { g_ev_posted_hook = fn; }
+static inline void Vdp2NotifyPosted(void) { if (g_ev_posted_hook) g_ev_posted_hook(); }
 extern "C" void Vdp2SetFrontendConsumer(int on) { g_vdp_frontend_consumer = on; }
 
 
@@ -1188,6 +1191,7 @@ void Vdp2VBlankIN(void) {
     ScuSendVBlankIN();
     FrameProfileAdd("VIN event");
     YabAddEventQueue(evqueue,VDPEV_VBLANK_IN);
+    Vdp2NotifyPosted();
     vin_render_pending = 1;
     FrameProfileAdd("VIN decoupled");
     return;
@@ -1447,6 +1451,7 @@ void Vdp2HBlankOUT(void) {
     if (evqueue == NULL)
       evqueue = YabThreadCreateQueue(32);
     YabAddEventQueue(evqueue, VDPEV_VBLANK_OUT);
+    Vdp2NotifyPosted();
     Vdp1MarkRenderDispatched();
     /* sched_yield() after every VOUT enqueue gives up the time slice of the emulation thread. */
     YabThreadYield();
