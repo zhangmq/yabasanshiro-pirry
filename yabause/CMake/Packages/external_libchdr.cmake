@@ -24,7 +24,18 @@ elseif(IOS)
   )
 
 else()
-  set(ADDITIONAL_CMAKE_ARGS "")
+  # Cross compilation: the sub-project must use the same toolchain as the
+  # parent, otherwise it is configured with the host compiler but the parent's
+  # target flags (e.g. -march=armv8-a) and fails.
+  if(CMAKE_CROSSCOMPILING)
+    get_filename_component(TOOL_CHAIN_ABSOLUTE_PATH "${CMAKE_TOOLCHAIN_FILE}"
+                           REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
+    set(ADDITIONAL_CMAKE_ARGS
+      -DCMAKE_TOOLCHAIN_FILE=${TOOL_CHAIN_ABSOLUTE_PATH}
+      -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
+  else()
+    set(ADDITIONAL_CMAKE_ARGS "")
+  endif()
 endif()
 
 ExternalProject_Add(

@@ -45,10 +45,7 @@ extern "C" {
 
 #if defined(HAVE_LIBGL) || defined(__ANDROID__) || defined(IOS) || defined(NX)
 
-#if defined(__LIBRETRO__) && !defined(_USEGLEW_)
-    #include <glsym/glsym.h>
-    #include <glsm/glsm.h>
-#elif defined(__ANDROID__)
+#if defined(__ANDROID__)
     #include <GLES3/gl31.h>
     #include <GLES3/gl3ext.h>
     #include <EGL/egl.h>
@@ -874,7 +871,7 @@ int YglCleanUpWindow(YglProgram * prg);
 void YglEraseWriteVDP1();
 void YglFrameChangeVDP1();
 
-#if !defined(__APPLE__) && !defined(__ANDROID__) && !defined(_USEGLEW_) && !defined(_OGLES3_) && !defined(__LIBRETRO__) &&  !defined(NX)
+#if !defined(__APPLE__) && !defined(__ANDROID__) && !defined(_USEGLEW_) && !defined(_OGLES3_) && !defined(NX)
 
 extern GLuint (STDCALL *glCreateProgram)(void);
 extern GLuint (STDCALL *glCreateShader)(GLenum);
