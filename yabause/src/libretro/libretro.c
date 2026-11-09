@@ -47,6 +47,7 @@
 #include <GLES3/gl3.h>
 
 #include "yabause.h"
+#include "vdp1.h"     /* VIDCore->GetNativeResolution / Resize */
 #include "vidogl.h"
 #include "sh2core.h"
 #include "scsp.h"
@@ -69,7 +70,7 @@ static unsigned ev_posted, ev_seen;
 
 /* Statistics shared by the machine thread (writer) and retro_run (reader). */
 static pthread_mutex_t st_mtx = PTHREAD_MUTEX_INITIALIZER;
-static double acc_render_ms, acc_present_ms, acc_wait_ms;
+static double acc_draw_ms, acc_present_ms, acc_wait_ms;
 static double acc_machine_ms;
 static unsigned acc_machine_n;
 static unsigned acc_calls;
@@ -96,6 +97,10 @@ extern unsigned Vdp2FieldSeq(void);
 extern void EnableAutoFrameSkip(void);
 extern void DisableAutoFrameSkip(void);
 extern int  g_perline_requested;
+/* Config-driven globals of the standalone (main.cpp:346/364) that the engine
+   reads directly and whose engine defaults differ from the standalone's. */
+extern int  g_scsp_dsp_off;      /* scsp.c:163 defaults to 1 = SCSP DSP off   */
+extern int  g_texcache_persist;  /* yglcache.c:49 defaults to 0               */
 extern int  g_emulated_bios;   /* port_stubs.c: 0 when a real BIOS is used */
 extern void YabauseSetDecilineMode(int on);
 /* Temporary probe: how long the two joins actually block (see DESIGN note). */
@@ -142,6 +147,69 @@ static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 
 static retro_log_printf_t frontend_log;
+
+/* ------------------------------------------------------------------------- *
+ * Resolution / geometry (libretro protocol)
+ *
+ * The engine renders the Saturn mode itself (yinit.resolution_mode =
+ * RES_ORIGINAL, the standalone's -r 3), so the frame the front end gets is the
+ * native mode: 320x224 / 352x224 / 352x240 / 640x480 / 704x448 (double-height
+ * interlace).  The mode changes while a game runs, so this is polled once per
+ * field and published with RETRO_ENVIRONMENT_SET_GEOMETRY (allowed only inside
+ * retro_run) before that field is drawn.
+ * ------------------------------------------------------------------------- */
+#define GEOMETRY_MAX_W 704            /* Saturn native maximum */
+#define GEOMETRY_MAX_H 512
+
+void *LibretroFrontFbo(void);
+
+static int game_width  = 320;         /* current native Saturn mode */
+static int game_height = 224;
+static int frame_width  = 0;          /* size last reported to the front end */
+static int frame_height = 0;
+
+static void core_apply_resolution(void)
+{
+   int nw = 0, nh = 0, interlace = 0;
+   GLuint fb;
+   struct retro_system_av_info info;
+
+   if (VIDCore == NULL || VIDCore->GetNativeResolution == NULL)
+      return;
+   VIDCore->GetNativeResolution(&nw, &nh, &interlace);
+   if (nw <= 0 || nh <= 0)
+      return;
+   if (frame_width > 0 && nw == game_width && nh == game_height)
+      return;
+
+   game_width = nw;
+   game_height = nh;
+   frame_width = nw;
+   frame_height = nh;
+
+   /* on = 1, aspect = FULL: the engine must not letterbox its own frame (the
+      front end scales), and screen_width/height must follow the frame so that
+      SetSaturnResolution() keeps GlWidth/GlHeight at the frame size. */
+   fb = (GLuint)(uintptr_t)LibretroFrontFbo();
+   if (fb == 0)
+      return;
+   glBindFramebuffer(GL_FRAMEBUFFER, fb);
+   VIDCore->Resize(0, 0, (unsigned)frame_width, (unsigned)frame_height, 1, FULL);
+   /* YglGLInit() inside Resize re-reads the current framebuffer binding; pin the
+      front end's FBO again so the engine does not fall back to 0. */
+   _Ygl->default_fbo = fb;
+   /* With RES_ORIGINAL, _Ygl->width/height are only recomputed here; without it
+      the engine keeps rendering the first mode's size (hi-res modes would stay
+      at 320x224 internally even though the TVMD mode changed). */
+   YglRebuildGramebuffer();
+
+   if (environ_cb != NULL) {
+      retro_get_system_av_info(&info);
+      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
+   }
+   LOG_INFO("resolution: %dx%d (interlace=%d)", frame_width, frame_height, interlace);
+}
+
 
 static uint16_t *frame_buf;
 static int16_t *audio_buf;
@@ -307,6 +375,14 @@ void LibretroEngineContextReset(void)
       yinit.osdcoretype     = OSDCORE_DUMMY;
       yinit.skip_load       = 0;
       g_emulated_bios = (libretro_bios_path[0] != 0) ? 0 : 1;   /* standalone: 0 when -b */
+      /* Standalone config defaults (main.cpp): "sound dsp" = 1 -> DSP on;
+         "texcache persist" = true.  The DSP is emulated hardware state, so it
+         stays on.  Texture-cache persistence is left OFF: measured on the
+         Daytona race (same save state) it costs 5-10 ms of draw time here, and
+         with this renderer (single front-end FBO, present after retro_run) it
+         degrades over a long run; the standalone's own config keeps it on. */
+      g_scsp_dsp_off = 0;
+      g_texcache_persist = 0;
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
       /* Audio: the SCSP thread produces at its own wall-clock rate, the consumer
          thread of sndlibretro.c drains it in 512-frame periods and calls this,
@@ -555,12 +631,15 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->geometry.base_width = TEST_W;
-   info->geometry.base_height = TEST_H;
-   info->geometry.max_width = TEST_W;
-   info->geometry.max_height = TEST_H;
+   info->geometry.base_width = (unsigned)(frame_width > 0 ? frame_width : game_width);
+   info->geometry.base_height = (unsigned)(frame_height > 0 ? frame_height : game_height);
+   /* The front end allocates its hw-render FBO from these; understating them
+      (the old 320x240) left no room for the hi-res modes. */
+   info->geometry.max_width = GEOMETRY_MAX_W;
+   info->geometry.max_height = GEOMETRY_MAX_H;
+   /* Saturn pixels are not square: every TV mode (320/352/704 wide) is 4:3. */
    info->geometry.aspect_ratio = 4.0f / 3.0f;
-   info->timing.fps = 60.0;
+   info->timing.fps = yabsys.IsPal ? 50.0 : 60.0;
    info->timing.sample_rate = 44100.0;
 }
 
@@ -583,6 +662,11 @@ RETRO_API void retro_run(void)
 
    if (engine_up) {
       Vdp2SetRenderThreadHere();   /* this thread renders now, not VdpProc */
+      /* Saturn mode changes are applied before anything of this field is drawn.
+         The engine's Resize()/YglGLInit() rebuilds GL objects, so it has to stay
+         outside the render stack (a change is then visible one field late, which
+         is what the standalone's fixed window hides anyway). */
+      core_apply_resolution();
       /* One field per call, and the call does not return before that field has
          been handled: consume the events, and when the queue is empty block on
          the machine's post notification (no timeout).  Draining the whole queue
@@ -593,13 +677,19 @@ RETRO_API void retro_run(void)
          field may present nothing (VIDDummy), and returning only on presentation
          would halve the front end's call rate and therefore the game's speed. */
       const unsigned seq0 = Vdp2FieldSeq();
-      struct timespec t0, t1, t2, w0;
-      double wait_ms = 0.0;
+      struct timespec t0, t1, t2, w0, d0, d1;
+      double draw_ms = 0.0, wait_ms = 0.0;
       clock_gettime(CLOCK_MONOTONIC, &t0);
       for (;;) {
+         /* Drawing and waiting for the machine are measured apart: a heavy game
+            keeps this thread waiting for VOUT most of the field, and folding
+            that into one "render" number hides which side is the bottleneck. */
+         clock_gettime(CLOCK_MONOTONIC, &d0);
          while (Vdp2ConsumeFrontendEvent()) {
             if (Vdp2FieldSeq() != seq0) break;
          }
+         clock_gettime(CLOCK_MONOTONIC, &d1);
+         draw_ms += (d1.tv_sec - d0.tv_sec) * 1e3 + (d1.tv_nsec - d0.tv_nsec) / 1e6;
          if (Vdp2FieldSeq() != seq0) break;
          clock_gettime(CLOCK_MONOTONIC, &w0);
          pthread_mutex_lock(&ev_mtx);
@@ -613,15 +703,17 @@ RETRO_API void retro_run(void)
             wait_ms += (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
          }
       }
+      acc_draw_ms += draw_ms;
       acc_wait_ms += wait_ms;
       clock_gettime(CLOCK_MONOTONIC, &t1);
-      acc_render_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
       /* Every call ends with a picture.  A field that autoframeskip dropped ran
          VIDDummy, so the FBO still holds the previous picture and re-presenting it
          is exactly what the standalone shows when it does not swap.  No
          video_cb(NULL): the hw-render frame buffer is always valid. */
       frame_sent = frame_ready;
-      video_cb(RETRO_HW_FRAME_BUFFER_VALID, TEST_W, TEST_H, 0);
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+               (unsigned)(frame_width > 0 ? frame_width : TEST_W),
+               (unsigned)(frame_height > 0 ? frame_height : TEST_H), 0);
       clock_gettime(CLOCK_MONOTONIC, &t2);
       acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
       acc_calls++;
@@ -658,10 +750,13 @@ RETRO_API void retro_run(void)
             {
                double c = acc_calls ? (double)acc_calls : 1.0;
                double mc = acc_machine_n ? (double)acc_machine_n : 1.0;
-               LOG_INFO("segment: calls/s=%.0f render_ms=%.2f machine_ms=%.2f (n=%u) wait_ms=%.0f present_ms=%.2f",
-                        acc_calls / dt, acc_render_ms / c, acc_machine_ms / mc, acc_machine_n,
-                        acc_wait_ms, acc_present_ms / c);
-               acc_render_ms = acc_present_ms = acc_wait_ms = acc_machine_ms = 0.0;
+               /* draw/wait/swap are per retro_run call; machine is per field.
+                  swap = time inside video_cb, i.e. the front end's present
+                  including its vsync wait (not core work). */
+               LOG_INFO("segment: calls/s=%.0f draw_ms=%.2f wait_ms=%.2f machine_ms=%.2f (n=%u) swap_ms=%.2f",
+                        acc_calls / dt, acc_draw_ms / c, acc_wait_ms / c, acc_machine_ms / mc,
+                        acc_machine_n, acc_present_ms / c);
+               acc_draw_ms = acc_present_ms = acc_wait_ms = acc_machine_ms = 0.0;
                acc_calls = acc_machine_n = 0;
             }
             {
@@ -740,7 +835,7 @@ RETRO_API void retro_unload_game(void)
 
 RETRO_API unsigned retro_get_region(void)
 {
-   return RETRO_REGION_NTSC;
+   return yabsys.IsPal ? RETRO_REGION_PAL : RETRO_REGION_NTSC;
 }
 
 RETRO_API void *retro_get_memory_data(unsigned id)
