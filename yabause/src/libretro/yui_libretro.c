@@ -38,6 +38,7 @@
 
 #include "libretro.h"
 #include "log.h"
+#include "sndlibretro.h"
 #include "yui.h"
 #include "m68kcore.h"
 #include "sh2core.h"
@@ -78,7 +79,7 @@ PerInterface_struct *PERCoreList[] = { &PERDummy, NULL };
 
 CDInterface *CDCoreList[] = { &DummyCD, &ISOCD, NULL };
 
-SoundInterface_struct *SNDCoreList[] = { &SNDDummy, NULL };
+SoundInterface_struct *SNDCoreList[] = { &SNDDummy, &SNDLibretro, NULL };
 
 VideoInterface_struct *VIDCoreList[] = { &VIDDummy, &VIDOGL, NULL };
 

@@ -50,6 +50,7 @@
 #include "vidogl.h"
 #include "sh2core.h"
 #include "scsp.h"
+#include "sndlibretro.h"
 #include "m68kcore.h"
 #include "cdbase.h"
 #include "cs0.h"
@@ -95,6 +96,7 @@ extern unsigned Vdp2FieldSeq(void);
 extern void EnableAutoFrameSkip(void);
 extern void DisableAutoFrameSkip(void);
 extern int  g_perline_requested;
+extern int  g_emulated_bios;   /* port_stubs.c: 0 when a real BIOS is used */
 extern void YabauseSetDecilineMode(int on);
 /* Temporary probe: how long the two joins actually block (see DESIGN note). */
 extern void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
@@ -195,6 +197,54 @@ static void reset_gl_state_for_frontend(const char *tag)
    log_gl_state(tag);
 }
 
+/* CD read trace (env YAB_CDTRACE=1): one line per sector the CD block delivers,
+   so the movie/file reads can be compared with the standalone.  Called from
+   cs2.c inside the libretro build only. */
+void LibretroCdTrace(unsigned int fad, int ret, int isaudio,
+                     unsigned status, unsigned ptiming, unsigned pcycles)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("YAB_CDTRACE");
+      on = (e != NULL && e[0] == '1') ? 1 : 0;
+   }
+   if (!on) return;
+   LOG_INFO("cd: fad=%u ret=%d audio=%d status=%02x pt=%u pc=%u",
+            fad, ret, isaudio, status, ptiming, pcycles);
+}
+
+/* CD command trace (env YAB_CDCMD=1): one line when a command is executed and one
+   with the result registers, so the command stream can be compared with the
+   standalone.  Called from cs2.c inside the libretro build only. */
+void LibretroCdCmdTrace(unsigned cmd, unsigned fad, unsigned a, unsigned b,
+                        unsigned c, unsigned d, int done)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *e = getenv("YAB_CDCMD");
+      on = (e != NULL && e[0] == '1') ? 1 : 0;
+   }
+   if (!on) return;
+   if (!done)
+      LOG_INFO("cdcmd: cmd=%02x fad=%u cr2=%04x cr3=%04x cr4=%04x status=%04x",
+               cmd, fad, a, b, c, d);
+   else
+      LOG_INFO("cdcmd: done cmd=%02x cr1=%04x cr2=%04x cr3=%04x hirq=%04x",
+               cmd, a, b, c, d);
+}
+
+/* CD data-delivery trace (env YAB_CDDATA=1), called from cs2.c. */
+void LibretroCdDataTrace(const char *what, unsigned a, unsigned b, unsigned c, unsigned e)
+{
+   static int on = -1;
+   if (on < 0) {
+      const char *en = getenv("YAB_CDDATA");
+      on = (en != NULL && en[0] == '1') ? 1 : 0;
+   }
+   if (!on) return;
+   LOG_INFO("cddata: %s %u %u %u %u", what, a, b, c, e);
+}
+
 void *LibretroFrontFbo(void)
 {
    return hw.get_current_framebuffer ? (void *)(uintptr_t)hw.get_current_framebuffer() : NULL;
@@ -203,6 +253,13 @@ void *LibretroFrontFbo(void)
 int LibretroHasVideo(void)
 {
    return video_cb != NULL;
+}
+
+/* Audio submit hook: called from the consumer thread in sndlibretro.c. */
+static void libretro_audio_submit(const int16_t *pcm, unsigned frames)
+{
+   if (audio_batch_cb != NULL)
+      audio_batch_cb(pcm, frames);
 }
 
 void LibretroEngineContextReset(void)
@@ -216,7 +273,7 @@ void LibretroEngineContextReset(void)
       memset(&yinit, 0, sizeof(yinit));
       yinit.sh2coretype     = 3;
       yinit.vidcoretype     = VIDCORE_OGL;
-      yinit.sndcoretype     = SNDCORE_DUMMY;
+      yinit.sndcoretype     = SNDCORE_LIBRETRO;   /* SCSP thread -> retro_run -> audio_batch_cb */
       yinit.m68kcoretype    = M68KCORE_MUSASHI;
       yinit.percoretype     = PERCORE_DUMMY;
       yinit.carttype        = CART_DRAM32MBIT;
@@ -227,9 +284,19 @@ void LibretroEngineContextReset(void)
       yinit.polygon_generation_mode = PERSPECTIVE_CORRECTION;
       yinit.frameskip       = 0;
       yinit.resolution_mode = 3;   /* match the standalone baseline (-r 3) */
-      yinit.rbg_use_compute_shader = false;
+      yinit.rbg_use_compute_shader = true;   /* standalone default ("Use compute shader") */
       yinit.cdcoretype      = CDCORE_ISO;
-      yinit.carttype        = CART_NONE;
+      /* The rest of the standalone's yinit (main.cpp), field by field: the engine
+         branches on these, so leaving them at their zero value is a silent config
+         divergence (e.g. scsp_main_mode 0 = CpuTime changes the SCSP thread and
+         makes SyncCPUtoSCSP wait every field).  See CONFIG-ALIGN-20261109.md. */
+      yinit.scsp_main_mode  = 1;              /* Realtime SCSP thread (non-Jetson) */
+      yinit.scsp_sync_count_per_frame = 1;    /* g_scsp_sync */
+      yinit.rotate_screen   = 0;
+      yinit.rbg_resolution_mode = 0;
+      yinit.basetime        = 0;
+      yinit.cartpath        = NULL;
+      yinit.mpegpath        = NULL;
       yinit.regionid        = 0;
       yinit.biospath        = libretro_bios_path[0] ? libretro_bios_path : NULL;
       yinit.buppath         = libretro_bup_path[0] ? libretro_bup_path : NULL;
@@ -239,7 +306,12 @@ void LibretroEngineContextReset(void)
       yinit.usethreads      = 0;
       yinit.osdcoretype     = OSDCORE_DUMMY;
       yinit.skip_load       = 0;
+      g_emulated_bios = (libretro_bios_path[0] != 0) ? 0 : 1;   /* standalone: 0 when -b */
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
+      /* Audio: the SCSP thread produces at its own wall-clock rate, the consumer
+         thread of sndlibretro.c drains it in 512-frame periods and calls this,
+         so nothing in retro_run can block on the front end's audio ring. */
+      SNDLibretroStart(libretro_audio_submit);
       /* Per-line CPU sync, exactly as the standalone does it (main.cpp, right after
          YabauseInit, which resets the mode): request it here, and vdp2's FPSDisplay
          switches to DecilineMode 0 three seconds after the game starts drawing.
@@ -308,6 +380,7 @@ void LibretroEngineContextDestroy(void)
       pthread_join(machine_thread, NULL);
       machine_started = 0;
    }
+   SNDLibretroStop();
    LOG_INFO("engine: YabauseDeInit");
    YabauseDeInit();
    engine_up = 0;

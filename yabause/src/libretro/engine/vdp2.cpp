@@ -62,6 +62,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "vidsoft.h"
 #include <atomic>
 #include <pthread.h>
+#include "libretro/log.h"
 #include "vulkan/VIDVulkanCInterface.h"
 
 u8 * Vdp2Ram;
@@ -2047,7 +2048,32 @@ void vdp2VBlankOUT(void) {
 }
 
 //////////////////////////////////////////////////////////////////////////////
+/* TEMPORARY probe (env YAB_SH2STAT=1): average SH2 cycles per field, printed once
+   per second, to compare the machine thread's effective CPU budget between the
+   core and the standalone.  Remove with the investigation. */
+static void YabSh2Stat(unsigned mcyc, unsigned scyc)
+{
+  static int on = -1;
+  static unsigned acc_m, acc_s, n;
+  if (on < 0) { const char *e = getenv("YAB_SH2STAT"); on = (e != NULL && e[0] == '1') ? 1 : 0; }
+  if (!on) return;
+  acc_m += mcyc; acc_s += scyc; n++;
+  if (n >= 60) {
+#ifdef __LIBRETRO__
+    LOG_INFO("sh2stat: fields=%u deciline_mode=%d line=%d mcyc=%u scyc=%u",
+             n, (int)yabsys.DecilineMode, (int)yabsys.LineCount, acc_m / n, acc_s / n);
+#else
+    fprintf(stderr, "sh2stat: fields=%u deciline_mode=%d line=%d mcyc=%u scyc=%u\n",
+            n, (int)yabsys.DecilineMode, (int)yabsys.LineCount, acc_m / n, acc_s / n);
+    fflush(stderr);
+#endif
+    acc_m = acc_s = n = 0;
+  }
+}
+
 void Vdp2VBlankOUT(void) {
+  extern SH2_struct *MSH2, *SSH2;
+  YabSh2Stat(MSH2 ? (unsigned)MSH2->cycles : 0, SSH2 ? (unsigned)SSH2->cycles : 0);
   g_frame_count++;
 
 

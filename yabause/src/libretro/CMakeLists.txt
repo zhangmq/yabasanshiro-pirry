@@ -101,6 +101,7 @@ add_library(yabasanshiro_libretro SHARED
    libretro.c
    engine/vdp2.cpp
    yui_libretro.c
+   sndlibretro.c
    log.c
    port_stubs.c
    ${ENGINE_SOURCES}
