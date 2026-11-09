@@ -8,12 +8,21 @@ if(NOT CMAKE_BUILD_TYPE)
    set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
 
-# Local dependency cache (no network). Override on the command line as needed.
-set(YAB_DEP_CACHE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.notes/build-standalone/src" CACHE PATH "built dependency cache")
-set(LIBCHDR_SRC  "${YAB_DEP_CACHE}/libchdr-prefix/src/libchdr/src")
-set(LIBCHDR_LIB  "${YAB_DEP_CACHE}/libchdr-prefix/src/libchdr-build/libchdr-static.a")
-set(ZLIB_DIR     "${YAB_DEP_CACHE}/zlib/install")
-set(MUSASHI_GEN  "${CMAKE_CURRENT_SOURCE_DIR}/../../../.notes/deps/musashi")
+# Dependencies: the SAME sources and pins the standalone uses, so the two builds
+# can never drift apart:
+#   libchdr  devmiyax/libchdr @ 074ff1614f2a685f2b5a95b0e788bff6297d5680
+#            (yabause/CMake/Packages/external_libchdr.cmake GIT_TAG)
+#   zlib     madler/zlib      @ 50893291621658f355bc5b4d450a8d06a563053d  (zlib 1.2.8,
+#            yabause/CMake/Packages/external_zlib.cmake ZLIB_TAG)
+#   musashi  generated m68kops*.c from the standalone's m68kmake run
+# They are checked out into YAB_DEPS_CACHE (daily dev: reused, no network) and
+# built here from source; `build-libretro.sh --release` starts from a fresh cache
+# so everything is fetched online.
+set(YAB_DEPS_CACHE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.notes/deps" CACHE PATH "dependency source cache")
+set(LIBCHDR_ROOT "${YAB_DEPS_CACHE}/libchdr")
+set(LIBCHDR_SRC  "${LIBCHDR_ROOT}/src")
+set(ZLIB_ROOT    "${YAB_DEPS_CACHE}/zlib")
+set(MUSASHI_GEN  "${YAB_DEPS_CACHE}/musashi")
 
 if(NOT DEFINED H700_DEPS)
   if(DEFINED DEPS)
@@ -23,11 +32,39 @@ if(NOT DEFINED H700_DEPS)
   endif()
 endif()
 set(ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
-# Build libchdr (and its codec deps) from the local cache with -fPIC, instead of
-# linking the standalone's non-PIC chdr-static.a.
+# Build both dependencies from source in this tree: the core is a shared object,
+# so everything it links must be PIC (the standalone's archives are not).
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-get_filename_component(LIBCHDR_ROOT "${LIBCHDR_SRC}/.." ABSOLUTE)
+if(NOT EXISTS "${LIBCHDR_ROOT}/CMakeLists.txt")
+  message(FATAL_ERROR "libchdr sources missing at ${LIBCHDR_ROOT} (run .notes/tools/build-libretro.sh)")
+endif()
+if(NOT EXISTS "${ZLIB_ROOT}/CMakeLists.txt")
+  message(FATAL_ERROR "zlib sources missing at ${ZLIB_ROOT} (run .notes/tools/build-libretro.sh)")
+endif()
 add_subdirectory(${LIBCHDR_ROOT} ${CMAKE_BINARY_DIR}/libchdr)
+
+# zlib is built as an ExternalProject in its own tree, exactly like the
+# standalone does it: the engine must link zlib 1.2.8, while libchdr brings its
+# own bundled copy for the CHD codecs. Doing it in-tree would clash on the
+# "zlib" target name.
+include(ExternalProject)
+if(CMAKE_CROSSCOMPILING)
+  get_filename_component(YAB_TCHAIN "${CMAKE_TOOLCHAIN_FILE}" REALPATH BASE_DIR "${CMAKE_BINARY_DIR}")
+  set(YAB_EP_TOOLCHAIN -DCMAKE_TOOLCHAIN_FILE=${YAB_TCHAIN} -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM})
+else()
+  set(YAB_EP_TOOLCHAIN "")
+endif()
+set(ZLIB_INSTALL ${CMAKE_BINARY_DIR}/zlib/install)
+ExternalProject_Add(zlib_ep
+  NAME zlib   # libchdr already owns a "zlib" target
+  SOURCE_DIR ${ZLIB_ROOT}
+  DOWNLOAD_COMMAND ""
+  UPDATE_COMMAND ""
+  CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${ZLIB_INSTALL}
+             -DCMAKE_BUILD_TYPE=Release
+             -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+             ${YAB_EP_TOOLCHAIN}
+  BUILD_BYPRODUCTS ${ZLIB_INSTALL}/lib/libz.a)
 
 set(ENGINE_SOURCES
    ${ENGINE_DIR}/BackupManager.cpp
@@ -114,7 +151,8 @@ target_include_directories(yabasanshiro_libretro PRIVATE
    ${ENGINE_DIR}/musashi
    ${MUSASHI_GEN}
    ${LIBCHDR_SRC}
-   ${ZLIB_DIR}/include
+   ${ZLIB_ROOT}
+   ${ZLIB_INSTALL}/include
    ${H700_DEPS}/include
 )
 
@@ -130,9 +168,10 @@ target_compile_definitions(yabasanshiro_libretro PRIVATE
 
 target_compile_options(yabasanshiro_libretro PRIVATE -O3 -fomit-frame-pointer -fno-strict-aliasing -Wno-format-truncation -Wno-format-overflow -Wno-stringop-overflow)
 set_target_properties(yabasanshiro_libretro PROPERTIES POSITION_INDEPENDENT_CODE ON)
+add_dependencies(yabasanshiro_libretro zlib_ep)
 
 target_link_libraries(yabasanshiro_libretro PRIVATE
-   chdr-static flac-static lzma-static crypto-static ${ZLIB_DIR}/lib/libz.a
+   chdr-static flac-static lzma-static crypto-static ${ZLIB_INSTALL}/lib/libz.a
    ${H700_DEPS}/lib/libEGL.so.1
    ${H700_DEPS}/lib/libmali.so.0
    pthread dl m)
