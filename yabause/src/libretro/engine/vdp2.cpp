@@ -150,6 +150,10 @@ static s64 onesecondticks = 0;
 
 static int enableFrameLimit = 1;
 static int frameLimitShift = 0;
+/* Core-only: run the autoframeskip decision without the 60 Hz sleep.  The front
+   end's vsync paces the core (the swap happens after retro_run returns, outside
+   this handler), so sleeping here would pace twice.  Set by VDP2SetFrameLimit(3). */
+static int frameLimitNoSleep = 0;
 
 //#define LOG yprintf
 #define PROFILE_RENDERING 0
@@ -191,9 +195,38 @@ static inline unsigned int counter_delta(unsigned int now_val, unsigned int *pre
 static int g_vin_decoupled = -1;
 static int vin_render_pending = 0;
 
+/* Temporary probe (remove with the join measurement): how long the machine
+   blocks at the two joins, and which DRAWEND site fired.  Vdp2TakeWaitStats
+   reads and resets it once per second from retro_run. */
+static unsigned g_join_vin_n, g_join_vin_us, g_join_rnd_n, g_join_rnd_us;
+static unsigned g_drawend_machine_n, g_drawend_side_n;
+static unsigned long probe_us(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (unsigned long)ts.tv_sec * 1000000UL + (unsigned long)ts.tv_nsec / 1000UL;
+}
+/* Field sequence: one increment per VDPEV_VBLANK_IN handled by the renderer,
+   whether or not that field was presented (a skipped field presents nothing).
+   retro_run uses it to return exactly once per field. */
+static unsigned g_field_seq = 0;
+extern "C" unsigned Vdp2FieldSeq(void) { return g_field_seq; }
+
+extern "C" void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
+                                  unsigned *rnd_n, unsigned *rnd_us,
+                                  unsigned *drawend_machine_n, unsigned *drawend_side_n) {
+  *vin_n = g_join_vin_n; *vin_us = g_join_vin_us;
+  *rnd_n = g_join_rnd_n; *rnd_us = g_join_rnd_us;
+  *drawend_machine_n = g_drawend_machine_n; *drawend_side_n = g_drawend_side_n;
+  g_join_vin_n = g_join_vin_us = g_join_rnd_n = g_join_rnd_us = 0;
+  g_drawend_machine_n = g_drawend_side_n = 0;
+}
+
 static void Vdp2JoinPendingVIN(void) {
   if (vin_render_pending) {
+    unsigned long t0 = probe_us();
     YabWaitEventQueue(rcv_evqueue);
+    g_join_vin_us += (unsigned)(probe_us() - t0);
+    g_join_vin_n++;
     vin_render_pending = 0;
   }
 }
@@ -263,18 +296,25 @@ static void Vdp1MarkRenderRetired(void) {
 }
 
 static void Vdp1JoinPendingRenders(void) {
+  unsigned long t0 = probe_us();
+  int pending = 1;
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_retired.load(std::memory_order_acquire) >=
         vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
-      return;
+      pending = 0;
+      break;
     }
   }
-  pthread_mutex_lock(&vdp1_join_mtx);
-  while (vdp1_ev_retired.load(std::memory_order_acquire) <
-         vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
-    pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+  if (pending) {
+    pthread_mutex_lock(&vdp1_join_mtx);
+    while (vdp1_ev_retired.load(std::memory_order_acquire) <
+           vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
+      pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
+    }
+    pthread_mutex_unlock(&vdp1_join_mtx);
   }
-  pthread_mutex_unlock(&vdp1_join_mtx);
+  g_join_rnd_us += (unsigned)(probe_us() - t0);
+  g_join_rnd_n++;
 }
 
 
@@ -808,10 +848,12 @@ static void Vdp2HandleEvent(int evcode) {
     case VDPEV_VBLANK_IN:
       FrameProfileAdd("VIN start");
       vdp2VBlankIN();
+      g_field_seq++;
       FrameProfileAdd("VIN end");
       break;
     case VDPEV_VBLANK_OUT:
       FrameProfileAdd("VOUT start");
+      if (!Vdp1External.disptoggle) g_drawend_side_n++;  /* Vdp1NoDraw: DRAWEND from here */
       vdp2VBlankOUT();
       FrameProfileAdd("VOUT end");
       Vdp1MarkRenderRetired();
@@ -820,6 +862,7 @@ static void Vdp2HandleEvent(int evcode) {
     case VDPEV_DIRECT_DRAW:
       FrameProfileAdd("DirectDraw start");
       FRAMELOG("VDP1: VDPEV_DIRECT_DRAW(T)");
+      if (!Vdp1External.disptoggle) g_drawend_side_n++;
       Vdp1Draw();
       VIDCore->Vdp1DrawEnd();
       Vdp1External.frame_change_plot = 0;
@@ -1048,6 +1091,16 @@ void VDP2SetFrameLimit(int mode) {
     onesecondticks = 0;
     lastticks = YabauseGetTicks();
     break;
+  case 3:
+    /* libretro core: keep the autoframeskip decision, drop the sleep.  Otherwise
+       identical to mode 0 (60 Hz budget). */
+    enableFrameLimit = 1;
+    frameLimitShift = 0;
+    frameLimitNoSleep = 1;
+    framecount = 0;
+    onesecondticks = 0;
+    lastticks = YabauseGetTicks();
+    break;
   default:
     enableFrameLimit = 1;
     frameLimitShift = 0;
@@ -1097,7 +1150,7 @@ void frameSkipAndLimit() {
 
     // just wait for next vsync
     targetTime -= 1000;
-    if ((s64)(onesecondticks + diffticks) < targetTime)
+    if (!frameLimitNoSleep && (s64)(onesecondticks + diffticks) < targetTime)
     {
 
       s64 sleeptime = (targetTime - (onesecondticks + diffticks));
@@ -1465,6 +1518,7 @@ void Vdp2HBlankOUT(void) {
         YabClearEventQueue(vdp1_rcv_evqueue);
         FRAMELOG("**WAIT END**");
         FrameProfileAdd("DirectDraw sync");        
+        g_drawend_machine_n++;
         ScuSendDrawEnd();
         FRAMELOG("Vdp1Draw end at %d line EDSR=%02X", yabsys.LineCount, Vdp1Regs->EDSR);
         yabsys.wait_line_count = -1;

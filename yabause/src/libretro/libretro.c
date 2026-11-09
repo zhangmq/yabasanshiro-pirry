@@ -59,16 +59,19 @@
 
 static struct retro_hw_render_callback hw;
 
-/* Event-driven consumption: the engine calls this right after it posts a VDP
-   event, so retro_run can sleep on a condvar instead of polling. */
+/* One frame per retro_run, and retro_run blocks until that frame exists.
+   The machine thread notifies after every VDP event it posts; there is no
+   timeout -- a call returns only after a field has been presented. */
 static pthread_mutex_t ev_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  ev_cv  = PTHREAD_COND_INITIALIZER;
-static unsigned ev_posted;
-static double acc_render_ms, acc_wait_ms, acc_present_ms;
+static unsigned ev_posted, ev_seen;
+
+/* Statistics shared by the machine thread (writer) and retro_run (reader). */
+static pthread_mutex_t st_mtx = PTHREAD_MUTEX_INITIALIZER;
+static double acc_render_ms, acc_present_ms, acc_wait_ms;
 static double acc_machine_ms;
 static unsigned acc_machine_n;
 static unsigned acc_calls;
-static unsigned ev_seen;
 
 static void on_event_posted(void)
 {
@@ -77,6 +80,7 @@ static void on_event_posted(void)
    pthread_cond_signal(&ev_cv);
    pthread_mutex_unlock(&ev_mtx);
 }
+
 static int engine_up;
 static const char *libretro_content_path;
 static char libretro_bup_path[512];
@@ -87,6 +91,14 @@ extern void Vdp2SetFrontendConsumer(int on);
 extern void Vdp2SetRenderThreadHere(void);
 extern void Vdp2SetEventPostedHook(void (*fn)(void));
 extern int  Vdp2ConsumeFrontendEvent(void);
+extern unsigned Vdp2FieldSeq(void);
+extern void EnableAutoFrameSkip(void);
+/* Set once from the front end's answer to RETRO_ENVIRONMENT_GET_CAN_DUPE. */
+static int can_dupe;
+/* Temporary probe: how long the two joins actually block (see DESIGN note). */
+extern void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
+                              unsigned *rnd_n, unsigned *rnd_us,
+                              unsigned *drawend_machine_n, unsigned *drawend_side_n);
 
 static pthread_t machine_thread;
 static volatile int machine_run;
@@ -100,10 +112,10 @@ static void *machine_main(void *arg)
       clock_gettime(CLOCK_MONOTONIC, &m0);
       YabauseExec();
       clock_gettime(CLOCK_MONOTONIC, &m1);
-      pthread_mutex_lock(&ev_mtx);
+      pthread_mutex_lock(&st_mtx);
       acc_machine_ms += (m1.tv_sec - m0.tv_sec) * 1e3 + (m1.tv_nsec - m0.tv_nsec) / 1e6;
       acc_machine_n++;
-      pthread_mutex_unlock(&ev_mtx);
+      pthread_mutex_unlock(&st_mtx);
    }
    return NULL;
 }
@@ -229,9 +241,26 @@ void LibretroEngineContextReset(void)
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
    {
       extern void VDP2SetFrameLimit(int mode);
-      VDP2SetFrameLimit(1);            /* no limit: the frontend paces */
+      /* Autoframeskip is available but OFF by default.  The engine's skip
+         decision compares wall time against an ideal 60 Hz schedule and is
+         coupled to frameSkipAndLimit()'s own sleep; in the core the schedule
+         comes from the front end's vsync (the swap happens after retro_run
+         returns), so that measure sees every field as "behind" and the engine
+         skips continuously (measured: Golden Axe 34 fps, skip ~21/s, machine
+         still 16.7 ms).  Opt in with YAB_FRAMESKIP=1 only to study it.
+         Mode 3 = 60 Hz budget without the sleep (the front end paces). */
+      {
+         const char *fs = getenv("YAB_FRAMESKIP");
+         if (fs != NULL && fs[0] == '1') {
+            VDP2SetFrameLimit(3);
+            EnableAutoFrameSkip();
+            LOG_INFO("engine frame limit: 60 Hz budget, autoframeskip ON (YAB_FRAMESKIP=1)");
+         } else {
+            VDP2SetFrameLimit(1);
+            LOG_INFO("engine frame limit: off; autoframeskip available but off (YAB_FRAMESKIP=1 to enable)");
+         }
+      }
       Vdp2SetEventPostedHook(on_event_posted);
-      LOG_INFO("engine frame limit: off (frontend paces)");
    }
    /* Render target: the FBO the frontend handed us.  ygles.c sets
       _Ygl->default_fbo = 0 when it initialises, which in a libretro hw core is
@@ -387,6 +416,11 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
 
    if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
       LOG_WARN("front end rejected RGB565; it keeps its default pixel format");
+
+   {
+      bool dupe = false;
+      can_dupe = (cb != NULL && cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &dupe) && dupe) ? 1 : 0;
+   }
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
@@ -460,45 +494,48 @@ RETRO_API void retro_run(void)
 
    if (engine_up) {
       Vdp2SetRenderThreadHere();   /* this thread renders now, not VdpProc */
-      /* A+token: drain the events the machine queued; rendering happens here,
-         on the front end's thread, and YuiSwapBuffers issues video_cb. */
-      /* Consumption loop: keep draining inside one retro_run call instead of
-         returning to the front end between events.  If the machine has not
-         posted yet, wait briefly and retry (bounded), so the renderer starts as
-         soon as the event lands rather than at the next front-end frame. */
-      int n = 0;
-      struct timespec t0, t1, t2;
+      /* One field per call, and the call does not return before that field has
+         been handled: consume the events, and when the queue is empty block on
+         the machine's post notification (no timeout).  Draining the whole queue
+         instead would pump the machine to 86-97 fps, because it posts its VIN
+         event before running the field.
+
+         The break is per FIELD, not per presented frame: with autoframeskip a
+         field may present nothing (VIDDummy), and returning only on presentation
+         would halve the front end's call rate and therefore the game's speed. */
+      const unsigned seq0 = Vdp2FieldSeq();
+      struct timespec t0, t1, t2, w0;
+      double wait_ms = 0.0;
       clock_gettime(CLOCK_MONOTONIC, &t0);
-      {
-         for (;;) {
-            int got = 0;
-            while (Vdp2ConsumeFrontendEvent()) { got++; n++; if (n >= 64) break; }
-            if (got > 0) break;               /* a field was consumed */
-            /* Nothing queued yet: sleep until the machine posts, bounded by one
-               frame so pause/quit stays responsive. */
-            {
-               struct timespec ts, w0, w1;
-               clock_gettime(CLOCK_MONOTONIC, &w0);
-               clock_gettime(CLOCK_MONOTONIC, &ts);
-               ts.tv_nsec += 20000000L;       /* 20 ms */
-               if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-               pthread_mutex_lock(&ev_mtx);
-               if (ev_posted == ev_seen)
-                  pthread_cond_timedwait(&ev_cv, &ev_mtx, &ts);
-               ev_seen = ev_posted;
-               pthread_mutex_unlock(&ev_mtx);
-               clock_gettime(CLOCK_MONOTONIC, &w1);
-               acc_wait_ms += (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
-            }
+      for (;;) {
+         while (Vdp2ConsumeFrontendEvent()) {
+            if (Vdp2FieldSeq() != seq0) break;
+         }
+         if (Vdp2FieldSeq() != seq0) break;
+         clock_gettime(CLOCK_MONOTONIC, &w0);
+         pthread_mutex_lock(&ev_mtx);
+         if (ev_posted == ev_seen)
+            pthread_cond_wait(&ev_cv, &ev_mtx);
+         ev_seen = ev_posted;
+         pthread_mutex_unlock(&ev_mtx);
+         {
+            struct timespec w1;
+            clock_gettime(CLOCK_MONOTONIC, &w1);
+            wait_ms += (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
          }
       }
+      acc_wait_ms += wait_ms;
       clock_gettime(CLOCK_MONOTONIC, &t1);
       acc_render_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
       if (frame_ready != frame_sent) {
          frame_sent = frame_ready;
          video_cb(RETRO_HW_FRAME_BUFFER_VALID, TEST_W, TEST_H, 0);
+      } else if (can_dupe) {
+         /* autoframeskip dropped this field (VIDDummy): no new picture */
+         video_cb(NULL, TEST_W, TEST_H, 0);
       } else {
-         video_cb(NULL, TEST_W, TEST_H, 0);   /* dupe: no new field this call */
+         /* front end cannot dupe: hand it the same FBO again, same picture */
+         video_cb(RETRO_HW_FRAME_BUFFER_VALID, TEST_W, TEST_H, 0);
       }
       clock_gettime(CLOCK_MONOTONIC, &t2);
       acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
@@ -513,10 +550,11 @@ RETRO_API void retro_run(void)
    frame_count++;
    {
       static struct timespec last;
-      static unsigned last_ready, last_run, last_drain;
+      static unsigned last_ready, last_run, last_drain, last_fields;
       struct timespec now;
       clock_gettime(CLOCK_MONOTONIC, &now);
-      if (last.tv_sec == 0) { last = now; last_ready = frame_ready; last_run = frame_count; last_drain = drained_total; }
+      if (last.tv_sec == 0) { last = now; last_ready = frame_ready; last_run = frame_count;
+                              last_drain = drained_total; last_fields = Vdp2FieldSeq(); }
       else if (now.tv_sec != last.tv_sec) {
          double dt = (now.tv_sec - last.tv_sec) + (now.tv_nsec - last.tv_nsec) / 1e9;
          {
@@ -526,21 +564,33 @@ RETRO_API void retro_run(void)
             extern unsigned int show_skipped_frame;
             /* Same line, same fields, same sources as the standalone probe:
                PERFLOG fps=<rendered fields/s> skip=<show_skipped_frame> vdp1=<show_vdp1_frame> */
-            LOG_INFO("PERFLOG fps=%d skip=%u vdp1=%d",
-                     (int)((frame_ready - last_ready) / dt + 0.5), show_skipped_frame,
-                     show_vdp1_frame);
+            /* fps = presented fields/s (the standalone OSD's number is the FIELD
+               rate, so it also gets logged as fields=); skip = autoframeskip drops. */
+            LOG_INFO("PERFLOG fps=%d fields=%d skip=%u vdp1=%d",
+                     (int)((frame_ready - last_ready) / dt + 0.5),
+                     (int)((Vdp2FieldSeq() - last_fields) / dt + 0.5),
+                     show_skipped_frame, show_vdp1_frame);
             {
                double c = acc_calls ? (double)acc_calls : 1.0;
                double mc = acc_machine_n ? (double)acc_machine_n : 1.0;
                LOG_INFO("segment: calls/s=%.0f render_ms=%.2f machine_ms=%.2f (n=%u) wait_ms=%.0f present_ms=%.2f",
                         acc_calls / dt, acc_render_ms / c, acc_machine_ms / mc, acc_machine_n,
                         acc_wait_ms, acc_present_ms / c);
-               acc_render_ms = acc_wait_ms = acc_present_ms = acc_machine_ms = 0.0;
+               acc_render_ms = acc_present_ms = acc_wait_ms = acc_machine_ms = 0.0;
                acc_calls = acc_machine_n = 0;
+            }
+            {
+               /* Temporary probe: how long the machine actually blocks at the two
+                  joins, and which DRAWEND path fired.  Remove with the probe. */
+               unsigned vn, vu, rn, ru, dm, ds;
+               Vdp2TakeWaitStats(&vn, &vu, &rn, &ru, &dm, &ds);
+               LOG_INFO("join: vin_n=%u vin_ms=%.2f rnd_n=%u rnd_ms=%.2f drawend machine=%u render=%u",
+                        vn, vu / 1000.0, rn, ru / 1000.0, dm, ds);
             }
 
          }
-         last = now; last_ready = frame_ready; last_run = frame_count; last_drain = drained_total;
+         last = now; last_ready = frame_ready; last_run = frame_count;
+         last_drain = drained_total; last_fields = Vdp2FieldSeq();
       }
    }
 
