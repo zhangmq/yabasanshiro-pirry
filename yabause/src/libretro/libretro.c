@@ -94,6 +94,8 @@ extern int  Vdp2ConsumeFrontendEvent(void);
 extern unsigned Vdp2FieldSeq(void);
 extern void EnableAutoFrameSkip(void);
 extern void DisableAutoFrameSkip(void);
+extern int  g_perline_requested;
+extern void YabauseSetDecilineMode(int on);
 /* Temporary probe: how long the two joins actually block (see DESIGN note). */
 extern void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
                               unsigned *rnd_n, unsigned *rnd_us,
@@ -238,6 +240,20 @@ void LibretroEngineContextReset(void)
       yinit.osdcoretype     = OSDCORE_DUMMY;
       yinit.skip_load       = 0;
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
+      /* Per-line CPU sync, exactly as the standalone does it (main.cpp, right after
+         YabauseInit, which resets the mode): request it here, and vdp2's FPSDisplay
+         switches to DecilineMode 0 three seconds after the game starts drawing.
+         YAB_PERLINE=0 keeps the historical core path (deciline throughout). */
+      {
+         const char *pl = getenv("YAB_PERLINE");
+         if (pl != NULL && pl[0] == '0') {
+            LOG_INFO("per-line: disabled by YAB_PERLINE=0 (deciline throughout)");
+         } else {
+            g_perline_requested = 1;
+            YabauseSetDecilineMode(1);
+            LOG_INFO("per-line: requested (standalone parity; switches after 3 s of VDP1 draws)");
+         }
+      }
    {
       extern void VDP2SetFrameLimit(int mode);
       /* Autoframeskip is available but OFF by default.  The engine's skip
