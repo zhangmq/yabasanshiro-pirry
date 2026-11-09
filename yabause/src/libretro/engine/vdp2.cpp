@@ -1138,7 +1138,15 @@ void frameSkipAndLimit() {
     diffticks = curticks - lastticks;
 
 
-    if ( autoframeskipenab && (onesecondticks + diffticks) > targetTime )
+    /* Core mode 3 only: the front end's vsync owns the schedule, so the residual
+       against the ideal 60 Hz grid stays slightly positive and a strict
+       comparison skips almost every field (measured: Golden Axe skip ~26/s vs
+       the standalone's ~4/s).  Require a real overrun: a quarter of a field
+       behind.  The standalone can stay strict because its own sleep pins every
+       field to the grid. */
+    const s64 skip_slack = frameLimitNoSleep
+                           ? (s64)(yabsys.OneFrameTime >> (frameLimitShift + 2)) : 0;
+    if ( autoframeskipenab && (onesecondticks + diffticks) > targetTime + skip_slack )
     {
       // Skip the next frame
       skipnextframe = 1;

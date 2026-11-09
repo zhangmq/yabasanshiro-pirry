@@ -93,8 +93,7 @@ extern void Vdp2SetEventPostedHook(void (*fn)(void));
 extern int  Vdp2ConsumeFrontendEvent(void);
 extern unsigned Vdp2FieldSeq(void);
 extern void EnableAutoFrameSkip(void);
-/* Set once from the front end's answer to RETRO_ENVIRONMENT_GET_CAN_DUPE. */
-static int can_dupe;
+extern void DisableAutoFrameSkip(void);
 /* Temporary probe: how long the two joins actually block (see DESIGN note). */
 extern void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
                               unsigned *rnd_n, unsigned *rnd_us,
@@ -256,8 +255,13 @@ void LibretroEngineContextReset(void)
             EnableAutoFrameSkip();
             LOG_INFO("engine frame limit: 60 Hz budget, autoframeskip ON (YAB_FRAMESKIP=1)");
          } else {
-            VDP2SetFrameLimit(1);
-            LOG_INFO("engine frame limit: off; autoframeskip available but off (YAB_FRAMESKIP=1 to enable)");
+            /* Standalone `-nf` parity: the limiter itself stays on (framelimit 0
+               = the 60 Hz schedule with its sleep/busy-wait), only the skip
+               decision is disabled.  Mode 1 would short-circuit the whole
+               function and leave a different execution path. */
+            VDP2SetFrameLimit(0);
+            DisableAutoFrameSkip();
+            LOG_INFO("engine frame limit: 60 Hz schedule, frameskip off (standalone -nf path)");
          }
       }
       Vdp2SetEventPostedHook(on_event_posted);
@@ -417,10 +421,6 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
    if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
       LOG_WARN("front end rejected RGB565; it keeps its default pixel format");
 
-   {
-      bool dupe = false;
-      can_dupe = (cb != NULL && cb(RETRO_ENVIRONMENT_GET_CAN_DUPE, &dupe) && dupe) ? 1 : 0;
-   }
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
@@ -527,16 +527,12 @@ RETRO_API void retro_run(void)
       acc_wait_ms += wait_ms;
       clock_gettime(CLOCK_MONOTONIC, &t1);
       acc_render_ms += (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
-      if (frame_ready != frame_sent) {
-         frame_sent = frame_ready;
-         video_cb(RETRO_HW_FRAME_BUFFER_VALID, TEST_W, TEST_H, 0);
-      } else if (can_dupe) {
-         /* autoframeskip dropped this field (VIDDummy): no new picture */
-         video_cb(NULL, TEST_W, TEST_H, 0);
-      } else {
-         /* front end cannot dupe: hand it the same FBO again, same picture */
-         video_cb(RETRO_HW_FRAME_BUFFER_VALID, TEST_W, TEST_H, 0);
-      }
+      /* Every call ends with a picture.  A field that autoframeskip dropped ran
+         VIDDummy, so the FBO still holds the previous picture and re-presenting it
+         is exactly what the standalone shows when it does not swap.  No
+         video_cb(NULL): the hw-render frame buffer is always valid. */
+      frame_sent = frame_ready;
+      video_cb(RETRO_HW_FRAME_BUFFER_VALID, TEST_W, TEST_H, 0);
       clock_gettime(CLOCK_MONOTONIC, &t2);
       acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
       acc_calls++;
