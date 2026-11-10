@@ -591,12 +591,18 @@ void LibretroEngineContextReset(void)
       g_emulated_bios = (libretro_bios_path[0] != 0) ? 0 : 1;   /* standalone: 0 when -b */
       /* Standalone config defaults (main.cpp): "sound dsp" = 1 -> DSP on;
          "texcache persist" = true.  The DSP is emulated hardware state, so it
-         stays on.  Texture-cache persistence is left OFF: measured on the
-         Daytona race (same save state) it costs 5-10 ms of draw time here, and
-         with this renderer (single front-end FBO, present after retro_run) it
-         degrades over a long run; the standalone's own config keeps it on. */
+         stays on, and texture-cache persistence follows the standalone as well:
+         without it every field rebuilds the atlas (YglTMReset + YglCacheReset in
+         VIDOGLVdp2DrawStart) and re-uploads the sprites.  Measured on a fixed
+         in-game savestate (DoA, both front ends): persist off 39 fps (core) /
+         42 (standalone), persist on 55 for both - the earlier "persist costs
+         draw time" note came from mixing light and heavy attract scenes.
+         YAB_TEXCACHE_PERSIST=0 still turns it off for A/B measurements. */
       g_scsp_dsp_off = 0;
-      g_texcache_persist = 0;
+      {
+         const char *tp = getenv("YAB_TEXCACHE_PERSIST");
+         g_texcache_persist = (tp != NULL) ? atoi(tp) : 1;
+      }
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
       /* Audio: the SCSP thread produces at its own wall-clock rate.  With env 22
          the front end's audio thread pulls 512-frame periods from the ring and
