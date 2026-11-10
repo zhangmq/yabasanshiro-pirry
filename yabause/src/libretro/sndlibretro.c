@@ -60,6 +60,31 @@
 
 #define SND_MAXVOLUME     128
 
+/* On resume the ring holds whatever the SCSP produced while the front end was
+   paused.  Its old end is a timeline that has moved on, but throwing all of it
+   away leaves the front end's own buffer empty (it then polls us in a tight
+   loop with nothing to give); keep the newest two periods, i.e. the audio from
+   the moment of the resume. */
+#define SND_RESUME_KEEP   (2 * SND_PERIOD_FRAMES)
+
+/* Adaptive resampling trim, ported from the standalone (sndsdl.c:600-740).
+   The SCSP thread produces by the wall clock, the front end's device consumes
+   by its own crystal, and the two never match exactly (measured ~0.1% here).
+   A small ratio trim holds the ring at a fill target instead of letting it
+   drift into a hard underrun or a dropped block.  The trim stays inside +-1%
+   (inaudible as pitch), with a slightly wider emergency band when the level is
+   far off; the ratio is slewed so it never steps. */
+#define SND_STRETCH_RATIOMIN      0.99
+#define SND_STRETCH_RATIOMAX      1.01
+#define SND_STRETCH_RATIOGAIN     0.10
+#define SND_STRETCH_RATIOSLEW     0.10
+#define SND_STRETCH_RATIOMIN_EMG  0.985
+#define SND_STRETCH_RATIOMAX_EMG  1.015
+#define SND_STRETCH_LOWFILL       0.60
+#define SND_STRETCH_HIGHFILL      0.85
+#define SND_STRETCH_TARGET_FIELDS 4      /* YABA_STRETCH_PREFILL: 4 fields ~67 ms */
+#define SND_STRETCH_WIN_FRAMES    1024   /* one period needs ~522 + slack */
+
 static s16 *ring;                          /* SND_RING_FRAMES stereo frames */
 static pthread_mutex_t ring_lock = PTHREAD_MUTEX_INITIALIZER;
 static u32 read_pos;                       /* frames */
@@ -83,6 +108,33 @@ static u32 stat_produced;
 static u32 stat_consumed;
 static u32 stat_underrun;
 static u32 stat_dropped;
+static u32 stat_stale;             /* dropped at a pause/resume boundary */
+
+/* Async (env 22) path: the front end's audio thread pulls, so there is no
+   consumer thread and no wall-clock schedule of our own. */
+static s64 hb_us;                  /* last retro_run, CLOCK_MONOTONIC us */
+
+/* Resampler state (ring_lock). */
+static u32 stretch_target;         /* fill target, frames (four fields) */
+static double soundratio = 1.0;    /* output frames per input frame */
+static double soundfrac;           /* fractional read position in the window */
+static s16 stretch_last[2];        /* last input frame, for interpolation */
+static s16 stretch_win[SND_STRETCH_WIN_FRAMES * 2];
+
+/* Pause detection.  libretro has no pause environment call (env 22's set_state
+   is about the front end's audio driver), so "the front end stopped calling
+   retro_run" is the signal: the menu blocks the main loop, the game stops, and
+   the audio must stop with it.  250 ms is 2.5x the longest field measured on
+   this device with autoframeskip; it is overridable for experiments. */
+/* 1000 ms, not the 250 ms first tried: a legitimate Saturn mode switch
+   (320x224 -> 704x448 interlace) blocks the machine thread for ~506 ms on this
+   device (measured 2026-11-11, join: vin_ms=506), and 250 ms turned that into a
+   false "resume", which dropped the ring and made the front end underrun. */
+#define SND_PAUSE_MS_DEFAULT 1000
+static unsigned pause_ms = SND_PAUSE_MS_DEFAULT;
+static int paused;
+static int resume_pending;         /* retro_run came back after a long gap */
+static unsigned pause_events, resume_events;
 
 static u64 snd_ticks(void)
 {
@@ -93,6 +145,8 @@ static u64 snd_tickfreq(void)
 {
    return yabsys.tickfreq ? yabsys.tickfreq : 1;
 }
+
+static int snd_pause_gate(void);   /* defined with the pump below */
 
 static void SNDLibretroLogStats(void)
 {
@@ -132,45 +186,246 @@ static void SNDLibretroLogStats(void)
                 (u32)SND_RING_FRAMES);
 }
 
-/* One consumer period: exactly SND_PERIOD_FRAMES frames, silence for whatever
-   the ring does not hold (sndsdl.c covers this with PLC/fade).  The device
-   clock is never stretched to wait for the emulation. */
-static void SNDLibretroPeriod(void)
+/* Steer the ring towards the fill target (constants above).  Caller holds
+   ring_lock.  Proportional only, like the standalone: a small standing error
+   just settles the ring a few ms off target, whereas an integral term would
+   wind the ratio up against a rate difference that never goes away. */
+static void snd_regulate(void)
 {
-   u32 first;
+   double fillf = (double)fill / (double)SND_RING_FRAMES;
+   double targetf = (double)stretch_target / (double)SND_RING_FRAMES;
+   double err = fillf - targetf;
+   double want = 1.0 - SND_STRETCH_RATIOGAIN * err;
+   double rmin = SND_STRETCH_RATIOMIN;
+   double rmax = SND_STRETCH_RATIOMAX;
 
-   pthread_mutex_lock(&ring_lock);
+   if (fillf < targetf * SND_STRETCH_LOWFILL)
+      rmax = SND_STRETCH_RATIOMAX_EMG;
+   if (fillf > SND_STRETCH_HIGHFILL)
+      rmin = SND_STRETCH_RATIOMIN_EMG;
+   if (want > rmax)
+      want = rmax;
+   else if (want < rmin)
+      want = rmin;
 
-   first = fill;
-   if (first > SND_PERIOD_FRAMES)
-      first = SND_PERIOD_FRAMES;
+   soundratio += (want - soundratio) * SND_STRETCH_RATIOSLEW;
+}
 
-   if (first > 0)
+/* Packet-loss concealment for a short ring, ported from the standalone
+   (sndsdl.c MixAudio_Stretch + PlcScore): repeat the last pitch period found in
+   the ring history so a tonal signal continues instead of clicking.  After four
+   consecutive gaps, or when no period is found, fade 64 frames from the last
+   sample and leave the rest silent.  Called with ring_lock held. */
+static double snd_plc_score(u32 pos_f, int P)
+{
+   const int W = 240;
+   double cross = 0.0, en = 1e-9;
+   int k;
+
+   for (k = 0; k < W; k += 2)
+   {
+      u32 ai = (pos_f + SND_RING_FRAMES - 1 - (u32)k) % SND_RING_FRAMES;
+      u32 bi = (pos_f + SND_RING_FRAMES - 1 - (u32)(k + P)) % SND_RING_FRAMES;
+      double b0 = ring[2 * bi], b1 = ring[2 * bi + 1];
+      cross += (double)ring[2 * ai] * b0 + (double)ring[2 * ai + 1] * b1;
+      en    += b0 * b0 + b1 * b1;
+   }
+   return (cross > 0.0) ? (cross * cross) / en : 0.0;
+}
+
+static int snd_plc_run;
+static int snd_plc_lastP;
+
+static void snd_conceal(s16 *dst, u32 from)
+{
+   u32 nframes;
+   int plc_done = 0;
+
+   if (from >= SND_PERIOD_FRAMES)
+      return;
+   nframes = SND_PERIOD_FRAMES - from;
+   snd_plc_run++;
+
+   if (snd_plc_run <= 4 && from > 0)
+   {
+      const int P_MIN = 32, P_MAX = 480;
+      double best = 0.0;
+      int bestP = 0, P;
+
+      if (snd_plc_lastP >= P_MIN && snd_plc_lastP <= P_MAX)
+      {
+         best = snd_plc_score(read_pos, snd_plc_lastP);
+         if (best > 0.0)
+            bestP = snd_plc_lastP;
+      }
+      for (P = P_MIN; P <= P_MAX; P += 4)
+      {
+         double sc = snd_plc_score(read_pos, P);
+         if (sc > best) { best = sc; bestP = P; }
+      }
+      if (bestP > 0)
+      {
+         int lo = bestP - 3, hi = bestP + 3, q;
+         if (lo < P_MIN) lo = P_MIN;
+         if (hi > P_MAX) hi = P_MAX;
+         for (q = lo; q <= hi; q++)
+         {
+            double sc;
+            if (q == bestP) continue;
+            sc = snd_plc_score(read_pos, q);
+            if (sc > best) { best = sc; bestP = q; }
+         }
+      }
+      snd_plc_lastP = bestP;
+      if (bestP > 0)
+      {
+         u32 fi;
+         for (fi = 0; fi < nframes; fi++)
+         {
+            u32 si = (read_pos + SND_RING_FRAMES - (u32)bestP +
+                      (fi % (u32)bestP)) % SND_RING_FRAMES;
+            dst[2 * (from + fi)]     = ring[2 * si];
+            dst[2 * (from + fi) + 1] = ring[2 * si + 1];
+         }
+         if (nframes > 1764)
+         {
+            u32 t;
+            s32 den = (s32)(nframes - 1764);
+            if (den < 1) den = 1;
+            for (t = 1764; t < nframes; t++)
+            {
+               s32 num = (s32)(nframes - 1 - t);
+               dst[2 * (from + t)]     = (s16)((s32)dst[2 * (from + t)] * num / den);
+               dst[2 * (from + t) + 1] = (s16)((s32)dst[2 * (from + t) + 1] * num / den);
+            }
+         }
+         plc_done = 1;
+      }
+   }
+
+   if (!plc_done)
+   {
+      const u32 FADE = 64;
+      s16 fl = 0, fr = 0;
+      u32 fade_n = (nframes < FADE) ? nframes : FADE;
+      u32 fi;
+
+      if (from > 0)
+      {
+         fl = dst[2 * (from - 1)];
+         fr = dst[2 * (from - 1) + 1];
+      }
+      for (fi = 0; fi < fade_n; fi++)
+      {
+         s32 num = (s32)(FADE - 1 - fi);
+         dst[2 * (from + fi)]     = (s16)((s32)fl * num / (s32)(FADE - 1));
+         dst[2 * (from + fi) + 1] = (s16)((s32)fr * num / (s32)(FADE - 1));
+      }
+      for (fi = fade_n; fi < nframes; fi++)
+      {
+         dst[2 * (from + fi)]     = 0;
+         dst[2 * (from + fi) + 1] = 0;
+      }
+   }
+}
+
+/* One output period, resampled by soundratio from the ring.  Caller holds
+   ring_lock.  Always writes SND_PERIOD_FRAMES frames; a ring that cannot feed
+   them is zero-filled (the standalone conceals that with PLC/fade, phase 2).
+   The phase (soundfrac) and the last input frame carry across calls, so the
+   interpolation is continuous instead of restarting at every period. */
+static void snd_render_period(s16 *dst)
+{
+   const double step = 1.0 / soundratio;
+   u32 need, avail, i, k, used;
+   int clamped = 0;
+   double pos = soundfrac;
+
+   need = (u32)((double)SND_PERIOD_FRAMES * step) + 3;
+   if (need > SND_STRETCH_WIN_FRAMES)
+      need = SND_STRETCH_WIN_FRAMES;
+
+   avail = fill;
+   if (avail > need)
+      avail = need;
+
+   if (avail > 0)
    {
       u32 head = SND_RING_FRAMES - read_pos;
+      if (head > avail)
+         head = avail;
+      memcpy(stretch_win, ring + 2 * read_pos, sizeof(s16) * 2 * head);
+      if (avail > head)
+         memcpy(stretch_win + 2 * head, ring, sizeof(s16) * 2 * (avail - head));
+   }
+   if (avail < need)
+      memset(stretch_win + 2 * avail, 0, sizeof(s16) * 2 * (need - avail));
+   if (avail < SND_PERIOD_FRAMES)
+      stat_underrun += SND_PERIOD_FRAMES - avail;
 
-      if (head > first)
-         head = first;
-      memcpy(period_buf, ring + 2 * read_pos, sizeof(s16) * 2 * head);
-      if (first > head)
-         memcpy(period_buf + 2 * head, ring, sizeof(s16) * 2 * (first - head));
+   for (k = 0; k < SND_PERIOD_FRAMES; k++)
+   {
+      u32 idx = (u32)pos;
+      double f = pos - (double)idx;
+      double al, ar;
 
-      read_pos += first;
+      if (idx >= need)
+         idx = need - 1;
+      al = (idx == 0) ? (double)stretch_last[0] : (double)stretch_win[2 * (idx - 1)];
+      ar = (idx == 0) ? (double)stretch_last[1] : (double)stretch_win[2 * (idx - 1) + 1];
+      dst[2 * k]     = (s16)(al + ((double)stretch_win[2 * idx] - al) * f);
+      dst[2 * k + 1] = (s16)(ar + ((double)stretch_win[2 * idx + 1] - ar) * f);
+      pos += step;
+   }
+
+   if (avail < need)
+   {
+      u32 from = (u32)((double)avail * soundratio);
+      if (from > SND_PERIOD_FRAMES)
+         from = SND_PERIOD_FRAMES;
+      snd_conceal(dst, from);
+   }
+   else
+      snd_plc_run = 0;
+
+   used = (u32)pos;
+   if (used > avail)
+   {
+      used = avail;
+      clamped = 1;
+   }
+   if (used > 0)
+   {
+      stretch_last[0] = stretch_win[2 * (used - 1)];
+      stretch_last[1] = stretch_win[2 * (used - 1) + 1];
+      read_pos += used;
       if (read_pos >= SND_RING_FRAMES)
          read_pos -= SND_RING_FRAMES;
-      fill -= first;
-      stat_consumed += first;
+      fill -= used;
+      stat_consumed += used;
    }
-   if (first < SND_PERIOD_FRAMES)
-   {
-      memset(period_buf + 2 * first, 0,
-             sizeof(s16) * 2 * (SND_PERIOD_FRAMES - first));
-      stat_underrun += SND_PERIOD_FRAMES - first;
-   }
+   if (clamped)
+      pos = 0.0;                    /* short ring: the phase is meaningless */
+   else
+      pos -= (double)used;
+   if (pos < 0.0)
+      pos = 0.0;
+   soundfrac = pos;
+
+   snd_regulate();
+}
+
+/* One consumer period: exactly SND_PERIOD_FRAMES frames, resampled from the
+   ring and steered towards the fill target. */
+static void SNDLibretroPeriod(void)
+{
+   pthread_mutex_lock(&ring_lock);
+   if (snd_pause_gate())
+      memset(period_buf, 0, sizeof(s16) * 2 * SND_PERIOD_FRAMES);
+   else
+      snd_render_period(period_buf);
    submit_frames = SND_PERIOD_FRAMES;
-
    pthread_mutex_unlock(&ring_lock);
-
    SNDLibretroLogStats();
 }
 
@@ -217,11 +472,151 @@ static void *SNDLibretroConsumer(void *arg)
 
       /* Outside the ring lock: the front end may block here until its device
          drains, and the SCSP thread must never wait for that. */
-      if (submit_pcm != NULL)
+      if (submit_pcm != NULL && submit_frames > 0)
          submit_pcm(period_buf, submit_frames);
    }
 
    return NULL;
+}
+
+/* Caller holds ring_lock.  Returns 1 when audio must not be handed over: the
+   front end has not run a frame for pause_ms, so whatever is queued belongs to
+   a timeline that has moved on.  On the transition back it drops the backlog
+   once, so playback resumes from the current moment. */
+static int snd_pause_gate(void)
+{
+   u32 dropped, keep;
+
+   if (__atomic_load_n(&resume_pending, __ATOMIC_RELAXED))
+   {
+      /* retro_run came back after a long gap: the old end of the queue is a
+         timeline that has moved on, the newest samples are from this moment.
+         Drop the stale head, keep a small cushion. */
+      __atomic_store_n(&resume_pending, 0, __ATOMIC_RELAXED);
+      dropped = 0;
+      keep = stretch_target ? stretch_target : SND_RESUME_KEEP;
+      if (fill > keep)
+      {
+         dropped = fill - keep;
+         read_pos += dropped;
+         if (read_pos >= SND_RING_FRAMES)
+            read_pos -= SND_RING_FRAMES;
+         fill = keep;
+         stat_stale += dropped;
+      }
+      /* The SCSP keeps producing into its own output buffer while the ring is
+         full; flush that too, otherwise it refills the ring with paused-time
+         audio right after this drop. */
+      ScspFlushOutput();
+      paused = 0;
+      resume_events++;
+      LOG_INFO("audio: resumed, dropped %u stale frames, kept %u", dropped, fill);
+      return 0;
+   }
+   if (SNDLibretroSinceHeartbeatMs() > pause_ms)
+   {
+      if (!paused)
+      {
+         paused = 1;
+         pause_events++;
+         LOG_INFO("audio: paused (%u ms without retro_run), not draining",
+                  SNDLibretroSinceHeartbeatMs());
+      }
+      return 1;
+   }
+   paused = 0;
+   return 0;
+}
+
+/* Async path: one device period per call, the same size the standalone asks
+   SDL for (sndsdl.c:371).  The caller submits it from inside the front end's
+   audio callback, outside ring_lock (that call may block). */
+unsigned SNDLibretroPump(s16 *dst)
+{
+   pthread_mutex_lock(&ring_lock);
+   if (snd_pause_gate())
+   {
+      memset(dst, 0, sizeof(s16) * 2 * SND_PERIOD_FRAMES);
+      pthread_mutex_unlock(&ring_lock);
+      return SND_PERIOD_FRAMES;
+   }
+   snd_render_period(dst);
+   pthread_mutex_unlock(&ring_lock);
+   return SND_PERIOD_FRAMES;
+}
+
+void SNDLibretroDropBacklog(void)
+{
+   pthread_mutex_lock(&ring_lock);
+   read_pos = 0;
+   write_pos = 0;
+   fill = 0;
+   pthread_mutex_unlock(&ring_lock);
+}
+
+static u64 snd_now_us(void)
+{
+   struct timespec t;
+   clock_gettime(CLOCK_MONOTONIC, &t);
+   return (u64)t.tv_sec * 1000000u + (u64)t.tv_nsec / 1000u;
+}
+
+void SNDLibretroHeartbeat(void)
+{
+   u64 now = snd_now_us();
+   s64 prev = __atomic_load_n(&hb_us, __ATOMIC_RELAXED);
+
+   /* A gap longer than the pause threshold means the front end was not running
+      us (menu, pause); the audio queued in between must not be played.  This is
+      detected here because the front end may simply stop calling the audio
+      callback while paused, in which case the pump never runs to notice. */
+   if (prev != 0 && (now - (u64)prev) > (u64)pause_ms * 1000u)
+      __atomic_store_n(&resume_pending, 1, __ATOMIC_RELAXED);
+
+   __atomic_store_n(&hb_us, (s64)now, __ATOMIC_RELAXED);
+}
+
+double SNDLibretroRatio(void)
+{
+   double r;
+
+   pthread_mutex_lock(&ring_lock);
+   r = soundratio;
+   pthread_mutex_unlock(&ring_lock);
+   return r;
+}
+
+unsigned SNDLibretroSinceHeartbeatMs(void)
+{
+   s64 hb = __atomic_load_n(&hb_us, __ATOMIC_RELAXED);
+   if (hb == 0)
+      return 0;
+   return (unsigned)((snd_now_us() - (u64)hb) / 1000u);
+}
+
+int SNDLibretroPaused(void)
+{
+   return __atomic_load_n(&paused, __ATOMIC_RELAXED);
+}
+
+unsigned SNDLibretroPauseEvents(void)  { return __atomic_load_n(&pause_events, __ATOMIC_RELAXED); }
+unsigned SNDLibretroResumeEvents(void) { return __atomic_load_n(&resume_events, __ATOMIC_RELAXED); }
+
+void SNDLibretroSnapshot(u32 *produced, u32 *consumed, u32 *dropped,
+                         u32 *underrun, unsigned *fill_frames)
+{
+   pthread_mutex_lock(&ring_lock);
+   if (produced)
+      *produced = stat_produced;
+   if (consumed)
+      *consumed = stat_consumed;
+   if (dropped)
+      *dropped = stat_dropped;
+   if (underrun)
+      *underrun = stat_underrun;
+   if (fill_frames)
+      *fill_frames = fill;
+   pthread_mutex_unlock(&ring_lock);
 }
 
 int SNDLibretroStart(void (*fn)(const s16 *pcm, unsigned frames))
@@ -274,6 +669,19 @@ static int SNDLibretroInit(void)
    fill = 0;
    stat_ticks = 0;
    stat_produced = stat_consumed = stat_underrun = stat_dropped = 0;
+   stat_stale = 0;
+   __atomic_store_n(&hb_us, 0, __ATOMIC_RELAXED);
+   soundratio = 1.0;
+   soundfrac = 0.0;
+   stretch_last[0] = stretch_last[1] = 0;
+   stretch_target = 735 * SND_STRETCH_TARGET_FIELDS;
+   paused = 0;
+   resume_pending = 0;
+   pause_events = resume_events = 0;
+   {
+      const char *pm = getenv("YAB_AUDIO_PAUSE_MS");
+      pause_ms = (pm != NULL && atoi(pm) > 0) ? (unsigned)atoi(pm) : SND_PAUSE_MS_DEFAULT;
+   }
    pthread_mutex_unlock(&ring_lock);
 
    LOG_INFO("audio: SCSP adapter, ring %u frames (%u ms), %u-frame periods",
@@ -310,6 +718,7 @@ static int SNDLibretroChangeVideoFormat(int vertfreq)
       the consumer period is the device's, not the video format's. */
    pthread_mutex_lock(&ring_lock);
    frames_per_field = (vertfreq > 0) ? (u32)(44100 / vertfreq) : 735;
+   stretch_target = frames_per_field * SND_STRETCH_TARGET_FIELDS;
    read_pos = 0;
    write_pos = 0;
    fill = 0;

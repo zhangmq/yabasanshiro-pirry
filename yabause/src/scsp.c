@@ -6303,6 +6303,17 @@ void ScspExec(){
     YabThreadUSleep(100000);
   }
 }
+#ifdef __LIBRETRO__
+/* libretro only: drop the audio the SCSP produced but could not hand to the
+   sound core because the front end was paused (the ring was full).  Without
+   this the backlog is flushed into the ring as soon as it drains again, so the
+   resume would play audio from the paused timeline. */
+void ScspFlushOutput(void)
+{
+   scspsoundoutleft = 0;
+}
+#endif
+
 void ScspExecAsync() {
   u32 audiosize;
 
