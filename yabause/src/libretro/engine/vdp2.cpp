@@ -195,6 +195,11 @@ static inline unsigned int counter_delta(unsigned int now_val, unsigned int *pre
 
 static int g_vin_decoupled = -1;
 static int vin_render_pending = 0;
+/* Set while the core shuts the machine down: both joins below wait for a retire
+   that only the renderer (retro_run) can produce, and the frontend stops calling
+   retro_run before it joins the machine thread.  Without this the quit from the
+   frontend's menu hung in pthread_join. */
+static volatile int g_join_abort = 0;
 
 /* Temporary probe (remove with the join measurement): how long the machine
    blocks at the two joins, and which DRAWEND site fired.  Vdp2TakeWaitStats
@@ -225,6 +230,7 @@ extern "C" void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
 static void Vdp2JoinPendingVIN(void) {
   if (vin_render_pending) {
     unsigned long t0 = probe_us();
+    if (g_join_abort) { vin_render_pending = 0; return; }
     YabWaitEventQueue(rcv_evqueue);
     g_join_vin_us += (unsigned)(probe_us() - t0);
     g_join_vin_n++;
@@ -299,6 +305,8 @@ static void Vdp1MarkRenderRetired(void) {
 static void Vdp1JoinPendingRenders(void) {
   unsigned long t0 = probe_us();
   int pending = 1;
+  if (g_join_abort)
+    return;
   for (int i = 0; i < 2000; i++) {
     if (vdp1_ev_retired.load(std::memory_order_acquire) >=
         vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
@@ -310,6 +318,8 @@ static void Vdp1JoinPendingRenders(void) {
     pthread_mutex_lock(&vdp1_join_mtx);
     while (vdp1_ev_retired.load(std::memory_order_acquire) <
            vdp1_ev_dispatched.load(std::memory_order_relaxed)) {
+      if (g_join_abort)
+        break;
       pthread_cond_wait(&vdp1_join_cv, &vdp1_join_mtx);
     }
     pthread_mutex_unlock(&vdp1_join_mtx);
@@ -843,6 +853,43 @@ extern "C" void Vdp2SetEventPostedHook(void (*fn)(void)) { g_ev_posted_hook = fn
 static inline void Vdp2NotifyPosted(void) { if (g_ev_posted_hook) g_ev_posted_hook(); }
 extern "C" void Vdp2SetFrontendConsumer(int on) { g_vdp_frontend_consumer = on; }
 
+/* Release every wait the machine can be parked in when the frontend stops
+   driving the renderer (quit, or a save state command that must reach the
+   machine's field boundary).  Counterpart Vdp2AbortJoins(0) restores them. */
+extern "C" void Vdp2AbortJoins(int on)
+{
+  g_join_abort = on;
+  if (!on)
+    return;
+  /* VDP1 draw-end wait (Vdp2HBlankOUT): the token comes from the renderer. */
+  if (vdp1_rcv_evqueue != NULL)
+    YabAddEventQueueNonBlocking(vdp1_rcv_evqueue, 0);
+  if (g_vdp_frontend_consumer) {
+    /* Joins wait on a condvar and on the VIN token, both produced by the
+       renderer; wake them explicitly, a flag alone cannot. */
+    pthread_mutex_lock(&vdp1_join_mtx);
+    pthread_cond_broadcast(&vdp1_join_cv);
+    pthread_mutex_unlock(&vdp1_join_mtx);
+    if (rcv_evqueue != NULL)
+      YabAddEventQueueNonBlocking(rcv_evqueue, 0);
+  }
+}
+
+/* Shutdown/step helper: drop pending dispatch events without rendering them, so
+   a machine thread blocked posting into a full queue can make progress. */
+extern "C" void Vdp2DrainQueueNoRender(void)
+{
+  if (evqueue == NULL)
+    return;
+  while (YaGetQueueSize(evqueue) > 0)
+    YabWaitEventQueue(evqueue);
+}
+
+/* Implemented by libretro.c: poll + publish the pad snapshot for the field that
+   is about to be released to the machine (same point the standalone polls: at
+   the top of its field loop). */
+extern "C" void yab_input_publish(void);
+
 
 static void Vdp2HandleEvent(int evcode) {
     switch(evcode){
@@ -1211,6 +1258,7 @@ void vdp2VBlankIN(void) {
    //   SH2SendInterrupt(SSH2, 0x43, 0x6);
    FrameProfileAdd("VIN flag");
    FRAMELOG("**** VIN(T) *****\n");
+   yab_input_publish();   /* input snapshot belongs to the field released below */
    YabAddEventQueue(rcv_evqueue, 0);
    
 

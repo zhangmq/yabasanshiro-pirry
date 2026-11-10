@@ -75,7 +75,8 @@ SH2Interface_struct *SH2CoreList[] = {
    NULL
 };
 
-PerInterface_struct *PERCoreList[] = { &PERDummy, NULL };
+extern PerInterface_struct PERLIBRETROJoy;
+PerInterface_struct *PERCoreList[] = { &PERDummy, &PERLIBRETROJoy, NULL };
 
 CDInterface *CDCoreList[] = { &DummyCD, &ISOCD, NULL };
 

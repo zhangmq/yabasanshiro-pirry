@@ -57,6 +57,7 @@
 #include "cs0.h"
 #include "osdcore.h"
 #include "peripheral.h"
+#define PERCORE_LIBRETRO 2   /* peripheral core id implemented below */
 #include "ygl.h"
 
 static struct retro_hw_render_callback hw;
@@ -93,6 +94,8 @@ extern void Vdp2SetFrontendConsumer(int on);
 extern void Vdp2SetRenderThreadHere(void);
 extern void Vdp2SetEventPostedHook(void (*fn)(void));
 extern int  Vdp2ConsumeFrontendEvent(void);
+extern void Vdp2AbortJoins(int on);
+extern void Vdp2DrainQueueNoRender(void);
 extern unsigned Vdp2FieldSeq(void);
 extern void EnableAutoFrameSkip(void);
 extern void DisableAutoFrameSkip(void);
@@ -110,21 +113,131 @@ extern void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
 
 static pthread_t machine_thread;
 static volatile int machine_run;
+static volatile int machine_done = 1;
 static int machine_started;
+
+/* ---- machine-thread commands (save state / load state / reset) ------------
+ * The engine's state belongs to the machine thread, while libretro's
+ * serialize/unserialize/reset arrive on the frontend thread.  The command is
+ * queued and executed by the machine at its next field boundary; while waiting,
+ * the frontend thread keeps pumping the VDP event queue, because the machine
+ * may be parked in a join that only that event handling releases. */
+enum { YAB_CMD_NONE = 0, YAB_CMD_SAVE, YAB_CMD_LOAD, YAB_CMD_RESET };
+
+static pthread_mutex_t cmd_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int cmd_type = YAB_CMD_NONE;
+static int cmd_done = 1;
+static int cmd_ok = 0;
+static const void *cmd_load_buf;
+static size_t cmd_load_size;
+static void *cmd_save_buf;
+static size_t cmd_save_size;
+static size_t state_size;          /* stable retro_serialize_size() */
+
+extern int YabSaveStateBuffer(void **buffer, size_t *size);
+extern int YabLoadStateBuffer(const void *buffer, size_t size);
+
+/* Engine work of one command.  Runs on the machine thread normally, and on the
+   frontend thread when no machine thread exists (nothing can race then). */
+static int yab_cmd_exec(int type, const void *load, size_t load_size)
+{
+   int ok = 0;
+   if (type == YAB_CMD_SAVE) {
+      void *buf = NULL;
+      size_t sz = 0;
+      if (YabSaveStateBuffer(&buf, &sz) == 0) {
+         cmd_save_buf = buf;
+         cmd_save_size = sz;
+         ok = 1;
+      } else {
+         free(buf);
+      }
+   } else if (type == YAB_CMD_LOAD) {
+      ok = (YabLoadStateBuffer(load, load_size) == 0) ? 1 : 0;
+   } else if (type == YAB_CMD_RESET) {
+      YabauseReset();
+      ok = 1;
+   }
+   return ok;
+}
+
+/* Machine thread, at the field boundary. */
+static void machine_cmd_step(void)
+{
+   int type;
+   const void *load;
+   size_t n;
+   int ok;
+
+   pthread_mutex_lock(&cmd_mtx);
+   type = cmd_type;
+   load = cmd_load_buf;
+   n = cmd_load_size;
+   pthread_mutex_unlock(&cmd_mtx);
+   if (type == YAB_CMD_NONE)
+      return;
+   ok = yab_cmd_exec(type, load, n);
+   pthread_mutex_lock(&cmd_mtx);
+   cmd_ok = ok;
+   cmd_type = YAB_CMD_NONE;
+   cmd_done = 1;
+   pthread_mutex_unlock(&cmd_mtx);
+}
+
+/* Frontend thread. */
+static int yab_cmd_wait(int type, const void *load, size_t load_size)
+{
+   int ok;
+   if (!machine_started)
+      return yab_cmd_exec(type, load, load_size);
+   pthread_mutex_lock(&cmd_mtx);
+   cmd_load_buf = load;
+   cmd_load_size = load_size;
+   cmd_ok = 0;
+   cmd_done = 0;
+   cmd_type = type;
+   pthread_mutex_unlock(&cmd_mtx);
+   for (;;) {
+      int done;
+      pthread_mutex_lock(&cmd_mtx);
+      done = cmd_done;
+      pthread_mutex_unlock(&cmd_mtx);
+      if (done)
+         break;
+      /* Keep the renderer alive: the machine may be blocked in a join waiting
+         for this very thread to consume a VDP event. */
+      while (Vdp2ConsumeFrontendEvent()) { }
+      usleep(200);
+   }
+   pthread_mutex_lock(&cmd_mtx);
+   ok = cmd_ok;
+   pthread_mutex_unlock(&cmd_mtx);
+   return ok;
+}
 
 static void *machine_main(void *arg)
 {
    (void)arg;
+   machine_done = 0;
    while (machine_run) {
       struct timespec m0, m1;
+      machine_cmd_step();   /* save/load/reset run at the field boundary */
+      if (!machine_run)
+         break;
       clock_gettime(CLOCK_MONOTONIC, &m0);
-      YabauseExec();
+      /* One machine frame through the peripheral core: PERDummy just runs
+         YabauseExec(), PERLIBRETRO applies the published pad state first. */
+      if (PERCore != NULL)
+         PERCore->HandleEvents();
+      else
+         YabauseExec();
       clock_gettime(CLOCK_MONOTONIC, &m1);
       pthread_mutex_lock(&st_mtx);
       acc_machine_ms += (m1.tv_sec - m0.tv_sec) * 1e3 + (m1.tv_nsec - m0.tv_nsec) / 1e6;
       acc_machine_n++;
       pthread_mutex_unlock(&st_mtx);
    }
+   machine_done = 1;
    return NULL;
 }
 
@@ -343,7 +456,7 @@ void LibretroEngineContextReset(void)
       yinit.vidcoretype     = VIDCORE_OGL;
       yinit.sndcoretype     = SNDCORE_LIBRETRO;   /* SCSP thread -> retro_run -> audio_batch_cb */
       yinit.m68kcoretype    = M68KCORE_MUSASHI;
-      yinit.percoretype     = PERCORE_DUMMY;
+      yinit.percoretype     = PERCORE_LIBRETRO;   /* pad on port 1, see PERLIBRETROJoy */
       yinit.carttype        = CART_DRAM32MBIT;
       yinit.clocksync       = 0;
       yinit.use_new_scsp    = 1;
@@ -452,14 +565,33 @@ void LibretroEngineContextDestroy(void)
 {
    if (!engine_up) return;
    if (machine_started) {
+      /* The machine can be parked in a join or in a full event queue whose only
+         consumer is this thread: release both before joining, otherwise the
+         quit from the frontend's menu hangs in pthread_join. */
+      Vdp2AbortJoins(1);
       machine_run = 0;
+      {
+         int spins = 0;
+         while (!machine_done && spins++ < 5000) {
+            Vdp2DrainQueueNoRender();
+            usleep(1000);
+         }
+      }
       pthread_join(machine_thread, NULL);
       machine_started = 0;
+      machine_done = 1;
+      Vdp2AbortJoins(0);
    }
    SNDLibretroStop();
    LOG_INFO("engine: YabauseDeInit");
    YabauseDeInit();
    engine_up = 0;
+   state_size = 0;
+   free(cmd_save_buf);
+   cmd_save_buf = NULL;
+   cmd_save_size = 0;
+   cmd_type = YAB_CMD_NONE;
+   cmd_done = 1;
 }
 
 static void core_log_sink(int level, const char *line)
@@ -594,6 +726,282 @@ RETRO_API void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { aud
 RETRO_API void retro_set_input_poll(retro_input_poll_t cb) { input_poll_cb = cb; }
 RETRO_API void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
 
+/* ---------------------------------------------------------------------------
+ * Libretro peripheral core: the Saturn pad side of the libretro input API.
+ *
+ * PERDummy never adds a pad, so PORTDATA stays empty and the SMPC hands the
+ * guest a port status that is neither F0 (not connected) nor F1 (directly
+ * connected).  The standalone builds this from its SDL layer, but this core
+ * must not depend on one frontend, so the state comes from the protocol:
+ *
+ *   retro_set_controller_port_device()      -> pad_type[port]
+ *   RETRO_ENVIRONMENT_GET_INPUT_MAX_USERS   -> how many ports to expose
+ *   RETRO_ENVIRONMENT_GET_INPUT_BITMASKS    -> MASK query or per-button loop
+ *   RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS -> 13 Saturn buttons, all ports
+ *
+ * Input is polled exactly once per retro_run (frontend thread, as the libretro
+ * contract requires) and published as a per-port snapshot; the machine thread
+ * only reads that snapshot and applies it to the engine.  No libretro callback
+ * runs off the retro_run thread, and the engine's peripheral state is only
+ * touched by the machine thread at the top of its frame, so a controller change
+ * cannot race the SMPC's INTBACK.
+ * ------------------------------------------------------------------------- */
+#define YAB_MAX_PORTS 12
+static int pad_type[YAB_MAX_PORTS];          /* what the machine applies */
+static int pad_type_pending[YAB_MAX_PORTS];  /* what the frontend asked for */
+static volatile int pad_cfg_dirty = 1;
+static unsigned players = 2;
+static int libretro_supports_bitmasks = 0;
+
+typedef struct {
+   u16 joypad;           /* RETRO_DEVICE_ID_JOYPAD_* bits */
+   int analog[4];
+   int trig_l2, trig_r2;
+} yab_input_port_t;
+static yab_input_port_t yab_input_buf[2][YAB_MAX_PORTS];
+static volatile int yab_input_cur = -1;   /* index of the last COMPLETE snapshot */
+static int yab_in_run = 0;                /* set while retro_run is on the stack */
+
+static const struct { unsigned id; u8 key; } kPadKeys[] = {
+   { RETRO_DEVICE_ID_JOYPAD_UP,    PERPAD_UP },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,  PERPAD_DOWN },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,  PERPAD_LEFT },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT, PERPAD_RIGHT },
+   { RETRO_DEVICE_ID_JOYPAD_Y,     PERPAD_X },
+   { RETRO_DEVICE_ID_JOYPAD_B,     PERPAD_A },
+   { RETRO_DEVICE_ID_JOYPAD_A,     PERPAD_B },
+   { RETRO_DEVICE_ID_JOYPAD_X,     PERPAD_Y },
+   { RETRO_DEVICE_ID_JOYPAD_L,     PERPAD_LEFT_TRIGGER },
+   { RETRO_DEVICE_ID_JOYPAD_R,     PERPAD_RIGHT_TRIGGER },
+   { RETRO_DEVICE_ID_JOYPAD_START, PERPAD_START },
+   { RETRO_DEVICE_ID_JOYPAD_L2,    PERPAD_Z },
+   { RETRO_DEVICE_ID_JOYPAD_R2,    PERPAD_C },
+};
+#define PADKEY_NB ((unsigned)(sizeof(kPadKeys) / sizeof(kPadKeys[0])))
+
+/* Frontend thread, at load time: negotiate the protocol, reset the port map. */
+static void yab_input_ports_init(void)
+{
+   unsigned i;
+   unsigned max_users = 0;
+   bool bitmasks = false;
+
+   for (i = 0; i < YAB_MAX_PORTS; i++) {
+      pad_type[i] = RETRO_DEVICE_JOYPAD;
+      pad_type_pending[i] = RETRO_DEVICE_JOYPAD;
+   }
+   if (environ_cb != NULL &&
+       environ_cb(RETRO_ENVIRONMENT_GET_INPUT_MAX_USERS, &max_users) && max_users > 0)
+      players = (max_users > YAB_MAX_PORTS) ? YAB_MAX_PORTS : max_users;
+   else
+      players = 2;   /* not reported: assume the engine's two ports */
+   if (environ_cb != NULL && environ_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, &bitmasks))
+      libretro_supports_bitmasks = bitmasks ? 1 : 0;
+   pad_cfg_dirty = 1;
+}
+
+/* Frontend thread, at load time: descriptors so any frontend can map the pad. */
+static void yab_input_descriptors(void)
+{
+   static const struct { unsigned id; const char *name; } d[] = {
+      { RETRO_DEVICE_ID_JOYPAD_UP,    "Up"    },
+      { RETRO_DEVICE_ID_JOYPAD_DOWN,  "Down"  },
+      { RETRO_DEVICE_ID_JOYPAD_LEFT,  "Left"  },
+      { RETRO_DEVICE_ID_JOYPAD_RIGHT, "Right" },
+      { RETRO_DEVICE_ID_JOYPAD_Y,     "X"     },
+      { RETRO_DEVICE_ID_JOYPAD_B,     "A"     },
+      { RETRO_DEVICE_ID_JOYPAD_A,     "B"     },
+      { RETRO_DEVICE_ID_JOYPAD_X,     "Y"     },
+      { RETRO_DEVICE_ID_JOYPAD_L,     "L"     },
+      { RETRO_DEVICE_ID_JOYPAD_R,     "R"     },
+      { RETRO_DEVICE_ID_JOYPAD_START, "Start" },
+      { RETRO_DEVICE_ID_JOYPAD_L2,    "Z"     },
+      { RETRO_DEVICE_ID_JOYPAD_R2,    "C"     },
+   };
+   static struct retro_input_descriptor desc[2 * (sizeof(d) / sizeof(d[0])) + 1];
+   const unsigned nb = (unsigned)(sizeof(d) / sizeof(d[0]));
+   unsigned p, i;
+
+   memset(desc, 0, sizeof(desc));
+   for (p = 0; p < 2; p++)
+      for (i = 0; i < nb; i++) {
+         desc[p * nb + i].port = p;
+         desc[p * nb + i].device = RETRO_DEVICE_JOYPAD;
+         desc[p * nb + i].index = 0;
+         desc[p * nb + i].id = d[i].id;
+         desc[p * nb + i].description = d[i].name;
+      }
+   if (environ_cb != NULL)
+      environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, desc);
+}
+
+/* Frontend thread: read the callback once per frame and publish the snapshot.
+   The poll itself happens in retro_run, before this. */
+void yab_input_publish(void)
+{
+   int cur, next;
+   unsigned i, id;
+
+   if (!yab_in_run)
+      return;
+   cur = yab_input_cur;
+   next = (cur == 0) ? 1 : 0;
+   for (i = 0; i < players && i < YAB_MAX_PORTS; i++) {
+      yab_input_port_t *p = &yab_input_buf[next][i];
+      p->joypad = 0;
+      p->analog[0] = p->analog[1] = p->analog[2] = p->analog[3] = 0;
+      p->trig_l2 = p->trig_r2 = 0;
+      if (input_state_cb == NULL)
+         continue;
+      if (libretro_supports_bitmasks) {
+         p->joypad = (u16)input_state_cb(i, RETRO_DEVICE_JOYPAD, 0,
+                                         RETRO_DEVICE_ID_JOYPAD_MASK);
+      } else {
+         for (id = 0; id < 16; id++)
+            if (input_state_cb(i, RETRO_DEVICE_JOYPAD, 0, id))
+               p->joypad |= (u16)(1u << id);
+      }
+      if (pad_type_pending[i] == RETRO_DEVICE_ANALOG) {
+         int l2, r2;
+         p->analog[0] = input_state_cb(i, RETRO_DEVICE_ANALOG,
+               RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+         p->analog[1] = input_state_cb(i, RETRO_DEVICE_ANALOG,
+               RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+         p->analog[2] = input_state_cb(i, RETRO_DEVICE_ANALOG,
+               RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+         p->analog[3] = input_state_cb(i, RETRO_DEVICE_ANALOG,
+               RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+         l2 = input_state_cb(i, RETRO_DEVICE_ANALOG,
+               RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_L2);
+         r2 = input_state_cb(i, RETRO_DEVICE_ANALOG,
+               RETRO_DEVICE_INDEX_ANALOG_BUTTON, RETRO_DEVICE_ID_JOYPAD_R2);
+         if (l2 == 0) l2 = (p->joypad & (1u << RETRO_DEVICE_ID_JOYPAD_L2)) ? 0x7FFF : 0;
+         if (r2 == 0) r2 = (p->joypad & (1u << RETRO_DEVICE_ID_JOYPAD_R2)) ? 0x7FFF : 0;
+         p->trig_l2 = l2;
+         p->trig_r2 = r2;
+      }
+   }
+   __atomic_store_n(&yab_input_cur, next, __ATOMIC_RELEASE);
+}
+
+/* Machine thread: read the last complete snapshot, never a libretro callback. */
+static int input_state_cb_wrapper(unsigned port, unsigned device, unsigned index, unsigned id)
+{
+   const yab_input_port_t *p;
+   int cur = __atomic_load_n(&yab_input_cur, __ATOMIC_ACQUIRE);
+
+   if (cur < 0 || port >= YAB_MAX_PORTS)
+      return 0;
+   p = &yab_input_buf[cur][port];
+   if (device == RETRO_DEVICE_JOYPAD)
+      return (id < 16) ? ((p->joypad >> id) & 1) : 0;
+   if (device == RETRO_DEVICE_ANALOG) {
+      if (index == RETRO_DEVICE_INDEX_ANALOG_LEFT) {
+         if (id == RETRO_DEVICE_ID_ANALOG_X) return p->analog[0];
+         if (id == RETRO_DEVICE_ID_ANALOG_Y) return p->analog[1];
+      } else if (index == RETRO_DEVICE_INDEX_ANALOG_RIGHT) {
+         if (id == RETRO_DEVICE_ID_ANALOG_X) return p->analog[2];
+         if (id == RETRO_DEVICE_ID_ANALOG_Y) return p->analog[3];
+      } else if (index == RETRO_DEVICE_INDEX_ANALOG_BUTTON) {
+         if (id == RETRO_DEVICE_ID_JOYPAD_L2) return p->trig_l2;
+         if (id == RETRO_DEVICE_ID_JOYPAD_R2) return p->trig_r2;
+      }
+   }
+   return 0;
+}
+
+/* Machine thread: rebuild the engine's port layout from pad_type_pending. */
+static void PERLIBRETROApplyConfig(void)
+{
+   unsigned i, j;
+   PortData_struct *portdata;
+   void *controller;
+
+   for (i = 0; i < YAB_MAX_PORTS; i++)
+      pad_type[i] = pad_type_pending[i];
+   PerPortReset();
+   for (i = 0; i < players && i < YAB_MAX_PORTS; i++) {
+      /* Two physical ports; more than two peripherals need the multitap slot.
+         Same split as the standalone's key map setup. */
+      portdata = ((players > 2 && i < 6) || i == 0) ? &PORTDATA1 : &PORTDATA2;
+      switch (pad_type[i]) {
+         case RETRO_DEVICE_NONE:
+            continue;
+         case RETRO_DEVICE_ANALOG:
+            controller = (void *)Per3DPadAdd(portdata);
+            for (j = PERPAD_UP; j <= PERPAD_Z; j++)
+               PerSetKey((i << 8) + j, (u8)j, controller);
+            for (j = PERANALOG_AXIS1; j <= PERANALOG_AXIS7; j++)
+               PerSetKey((i << 8) + j, (u8)j, controller);
+            break;
+         default:
+            controller = (void *)PerPadAdd(portdata);
+            for (j = PERPAD_UP; j <= PERPAD_Z; j++)
+               PerSetKey((i << 8) + j, (u8)j, controller);
+            break;
+      }
+   }
+   pad_cfg_dirty = 0;
+}
+
+static int PERLIBRETROInit(void)
+{
+   pad_cfg_dirty = 1;   /* the machine thread builds the pads on its first frame */
+   return 0;
+}
+
+static int PERLIBRETROHandleEvents(void)
+{
+   unsigned i, k;
+
+   if (pad_cfg_dirty)
+      PERLIBRETROApplyConfig();
+   for (i = 0; i < players && i < YAB_MAX_PORTS; i++) {
+      if (pad_type[i] == RETRO_DEVICE_NONE)
+         continue;
+      for (k = 0; k < PADKEY_NB; k++) {
+         if (input_state_cb_wrapper(i, RETRO_DEVICE_JOYPAD, 0, kPadKeys[k].id))
+            PerKeyDown((i << 8) + kPadKeys[k].key);
+         else
+            PerKeyUp((i << 8) + kPadKeys[k].key);
+      }
+      if (pad_type[i] == RETRO_DEVICE_ANALOG) {
+         int lx = input_state_cb_wrapper(i, RETRO_DEVICE_ANALOG,
+                     RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_X);
+         int ly = input_state_cb_wrapper(i, RETRO_DEVICE_ANALOG,
+                     RETRO_DEVICE_INDEX_ANALOG_LEFT, RETRO_DEVICE_ID_ANALOG_Y);
+         int rx = input_state_cb_wrapper(i, RETRO_DEVICE_ANALOG,
+                     RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+         int ry = input_state_cb_wrapper(i, RETRO_DEVICE_ANALOG,
+                     RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+         PerAxisValue((i << 8) + PERANALOG_AXIS1, (u8)((lx + 0x8000) >> 8));
+         PerAxisValue((i << 8) + PERANALOG_AXIS2, (u8)((ly + 0x8000) >> 8));
+         PerAxisValue((i << 8) + PERANALOG_AXIS3, (u8)((rx + 0x8000) >> 8));
+         PerAxisValue((i << 8) + PERANALOG_AXIS4, (u8)((ry + 0x8000) >> 8));
+      }
+   }
+   if (YabauseExec() != 0)
+      return -1;
+   return 0;
+}
+
+void PERLIBRETRODeInit(void) {}
+void PERLIBRETRONothing(void) {}
+u32  PERLIBRETROScan(u32 flags) { (void)flags; return 0; }
+void PERLIBRETROKeyName(u32 key, char *name, int size) { (void)key; if (size > 0) name[0] = '\0'; }
+
+PerInterface_struct PERLIBRETROJoy = {
+   PERCORE_LIBRETRO,
+   "Libretro Input Interface",
+   PERLIBRETROInit,
+   PERLIBRETRODeInit,
+   PERLIBRETROHandleEvents,
+   PERLIBRETROScan,
+   0,
+   PERLIBRETRONothing,
+   PERLIBRETROKeyName
+};
+
 RETRO_API void retro_init(void)
 {
    frame_count = 0;
@@ -607,6 +1015,10 @@ RETRO_API void retro_init(void)
 RETRO_API void retro_deinit(void)
 {
    LOG_INFO("placeholder core deinit after %u frames", frame_count);
+   LibretroEngineContextDestroy();
+   yab_in_run = 0;
+   yab_input_cur = -1;
+   pad_cfg_dirty = 1;
    free(frame_buf);
    free(audio_buf);
    frame_buf = NULL;
@@ -645,20 +1057,32 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 
 RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
 {
-   (void)port;
-   (void)device;
+   /* Frontend thread.  Only record the request; the machine thread applies it
+      at the top of its next frame (the engine's peripheral tables belong to
+      that thread).  Unsupported device types fall back to the RetroPad. */
+   if (port >= YAB_MAX_PORTS)
+      return;
+   if (device != RETRO_DEVICE_NONE && device != RETRO_DEVICE_JOYPAD &&
+       device != RETRO_DEVICE_ANALOG)
+      device = RETRO_DEVICE_JOYPAD;
+   pad_type_pending[port] = (int)device;
+   pad_cfg_dirty = 1;
 }
 
 RETRO_API void retro_reset(void)
 {
-   /* frame_count is a diagnostic counter since retro_init(), not emulated time. */
-   LOG_INFO("placeholder core reset");
+   /* The engine reset runs on the machine thread at its field boundary. */
+   if (engine_up)
+      (void)yab_cmd_wait(YAB_CMD_RESET, NULL, 0);
 }
 
 RETRO_API void retro_run(void)
 {
+   /* libretro contract: poll at least once per retro_run, on this thread.  The
+      input snapshot is published from the engine's VIN handler (vdp2.cpp). */
    if (input_poll_cb != NULL)
       input_poll_cb();
+   yab_in_run = 1;
 
    if (engine_up) {
       Vdp2SetRenderThreadHere();   /* this thread renders now, not VdpProc */
@@ -777,25 +1201,65 @@ RETRO_API void retro_run(void)
    if (frame_count % FRAME_LOG_INTERVAL == 0)
       LOG_INFO("run=%u ready=%u sent=%u drained=%u none=%u vin=%u",
                frame_count, frame_ready, frame_sent, drained_total, drained_none, engine_up);
+   yab_in_run = 0;
 }
 
+/* retro_serialize_size() must stay constant for the lifetime of a loaded game:
+   probe once, then report that size (plus slack, so a later field cannot need
+   more than the frontend allocated). */
 RETRO_API size_t retro_serialize_size(void)
 {
-   return 0;
+   if (!engine_up)
+      return 0;
+   if (state_size == 0) {
+      if (yab_cmd_wait(YAB_CMD_SAVE, NULL, 0) && cmd_save_buf != NULL)
+         state_size = cmd_save_size + (2u << 20);
+      free(cmd_save_buf);
+      cmd_save_buf = NULL;
+      cmd_save_size = 0;
+   }
+   return state_size;
 }
 
 RETRO_API bool retro_serialize(void *data, size_t size)
 {
-   (void)data;
-   (void)size;
-   return false;
+   if (!engine_up || data == NULL)
+      return false;
+   if (state_size == 0)
+      (void)retro_serialize_size();
+   if (!yab_cmd_wait(YAB_CMD_SAVE, NULL, 0) || cmd_save_buf == NULL) {
+      free(cmd_save_buf);
+      cmd_save_buf = NULL;
+      cmd_save_size = 0;
+      return false;
+   }
+   if (cmd_save_size < 0x14 || cmd_save_size > size) {
+      free(cmd_save_buf);
+      cmd_save_buf = NULL;
+      cmd_save_size = 0;
+      return false;
+   }
+   memcpy(data, cmd_save_buf, cmd_save_size);
+   if (size > cmd_save_size)
+      memset((uint8_t *)data + cmd_save_size, 0, size - cmd_save_size);
+   /* YabLoadStateStream() requires header.size == (bytes - 0x14); the frontend
+      allocated exactly the size we reported, so rewrite that field for the
+      padded buffer (the engine's own value is the unpadded payload size). */
+   {
+      uint32_t payload = (uint32_t)(size - 0x14);
+      memcpy((uint8_t *)data + 8, &payload, sizeof(payload));
+   }
+   free(cmd_save_buf);
+   cmd_save_buf = NULL;
+   cmd_save_size = 0;
+   return true;
 }
 
 RETRO_API bool retro_unserialize(const void *data, size_t size)
 {
-   (void)data;
-   (void)size;
-   return false;
+   if (!engine_up || data == NULL || size == 0)
+      return false;
+   return yab_cmd_wait(YAB_CMD_LOAD, data, size) ? true : false;
 }
 
 RETRO_API void retro_cheat_reset(void) {}
@@ -816,6 +1280,11 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       LOG_INFO("load_game: no content (placeholder)");
    }
 
+   /* libretro input protocol: ports, bitmask capability, descriptors. */
+   yab_input_ports_init();
+   yab_input_descriptors();
+
+
    return true;
 }
 
@@ -831,6 +1300,9 @@ RETRO_API bool retro_load_game_special(unsigned game_type, const struct retro_ga
 RETRO_API void retro_unload_game(void)
 {
    LOG_INFO("unload_game");
+   /* The frontend usually ran hw.context_destroy first; this call is idempotent
+      and also covers frontends that only call unload_game. */
+   LibretroEngineContextDestroy();
 }
 
 RETRO_API unsigned retro_get_region(void)
