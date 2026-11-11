@@ -108,10 +108,6 @@ extern int  g_scsp_dsp_off;      /* scsp.c:163 defaults to 1 = SCSP DSP off   */
 extern int  g_texcache_persist;  /* yglcache.c:49 defaults to 0               */
 extern int  g_emulated_bios;   /* port_stubs.c: 0 when a real BIOS is used */
 extern void YabauseSetDecilineMode(int on);
-/* Temporary probe: how long the two joins actually block (see DESIGN note). */
-extern void Vdp2TakeWaitStats(unsigned *vin_n, unsigned *vin_us,
-                              unsigned *rnd_n, unsigned *rnd_us,
-                              unsigned *drawend_machine_n, unsigned *drawend_side_n);
 
 static pthread_t machine_thread;
 static volatile int machine_run;
@@ -404,18 +400,6 @@ void LibretroPresentFrame(void)
       Only record it here: video_cb must run outside the engine stack, where the
       frontend can safely draw its own present/HUD/swap on this context. */
    frame_ready++;
-   if ((frame_ready % 120) == 1 && hw.get_current_framebuffer) {
-      unsigned char px[4 * 16];
-      GLint prev = 0;
-      unsigned sum = 0, i;
-      glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prev);
-      glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)(uintptr_t)hw.get_current_framebuffer());
-      glReadPixels(0, 0, 4, 4, GL_RGBA, GL_UNSIGNED_BYTE, px);
-      for (i = 0; i < sizeof(px); i++) sum += px[i];
-      glBindFramebuffer(GL_FRAMEBUFFER, (GLuint)prev);
-      LOG_INFO("fbo readback #%u: sum=%u px0=%u,%u,%u,%u err=0x%x", frame_ready, sum,
-               px[0], px[1], px[2], px[3], (unsigned)glGetError());
-   }
 }
 
 static void log_gl_state(const char *tag)
@@ -424,7 +408,7 @@ static void log_gl_state(const char *tag)
    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &fbo);
    glGetIntegerv(GL_CURRENT_PROGRAM, &prog);
    glGetIntegerv(GL_VERTEX_ARRAY_BINDING, &vao);
-   LOG_INFO("gl[%s]: fbo=%d program=%d vao=%d err=0x%x", tag, fbo, prog, vao,
+   LOG_DEBUG("gl[%s]: fbo=%d program=%d vao=%d err=0x%x", tag, fbo, prog, vao,
             (unsigned)glGetError());
 }
 
@@ -440,54 +424,6 @@ static void reset_gl_state_for_frontend(const char *tag)
    glDisable(GL_STENCIL_TEST);
    glActiveTexture(GL_TEXTURE0);
    log_gl_state(tag);
-}
-
-/* CD read trace (env YAB_CDTRACE=1): one line per sector the CD block delivers,
-   so the movie/file reads can be compared with the standalone.  Called from
-   cs2.c inside the libretro build only. */
-void LibretroCdTrace(unsigned int fad, int ret, int isaudio,
-                     unsigned status, unsigned ptiming, unsigned pcycles)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *e = getenv("YAB_CDTRACE");
-      on = (e != NULL && e[0] == '1') ? 1 : 0;
-   }
-   if (!on) return;
-   LOG_INFO("cd: fad=%u ret=%d audio=%d status=%02x pt=%u pc=%u",
-            fad, ret, isaudio, status, ptiming, pcycles);
-}
-
-/* CD command trace (env YAB_CDCMD=1): one line when a command is executed and one
-   with the result registers, so the command stream can be compared with the
-   standalone.  Called from cs2.c inside the libretro build only. */
-void LibretroCdCmdTrace(unsigned cmd, unsigned fad, unsigned a, unsigned b,
-                        unsigned c, unsigned d, int done)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *e = getenv("YAB_CDCMD");
-      on = (e != NULL && e[0] == '1') ? 1 : 0;
-   }
-   if (!on) return;
-   if (!done)
-      LOG_INFO("cdcmd: cmd=%02x fad=%u cr2=%04x cr3=%04x cr4=%04x status=%04x",
-               cmd, fad, a, b, c, d);
-   else
-      LOG_INFO("cdcmd: done cmd=%02x cr1=%04x cr2=%04x cr3=%04x hirq=%04x",
-               cmd, a, b, c, d);
-}
-
-/* CD data-delivery trace (env YAB_CDDATA=1), called from cs2.c. */
-void LibretroCdDataTrace(const char *what, unsigned a, unsigned b, unsigned c, unsigned e)
-{
-   static int on = -1;
-   if (on < 0) {
-      const char *en = getenv("YAB_CDDATA");
-      on = (en != NULL && en[0] == '1') ? 1 : 0;
-   }
-   if (!on) return;
-   LOG_INFO("cddata: %s %u %u %u %u", what, a, b, c, e);
 }
 
 void *LibretroFrontFbo(void)
@@ -758,8 +694,17 @@ void LibretroEngineContextDestroy(void)
 
 static void core_log_sink(int level, const char *line)
 {
-   if (frontend_log != NULL)
+   if (frontend_log != NULL) {
+      /* The log layer already decided this line passes LOG_LEVEL, and the text
+         carries its own severity ("[debug] ...").  Forward debug lines as INFO
+         because front ends may drop the DEBUG level outright: minarch's
+         LOG_note() prints LOG_DEBUG only in a DEBUG build of minarch itself, so
+         a release minarch would swallow every debug line even though
+         LOG_LEVEL=debug says we want them. */
+      if ((int)level == (int)RETRO_LOG_DEBUG)
+         level = (int)RETRO_LOG_INFO;
       frontend_log((enum retro_log_level)level, "%s", line);
+   }
 }
 
 static void render_test_card(void)
@@ -1353,14 +1298,6 @@ RETRO_API void retro_run(void)
                acc_calls = acc_machine_n = 0;
             }
             {
-               /* Temporary probe: how long the machine actually blocks at the two
-                  joins, and which DRAWEND path fired.  Remove with the probe. */
-               unsigned vn, vu, rn, ru, dm, ds;
-               Vdp2TakeWaitStats(&vn, &vu, &rn, &ru, &dm, &ds);
-               LOG_INFO("join: vin_n=%u vin_ms=%.2f rnd_n=%u rnd_ms=%.2f drawend machine=%u render=%u",
-                        vn, vu / 1000.0, rn, ru / 1000.0, dm, ds);
-            }
-            {
                /* Audio, once per second: which path is live, what the submit
                   costs on the thread that owns it, and the ring balance.  In
                   async mode calls/frames come from the front end's audio
@@ -1384,7 +1321,6 @@ RETRO_API void retro_run(void)
                         p - lp, c - lc, d - ld, pe - lpe, re - lre);
                lp = p; lc = c; ld = d; lu = u;
                lpe = pe; lre = re;
-               lp = p; lc = c; ld = d;
                aud_calls = aud_short = 0;
                aud_wmax = 0;
                aud_wmin = 0xFFFFFFFFu;
@@ -1398,8 +1334,8 @@ RETRO_API void retro_run(void)
    }
 
    if (frame_count % FRAME_LOG_INTERVAL == 0)
-      LOG_INFO("run=%u ready=%u sent=%u drained=%u none=%u vin=%u",
-               frame_count, frame_ready, frame_sent, drained_total, drained_none, engine_up);
+      LOG_DEBUG("run=%u ready=%u sent=%u drained=%u none=%u vin=%u",
+                frame_count, frame_ready, frame_sent, drained_total, drained_none, engine_up);
    yab_in_run = 0;
 }
 
