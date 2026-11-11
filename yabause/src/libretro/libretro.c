@@ -34,6 +34,7 @@
  */
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -54,6 +55,7 @@
 #include "sndlibretro.h"
 #include "m68kcore.h"
 #include "cdbase.h"
+#include "cs2.h"      /* Cs2ForceOpenTray / Cs2ForceCloseTray (disk control) */
 #include "cs0.h"
 #include "osdcore.h"
 #include "peripheral.h"
@@ -122,7 +124,9 @@ static int machine_started;
  * queued and executed by the machine at its next field boundary; while waiting,
  * the frontend thread keeps pumping the VDP event queue, because the machine
  * may be parked in a join that only that event handling releases. */
-enum { YAB_CMD_NONE = 0, YAB_CMD_SAVE, YAB_CMD_LOAD, YAB_CMD_RESET };
+enum { YAB_CMD_NONE = 0, YAB_CMD_SAVE, YAB_CMD_LOAD, YAB_CMD_RESET, YAB_CMD_DISC };
+
+#define YAB_PATH_MAX 512
 
 static pthread_mutex_t cmd_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int cmd_type = YAB_CMD_NONE;
@@ -133,13 +137,17 @@ static size_t cmd_load_size;
 static void *cmd_save_buf;
 static size_t cmd_save_size;
 static size_t state_size;          /* stable retro_serialize_size() */
+/* YAB_CMD_DISC payload: open the tray (path unused), or close it on this image. */
+static int cmd_disc_eject;
+static char cmd_disc_path[YAB_PATH_MAX];
 
 extern int YabSaveStateBuffer(void **buffer, size_t *size);
 extern int YabLoadStateBuffer(const void *buffer, size_t size);
 
 /* Engine work of one command.  Runs on the machine thread normally, and on the
    frontend thread when no machine thread exists (nothing can race then). */
-static int yab_cmd_exec(int type, const void *load, size_t load_size)
+static int yab_cmd_exec(int type, const void *load, size_t load_size,
+                        int disc_eject, const char *disc_path)
 {
    int ok = 0;
    if (type == YAB_CMD_SAVE) {
@@ -157,6 +165,15 @@ static int yab_cmd_exec(int type, const void *load, size_t load_size)
    } else if (type == YAB_CMD_RESET) {
       YabauseReset();
       ok = 1;
+   } else if (type == YAB_CMD_DISC) {
+      /* The CD block belongs to the machine thread (Cs2Exec runs there), so the
+         tray moves from here; closing it re-opens the ISO core on that image. */
+      if (disc_eject) {
+         Cs2ForceOpenTray();
+         ok = 1;
+      } else if (disc_path != NULL && disc_path[0] != '\0') {
+         ok = (Cs2ForceCloseTray(CDCORE_ISO, disc_path) == 0) ? 1 : 0;
+      }
    }
    return ok;
 }
@@ -168,15 +185,19 @@ static void machine_cmd_step(void)
    const void *load;
    size_t n;
    int ok;
+   int eject;
+   char path[YAB_PATH_MAX];
 
    pthread_mutex_lock(&cmd_mtx);
    type = cmd_type;
    load = cmd_load_buf;
    n = cmd_load_size;
+   eject = cmd_disc_eject;
+   snprintf(path, sizeof(path), "%s", cmd_disc_path);
    pthread_mutex_unlock(&cmd_mtx);
    if (type == YAB_CMD_NONE)
       return;
-   ok = yab_cmd_exec(type, load, n);
+   ok = yab_cmd_exec(type, load, n, eject, path);
    pthread_mutex_lock(&cmd_mtx);
    cmd_ok = ok;
    cmd_type = YAB_CMD_NONE;
@@ -185,14 +206,20 @@ static void machine_cmd_step(void)
 }
 
 /* Frontend thread. */
-static int yab_cmd_wait(int type, const void *load, size_t load_size)
+static int yab_cmd_wait_ex(int type, const void *load, size_t load_size,
+                           int disc_eject, const char *disc_path)
 {
    int ok;
    if (!machine_started)
-      return yab_cmd_exec(type, load, load_size);
+      return yab_cmd_exec(type, load, load_size, disc_eject, disc_path);
    pthread_mutex_lock(&cmd_mtx);
    cmd_load_buf = load;
    cmd_load_size = load_size;
+   cmd_disc_eject = disc_eject;
+   if (disc_path != NULL)
+      snprintf(cmd_disc_path, sizeof(cmd_disc_path), "%s", disc_path);
+   else
+      cmd_disc_path[0] = '\0';
    cmd_ok = 0;
    cmd_done = 0;
    cmd_type = type;
@@ -213,6 +240,18 @@ static int yab_cmd_wait(int type, const void *load, size_t load_size)
    ok = cmd_ok;
    pthread_mutex_unlock(&cmd_mtx);
    return ok;
+}
+
+/* Save / load / reset carry no payload of their own. */
+static int yab_cmd_wait(int type, const void *load, size_t load_size)
+{
+   return yab_cmd_wait_ex(type, load, load_size, 0, NULL);
+}
+
+/* Disk control, called from the frontend thread (its menu, between frames). */
+static int yab_disc_cmd(int eject, const char *path)
+{
+   return yab_cmd_wait_ex(YAB_CMD_DISC, NULL, 0, eject, path);
 }
 
 static void *machine_main(void *arg)
@@ -1158,7 +1197,7 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
    memset(info, 0, sizeof(*info));
    info->library_name = "YabaSanshiro";
    info->library_version = CORE_VERSION;
-   info->valid_extensions = "cue|iso|chd";
+   info->valid_extensions = "cue|iso|chd|m3u";
    info->need_fullpath = false; /* placeholder needs no content */
    info->block_extract = false;
 }
@@ -1424,13 +1463,296 @@ RETRO_API void retro_cheat_set(unsigned index, bool enabled, const char *code)
    (void)code;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Disk control (libretro protocol): multi-disc games and .m3u playlists
+ *
+ * Ported from the h700-libretro branch, which had this working: a Saturn
+ * multi-disc title ships as several images, the front end hands the playlist
+ * (.m3u) to retro_load_game, and the core resolves it here, boots its first
+ * entry and publishes the whole list through the disk-control interface.
+ * Swapping is a real tray open/close on the emulated CD block, so it runs on
+ * the machine thread through the same command channel as save/load/reset
+ * (Cs2Exec lives there).
+ *
+ * Playlist entries are paths relative to the playlist's directory or absolute;
+ * '#' comments and blank lines are skipped.  That is the layout in use:
+ *   Roms/Sega Saturn (SATURN)/D之食卓.m3u
+ *   Roms/Sega Saturn (SATURN)/D之食卓/D_CN3_CD1.chd
+ * ------------------------------------------------------------------------- */
+#define YAB_MAX_DISKS 16
+
+static char     disk_paths[YAB_MAX_DISKS][YAB_PATH_MAX];
+static char     disk_labels[YAB_MAX_DISKS][YAB_PATH_MAX];
+static unsigned disk_count;
+static unsigned disk_index;
+static unsigned disk_initial_idx;
+static char     disk_initial_path[YAB_PATH_MAX];
+static int      disk_tray_open;
+
+/* The image the engine boots: the playlist's first entry, or the single image.
+   libretro_content_path points here, so a later YabauseInit opens it too. */
+static char     content_path_buf[YAB_PATH_MAX];
+
+static const char *disk_basename(const char *path)
+{
+   const char *slash = strrchr(path, '/');
+   return (slash != NULL) ? slash + 1 : path;
+}
+
+static int disk_ext_is_m3u(const char *path)
+{
+   const char *ext = strrchr(disk_basename(path), '.');
+   if (ext == NULL)
+      return 0;
+   ext++;
+   return (ext[0] == 'm' || ext[0] == 'M') && ext[1] == '3' &&
+          (ext[2] == 'u' || ext[2] == 'U') && ext[3] == '\0';
+}
+
+/* Directory part including the trailing slash ("" when there is none). */
+static void disk_dirname(const char *path, char *out, size_t size)
+{
+   const char *slash = strrchr(path, '/');
+   size_t n = (slash != NULL) ? (size_t)(slash - path) + 1 : 0;
+   if (n >= size)
+      n = size - 1;
+   memcpy(out, path, n);
+   out[n] = '\0';
+}
+
+/* "D_CN3_CD1.chd" -> "D_CN3_CD1": what a front end shows in its disc list. */
+static void disk_set_label_from_path(unsigned idx)
+{
+   char base[YAB_PATH_MAX];
+   char *dot;
+   if (idx >= YAB_MAX_DISKS || disk_paths[idx][0] == '\0')
+      return;
+   snprintf(base, sizeof(base), "%s", disk_basename(disk_paths[idx]));
+   dot = strrchr(base, '.');
+   if (dot != NULL && dot != base)
+      *dot = '\0';
+   snprintf(disk_labels[idx], sizeof(disk_labels[idx]), "%s", base);
+}
+
+static bool disk_set_eject_state(bool ejected)
+{
+   if (!ejected && (disk_index >= disk_count || disk_paths[disk_index][0] == '\0'))
+      return false;
+   /* Before the engine exists there is no CD block to move: the front end's
+      request is still the initial state, so recording it is all it needs. */
+   if (engine_up && !yab_disc_cmd(ejected ? 1 : 0,
+                                  ejected ? NULL : disk_paths[disk_index]))
+      return false;
+   if (!ejected)
+      snprintf(content_path_buf, sizeof(content_path_buf), "%s",
+               disk_paths[disk_index]);
+   disk_tray_open = ejected ? 1 : 0;
+   return true;
+}
+
+static bool     disk_get_eject_state(void) { return disk_tray_open ? true : false; }
+static unsigned disk_get_image_index(void) { return disk_index; }
+static unsigned disk_get_num_images(void)  { return disk_count; }
+
+static bool disk_set_image_index(unsigned index)
+{
+   /* The media changes when the tray closes (disk_set_eject_state(false)); here
+      only the image to insert is recorded.  index == disk_count is the front
+      end's "no disc" sentinel. */
+   if (index == disk_count) {
+      disk_index = index;
+      return true;
+   }
+   if (index >= disk_count)
+      return false;
+   disk_index = index;
+   return true;
+}
+
+static bool disk_replace_image_index(unsigned index,
+      const struct retro_game_info *info)
+{
+   if (index >= YAB_MAX_DISKS)
+      return false;
+
+   if (info == NULL || info->path == NULL) {   /* remove this image */
+      unsigned i;
+      if (index >= disk_count)
+         return false;
+      for (i = index; i + 1 < disk_count; i++)
+         snprintf(disk_paths[i], YAB_PATH_MAX, "%s", disk_paths[i + 1]);
+      if (disk_count > 0)
+         disk_count--;
+      if (disk_count > 0 && disk_index >= disk_count)
+         disk_index = disk_count - 1;
+      return true;
+   }
+
+   snprintf(disk_paths[index], YAB_PATH_MAX, "%s", info->path);
+   disk_set_label_from_path(index);
+   if (index >= disk_count)
+      disk_count = index + 1;
+   return true;
+}
+
+static bool disk_add_image_index(void)
+{
+   if (disk_count >= YAB_MAX_DISKS)
+      return false;
+   disk_paths[disk_count][0]  = '\0';
+   disk_labels[disk_count][0] = '\0';
+   disk_count++;
+   return true;
+}
+
+static bool disk_set_initial_image(unsigned index, const char *path)
+{
+   disk_initial_idx = index;
+   if (path != NULL)
+      snprintf(disk_initial_path, sizeof(disk_initial_path), "%s", path);
+   else
+      disk_initial_path[0] = '\0';
+   return true;
+}
+
+static bool disk_get_image_path(unsigned index, char *path, size_t len)
+{
+   if (index >= disk_count || path == NULL || len == 0 || disk_paths[index][0] == '\0')
+      return false;
+   snprintf(path, len, "%s", disk_paths[index]);
+   return true;
+}
+
+static bool disk_get_image_label(unsigned index, char *label, size_t len)
+{
+   if (index >= disk_count || label == NULL || len == 0 || disk_labels[index][0] == '\0')
+      return false;
+   snprintf(label, len, "%s", disk_labels[index]);
+   return true;
+}
+
+static struct retro_disk_control_ext_callback disk_ext_cb = {
+   disk_set_eject_state,
+   disk_get_eject_state,
+   disk_get_image_index,
+   disk_set_image_index,
+   disk_get_num_images,
+   disk_replace_image_index,
+   disk_add_image_index,
+   disk_set_initial_image,
+   disk_get_image_path,
+   disk_get_image_label,
+};
+
+static struct retro_disk_control_callback disk_cb = {
+   disk_set_eject_state,
+   disk_get_eject_state,
+   disk_get_image_index,
+   disk_set_image_index,
+   disk_get_num_images,
+   disk_replace_image_index,
+   disk_add_image_index,
+};
+
+/* Build the disc list from the content path and publish the boot image.  Runs
+   in retro_load_game, before the engine (and its CD block) exists. */
+static void disk_init_from_content(const char *content_path)
+{
+   disk_count     = 0;
+   disk_index     = 0;
+   disk_tray_open = 0;
+
+   if (content_path != NULL && content_path[0] != '\0' &&
+       disk_ext_is_m3u(content_path)) {
+      char basedir[YAB_PATH_MAX];
+      char line[YAB_PATH_MAX];
+      FILE *fp;
+      disk_dirname(content_path, basedir, sizeof(basedir));
+      fp = fopen(content_path, "r");
+      if (fp != NULL) {
+         while (fgets(line, sizeof(line), fp) != NULL && disk_count < YAB_MAX_DISKS) {
+            char *p = line;
+            char *end;
+            /* a UTF-8 BOM in front of the first entry would hide it */
+            if ((unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB &&
+                (unsigned char)p[2] == 0xBF)
+               p += 3;
+            while (*p == ' ' || *p == '\t')
+               p++;
+            if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n')
+               continue;
+            end = p + strlen(p);
+            while (end > p && (end[-1] == '\n' || end[-1] == '\r' ||
+                               end[-1] == ' ' || end[-1] == '\t'))
+               *--end = '\0';
+            if (*p == '\0')
+               continue;
+            if (*p == '/')
+               snprintf(disk_paths[disk_count], YAB_PATH_MAX, "%s", p);
+            else
+               snprintf(disk_paths[disk_count], YAB_PATH_MAX, "%s%s", basedir, p);
+            disk_set_label_from_path(disk_count);
+            disk_count++;
+         }
+         fclose(fp);
+      }
+      LOG_INFO("disk: playlist %s -> %u image(s)", content_path, disk_count);
+   }
+
+   if (disk_count == 0) {   /* single image, or an empty/unreadable playlist */
+      if (content_path != NULL && content_path[0] != '\0') {
+         snprintf(disk_paths[0], YAB_PATH_MAX, "%s", content_path);
+         disk_set_label_from_path(0);
+         disk_count = 1;
+      }
+   }
+
+   /* Honour a frontend-requested initial image (last used disc restore). */
+   if (disk_initial_idx < disk_count &&
+       (disk_initial_path[0] == '\0' ||
+        strcmp(disk_initial_path, disk_paths[disk_initial_idx]) == 0))
+      disk_index = disk_initial_idx;
+   disk_initial_idx = 0;
+   disk_initial_path[0] = '\0';
+
+   if (disk_count > 0)
+      snprintf(content_path_buf, sizeof(content_path_buf), "%s",
+               disk_paths[disk_index]);
+   else
+      content_path_buf[0] = '\0';
+}
+
+/* env 57 says which disk-control struct the front end understands; the ext form
+   (env 58) supersedes the original one (env 13). */
+static void disk_register(void)
+{
+   unsigned version = 0;
+   if (environ_cb == NULL)
+      return;
+   if (environ_cb(RETRO_ENVIRONMENT_GET_DISK_CONTROL_INTERFACE_VERSION, &version) &&
+       version >= 1)
+      environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, &disk_ext_cb);
+   else
+      environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, &disk_cb);
+   LOG_INFO("disk: control interface registered, %u image(s), boot=%s",
+            disk_count, content_path_buf[0] ? content_path_buf : "(none)");
+}
+
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
    if (game != NULL) {
-      libretro_content_path = game->path;
-      LOG_INFO("load_game: %s (%u bytes)", game->path != NULL ? game->path : "(no path)",
-               (unsigned)game->size);
+      /* Content is a disc image or an .m3u playlist of them: build the disc list
+         and let the engine boot its first entry. */
+      disk_init_from_content(game->path);
+      libretro_content_path = (content_path_buf[0] != '\0') ? content_path_buf
+                                                            : game->path;
+      LOG_INFO("load_game: %s (%u bytes) -> boot image %s",
+               game->path != NULL ? game->path : "(no path)",
+               (unsigned)game->size,
+               libretro_content_path != NULL ? libretro_content_path : "(none)");
    } else {
+      disk_init_from_content(NULL);
+      libretro_content_path = NULL;
       LOG_INFO("load_game: no content (placeholder)");
    }
 
@@ -1461,6 +1783,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
          LOG_INFO("audio: env62 buffer status refused");
    }
 
+   /* Disk control: the front end's disc list for this content. */
+   disk_register();
 
    return true;
 }
