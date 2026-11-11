@@ -42,6 +42,7 @@
 */
 
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
@@ -117,6 +118,8 @@ static s64 hb_us;                  /* last retro_run, CLOCK_MONOTONIC us */
 /* Resampler state (ring_lock). */
 static u32 stretch_target;         /* fill target, frames (four fields) */
 static double soundratio = 1.0;    /* output frames per input frame */
+static double fill_avg = -1.0;     /* low-passed ring level for the regulator */
+static int snd_prefill_gate(void);  /* startup cushion, defined below */
 static double soundfrac;           /* fractional read position in the window */
 static s16 stretch_last[2];        /* last input frame, for interpolation */
 static s16 stretch_win[SND_STRETCH_WIN_FRAMES * 2];
@@ -192,7 +195,19 @@ static void SNDLibretroLogStats(void)
    wind the ratio up against a rate difference that never goes away. */
 static void snd_regulate(void)
 {
-   double fillf = (double)fill / (double)SND_RING_FRAMES;
+   /* The producer publishes a whole field at a time (735/882 frames every 16.7 or
+      20 ms) while this runs once per 512-frame device period, so the raw level
+      carries a strong ripple at the field rate - and sampling it at 86 Hz aliases
+      that ripple into a slow beat.  Regulating the raw value made the ratio swing
+      by ~0.5% at a few Hz, audible as a warble/oscillation (reported on PAL,
+      where the field rate is 50 Hz).  Regulate the low-passed level instead:
+      tau ~ 0.6 s kills the field ripple and leaves real drift. */
+   if (fill_avg < 0.0)
+      fill_avg = (double)fill;
+   else
+      fill_avg += ((double)fill - fill_avg) * 0.02;
+
+   double fillf = fill_avg / (double)SND_RING_FRAMES;
    double targetf = (double)stretch_target / (double)SND_RING_FRAMES;
    double err = fillf - targetf;
    double want = 1.0 - SND_STRETCH_RATIOGAIN * err;
@@ -208,7 +223,19 @@ static void snd_regulate(void)
    else if (want < rmin)
       want = rmin;
 
-   soundratio += (want - soundratio) * SND_STRETCH_RATIOSLEW;
+   /* Deadband: the SCSP thread and the audio device run off the same system
+      clock here, so a level inside this band is jitter, not drift.  Regulating
+      it would keep the resampler permanently off 1.0, which is audible as a
+      faint hiss over music (linear interpolation, measured: ratio never
+      settled, 45% of the delivered samples were interpolated).  Inside the band
+      the ratio goes back to exactly 1.0 and snd_render_period() copies. */
+   if (fabs(err) < 0.10) {
+      want = 1.0;
+      if (soundratio > 1.0 ? (soundratio - 1.0 < 2e-4) : (1.0 - soundratio < 2e-4))
+         soundratio = 1.0;
+   }
+   if (want != 1.0 || soundratio != 1.0)
+      soundratio += (want - soundratio) * SND_STRETCH_RATIOSLEW;
 }
 
 /* Packet-loss concealment for a short ring, ported from the standalone
@@ -341,6 +368,29 @@ static void snd_render_period(s16 *dst)
    int clamped = 0;
    double pos = soundfrac;
 
+   /* Ratio 1.0 and an aligned phase: hand the ring out untouched.  No
+      interpolation, no rounding (16-bit samples stay bit-exact), which is what
+      the standalone does when its device rate equals the SCSP rate. */
+   if (soundratio == 1.0 && soundfrac == 0.0 && fill >= SND_PERIOD_FRAMES)
+   {
+      u32 head = SND_RING_FRAMES - read_pos;
+      if (head > SND_PERIOD_FRAMES)
+         head = SND_PERIOD_FRAMES;
+      memcpy(dst, ring + 2 * read_pos, sizeof(s16) * 2 * head);
+      if (head < SND_PERIOD_FRAMES)
+         memcpy(dst + 2 * head, ring, sizeof(s16) * 2 * (SND_PERIOD_FRAMES - head));
+      stretch_last[0] = dst[2 * (SND_PERIOD_FRAMES - 1)];
+      stretch_last[1] = dst[2 * (SND_PERIOD_FRAMES - 1) + 1];
+      read_pos += SND_PERIOD_FRAMES;
+      if (read_pos >= SND_RING_FRAMES)
+         read_pos -= SND_RING_FRAMES;
+      fill -= SND_PERIOD_FRAMES;
+      stat_consumed += SND_PERIOD_FRAMES;
+      soundfrac = 0.0;
+      snd_regulate();
+      return;
+   }
+
    need = (u32)((double)SND_PERIOD_FRAMES * step) + 3;
    if (need > SND_STRETCH_WIN_FRAMES)
       need = SND_STRETCH_WIN_FRAMES;
@@ -420,7 +470,7 @@ static void snd_render_period(s16 *dst)
 static void SNDLibretroPeriod(void)
 {
    pthread_mutex_lock(&ring_lock);
-   if (snd_pause_gate())
+   if (snd_pause_gate() || snd_prefill_gate())
       memset(period_buf, 0, sizeof(s16) * 2 * SND_PERIOD_FRAMES);
    else
       snd_render_period(period_buf);
@@ -479,6 +529,49 @@ static void *SNDLibretroConsumer(void *arg)
    return NULL;
 }
 
+/* Startup prefill: the ring is regulated towards stretch_target (four fields),
+   but the regulator can only stretch audio that is there - starting from an
+   empty ring, the consumer takes every frame the producer writes and the ring
+   never fills (measured with a PAL game: fill 0-378 of 3528, soundratio pinned
+   at its emergency clamp, PLC filling the gaps).  The standalone does the same
+   thing with YABA_STRETCH_PREFILL (sndsdl.c): stay silent until the cushion
+   exists.  A two-second safety releases the gate so a silent producer can never
+   mute the core for good. */
+static int prefill_done;
+static u64 prefill_deadline_us;
+static u64 snd_now_us(void);
+
+/* Caller holds ring_lock.  1 = still filling, output silence. */
+static int snd_prefill_gate(void)
+{
+   if (prefill_done)
+      return 0;
+   if (fill >= stretch_target)
+   {
+      /* Entering playback with more than the cushion is latency we would then
+         have to regulate away (and while regulating the resampler runs off 1.0,
+         which is audible as a faint hiss).  Trim to the target instead: the
+         ring starts at the level the regulator wants. */
+      u32 trim = fill - stretch_target;
+      prefill_done = 1;
+      read_pos += trim;
+      if (read_pos >= SND_RING_FRAMES)
+         read_pos -= SND_RING_FRAMES;
+      fill = stretch_target;
+      stat_stale += trim;
+      LOG_INFO("audio: prefill done, %u frames (trimmed %u)", (u32)fill, (u32)trim);
+      return 0;
+   }
+   if (prefill_deadline_us != 0 && snd_now_us() > prefill_deadline_us)
+   {
+      prefill_done = 1;
+      LOG_WARN("audio: prefill timeout, starting with %u of %u frames",
+               (u32)fill, (u32)stretch_target);
+      return 0;
+   }
+   return 1;
+}
+
 /* Caller holds ring_lock.  Returns 1 when audio must not be handed over: the
    front end has not run a frame for pause_ms, so whatever is queued belongs to
    a timeline that has moved on.  On the transition back it drops the backlog
@@ -510,6 +603,7 @@ static int snd_pause_gate(void)
       ScspFlushOutput();
       paused = 0;
       resume_events++;
+      prefill_done = 1;   /* the branch above already kept stretch_target frames */
       LOG_INFO("audio: resumed, dropped %u stale frames, kept %u", dropped, fill);
       return 0;
    }
@@ -534,7 +628,7 @@ static int snd_pause_gate(void)
 unsigned SNDLibretroPump(s16 *dst)
 {
    pthread_mutex_lock(&ring_lock);
-   if (snd_pause_gate())
+   if (snd_pause_gate() || snd_prefill_gate())
    {
       memset(dst, 0, sizeof(s16) * 2 * SND_PERIOD_FRAMES);
       pthread_mutex_unlock(&ring_lock);
@@ -551,6 +645,8 @@ void SNDLibretroDropBacklog(void)
    read_pos = 0;
    write_pos = 0;
    fill = 0;
+   prefill_done = 0;
+   prefill_deadline_us = snd_now_us() + 2000000ULL;
    pthread_mutex_unlock(&ring_lock);
 }
 
@@ -675,6 +771,8 @@ static int SNDLibretroInit(void)
    soundfrac = 0.0;
    stretch_last[0] = stretch_last[1] = 0;
    stretch_target = 735 * SND_STRETCH_TARGET_FIELDS;
+   prefill_done = 0;
+   prefill_deadline_us = snd_now_us() + 2000000ULL;   /* safety: 2 s */
    paused = 0;
    resume_pending = 0;
    pause_events = resume_events = 0;

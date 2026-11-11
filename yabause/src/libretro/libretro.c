@@ -319,6 +319,15 @@ static volatile int aud_buf_active;
    can drain the core's buffer in one pull (minarch asked for it). */
 static unsigned aud_wmax, aud_wmin = 0xFFFFFFFFu;
 static double aud_us_sum, aud_us_max;
+/* Delivery budget: the front end may call the env 22 callback far more often
+   than its device consumes audio (minarch does when its ring is starved:
+   measured 40k calls/s), and every call would otherwise hand over a period,
+   so 99% of what the front end played was concealment and the spin starved
+   the SCSP thread.  A token bucket against the device rate fixes the average:
+   hand a period over only when the device has consumed what we already sent.
+   Frames are 44100/s whatever the video standard is. */
+static unsigned long long aud_rate_start_us;   /* token bucket epoch */
+static unsigned long long aud_rate_frames;     /* frames handed over since then */
 static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 
@@ -464,6 +473,35 @@ static void yab_audio_callback(void)
       buffer is empty (resume, load, slow frame) hand several, so its device
       never starves.  Each period is still one audio callback call. */
    unsigned want = yab_audio_want_periods();
+
+   /* Never hand over more audio than the device can play.  A front end that
+      reports a healthy buffer and asks again before the device consumed what we
+      already sent gets nothing (it asks again later).  Exception: it says it is
+      starving, then refill immediately. */
+   {
+      struct timespec now_ts;
+      unsigned long long now_us, due, limit;
+
+      clock_gettime(CLOCK_MONOTONIC, &now_ts);
+      now_us = (unsigned long long)now_ts.tv_sec * 1000000ULL +
+               (unsigned long long)now_ts.tv_nsec / 1000ULL;
+      if (aud_rate_start_us == 0)
+         aud_rate_start_us = now_us;
+      due = (now_us - aud_rate_start_us) * 44100ULL / 1000000ULL;
+      /* How much audio we may be ahead of what the device has played: one
+         period.  The front end asks again as soon as its device consumed the
+         previous one, so this is what keeps a spin (minarch calls this callback
+         3k times/s while starved) from draining our ring while handing the front
+         end audio it cannot take (measured: short 15-21/s with two periods of
+         lookahead).  env 62's occupancy is NOT usable here: minarch only reports
+         it every 5 s, so gating on it starved the front end instead. */
+      limit = 512ULL;
+      if (aud_rate_frames > due + limit)
+         return;
+      /* A long gap (pause, load) must not become a catch-up burst. */
+      if (due > aud_rate_frames + 44100ULL * 2ULL)
+         aud_rate_start_us = now_us - aud_rate_frames * 1000000ULL / 44100ULL;
+   }
    unsigned sent = 0, total = 0;
 
    while (sent < want)
@@ -485,6 +523,7 @@ static void yab_audio_callback(void)
       sent++;
       total += n;
    }
+   aud_rate_frames += total;
    /* wmax/wmin are frames per NOTIFICATION (one front end callback may now
       carry several periods), which is what a front end can observe. */
    if (total > aud_wmax) aud_wmax = total;
@@ -505,11 +544,12 @@ static void yab_audio_buffer_status(bool active, unsigned occupancy,
    front end's own buffer (a few periods), not a size we invent. */
 static unsigned yab_audio_want_periods(void)
 {
-   int occ = __atomic_load_n(&aud_occ, __ATOMIC_RELAXED);
-   int dry = __atomic_load_n(&aud_underrun_likely, __ATOMIC_RELAXED);
-
-   if (dry || occ < 0 || occ < 25)
-      return 4;              /* starving: refill the front end's buffer */
+   /* Always exactly one period.  The front end's ring is small (minarch:
+       2048 frames = two periods), so handing four periods at once overflows it
+       and the front end drops the excess: measured with a PAL game, "short"
+       (the front end accepted less than we sent) was 22-25 periods/s, audible
+       as clicks/hiss on top of the music.  Refilling a starving ring is the
+       front end's own business; it asks again when it has room. */
    return 1;
 }
 

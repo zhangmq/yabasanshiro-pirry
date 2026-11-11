@@ -1935,6 +1935,17 @@ static scsp_t   scsp;                         // SCSP structure
 static union {
    u8 data[CDDA_NUM_BUFFERS*2352];
 } cddabuf;
+#ifdef __LIBRETRO__
+/* libretro only: here the CD block (cs2.c) runs on the machine thread while the
+   SCSP runs on its own realtime thread, so the CDDA ring needs a lock.  The
+   standalone runs both on one thread (usethreads=0) and must not pay for it. */
+static pthread_mutex_t cdda_lock = PTHREAD_MUTEX_INITIALIZER;
+#define CDDA_LOCK()   pthread_mutex_lock(&cdda_lock)
+#define CDDA_UNLOCK() pthread_mutex_unlock(&cdda_lock)
+#else
+#define CDDA_LOCK()   ((void)0)
+#define CDDA_UNLOCK() ((void)0)
+#endif
 static unsigned int cdda_next_in=0;               // Next sector buffer offset to receive into
 /* Separate volume for CD music and game sound effects, in percent (100 = unchanged).
    In the active core CD music is added raw to the mix buffer in `scsp_update` (no level, no attenuation), while
@@ -5705,9 +5716,15 @@ static int CddaMute(void) {
 
 void new_scsp_run_sample()
 {
+#ifdef __LIBRETRO__
+   s32 temp;
+   s32 outpos;
+   u8 *buf;             /* filled under CDDA_LOCK below */
+#else
    s32 temp = cdda_next_in - cdda_out_left;
    s32 outpos = (temp < 0) ? temp + sizeof(cddabuf.data) : temp;
    u8 *buf = &cddabuf.data[outpos];
+#endif
 
    s16 out_l = 0;
    s16 out_r = 0;
@@ -5721,10 +5738,17 @@ void new_scsp_run_sample()
 
    if ((s32)cdda_out_left > 0)
    {
+#ifdef __LIBRETRO__
+      CDDA_LOCK();
+      temp = cdda_next_in - cdda_out_left;
+      outpos = (temp < 0) ? temp + sizeof(cddabuf.data) : temp;
+      buf = &cddabuf.data[outpos];
+#endif
       cd_in_l = (s16)((buf[1] << 8) | buf[0]);
       cd_in_r = (s16)((buf[3] << 8) | buf[2]);
 
       cdda_out_left -= 4;   /* must also run when muted, or the boost hysteresis in ScspReceiveCDDA tips over */
+      CDDA_UNLOCK();
       if (CddaMute()) { cd_in_l = 0; cd_in_r = 0; }
       /* CD music volume from the menu; 0 = off */
       else if (g_cdda_vol != 100) {
@@ -5895,6 +5919,7 @@ ScspReceiveCDDA (const u8 *sector)
       }
    }
 
+  CDDA_LOCK();
   memcpy(cddabuf.data+cdda_next_in, sector, 2352);
   if (sizeof(cddabuf.data)-cdda_next_in <= 2352)
      cdda_next_in = 0;
@@ -5908,6 +5933,7 @@ ScspReceiveCDDA (const u8 *sector)
       SCSPLOG ("WARNING: CDDA buffer overrun\n");
       cdda_out_left = sizeof(cddabuf.data);
     }
+  CDDA_UNLOCK();
 }
 
 
@@ -6095,9 +6121,10 @@ void ScspAsynMainCpuTime( void * p ){
 
 void ScspAsynMainRealtime(void * p) {
 
-  u64 before;
   u64 now;
-  u64 difftime;
+#ifndef __LIBRETRO__
+  u64 before;      /* standalone phase lock only (libretro paces on the sample clock) */
+#endif
   const int samplecnt = 256; // 11289600/44100
   const int step = 16;
   int frame = 0; 
@@ -6110,8 +6137,24 @@ void ScspAsynMainRealtime(void * p) {
      can only be set after the thread has started. */
   int cur_pal = -1;
   int framecnt = 188160 / frame_div; // 11289600/60
+#ifdef __LIBRETRO__
+  /* libretro only: pacing follows the SAMPLE clock, not a per-field period.
+     This thread makes exactly one sample per pass of the loop
+     (new_scsp_exec(512)) and the front end's device consumes 44100 of them per
+     second whatever the video standard is; pacing on a field period (16.67 or
+     20 ms) let a late wake-up lose samples permanently - measured on the device
+     with a PAL game: 38808 samples/s instead of 44100, i.e. the ring never
+     filled and everything the front end played was PLC concealment.  The
+     deadline below is derived from the samples produced, so a missed wake-up is
+     caught up on the following passes instead of dropped.
+     The standalone keeps the period lock (its SDL ring and pacing model are a
+     different thing, and its behaviour must not change). */
+  s64 phase_ns = 0;        /* wall clock of sample #0 */
+  u64 phase_samples = 0;   /* samples produced since phase_ns */
+#else
   s64 target_period_ns = 16666666L / frame_div;
   int phase_primed = 0;
+#endif
   int hzcheck = 0;
 
 #if defined(ARCH_IS_LINUX)
@@ -6129,11 +6172,15 @@ void ScspAsynMainRealtime(void * p) {
 
 
   YabThreadSetCurrentThreadAffinityMask(0x03);
+#ifndef __LIBRETRO__
   before = YabaTicksNs();
+#endif
   u32 wait_clock = 0;
 
   now = 0;
+#ifndef __LIBRETRO__
   before = 0;
+#endif
   while (thread_running) {
     /* The video format can only be known after the thread start (YabauseSetVideoFormat -> ScspChangeVideoFormat), so
        period and frame length are updated here to match scspsoundlen (44100/50 or 44100/60). */
@@ -6142,9 +6189,16 @@ void ScspAsynMainRealtime(void * p) {
       if (is_pal != cur_pal) {
         cur_pal = is_pal;
         framecnt = (is_pal ? 225792 : 188160) / frame_div;
-        target_period_ns = (is_pal ? 20000000L : 16666666L) / frame_div;
         frame = 0;
+#ifdef __LIBRETRO__
+        /* libretro: only the field boundary changes with the video standard
+           (735 or 882 samples per field); the wall-clock pacing is the sample
+           clock and does not depend on it. */
+        frame_count = 0;
+#else
         phase_primed = 0;
+        target_period_ns = (is_pal ? 20000000L : 16666666L) / frame_div;
+#endif
       }
     }
     if (g_scsp_lock) LoadSndPark();   /* lock loop with park notification */
@@ -6161,6 +6215,9 @@ void ScspAsynMainRealtime(void * p) {
     else {
       scsp_update_timer(1);
     }
+#ifdef __LIBRETRO__
+    phase_samples++;
+#endif
 
     // Sync 1/4 Frame(60Hz)
     frame += samplecnt;
@@ -6175,21 +6232,28 @@ void ScspAsynMainRealtime(void * p) {
       }
       s64 sleeptime = 0;
       s64 initsleeptime = 0;
-      u64 initnow = 0;
-      u64 initbefore = 0;
       u64 checktime = 0;
       u64 sleepchecktime = 0;
       sh2_read_req = 0;
       do {
         now = YabaTicksNs();
-          /* Signed difference: with the phase lock "now" may lie before "before" (the thread is early). Treating that
-             as a counter wrap would give a huge difftime and a permanently negative sleeptime, so the wait loop would
-             exit at once and the thread would run unthrottled. u64 nanoseconds overflow only after ~584 years. */
+#ifdef __LIBRETRO__
+          /* Deadline for the samples produced so far: phase_ns + samples/44100 s.
+             A late wake-up leaves a past deadline (sleeptime < 0); the following
+             passes then run without sleeping and catch up. */
+          if (phase_ns == 0) phase_ns = (s64)now - (s64)(phase_samples * 1000000000ULL / 44100ULL);
+          if (phase_samples > 44100ULL * 3600ULL) {
+            phase_ns += (s64)(phase_samples * 1000000000ULL / 44100ULL);
+            phase_samples = 0;
+          }
+          sleeptime = phase_ns + (s64)(phase_samples * 1000000000ULL / 44100ULL) - (s64)now;
+#else
+          /* Standalone: unchanged period lock.  Signed difference (see the note
+             below): "now" may lie before "before" while the thread runs early. */
           sleeptime = target_period_ns - (s64)(now - before);
+#endif
         if(initsleeptime==0){
           initsleeptime = sleeptime; 
-          initnow = now; 
-          initbefore = before;
         }
         if( sleeptime < 0 ) break;
 #if defined(ANDROID)
@@ -6263,16 +6327,18 @@ void ScspAsynMainRealtime(void * p) {
       } while (sleeptime > 0);
 
       checktime = YabaTicksNs();
-      //printf("vsynctime = %d(%d) %d(%d)\n", (s32)(checktime - before),16666666/frame_div,(s32)(checktime - initnow),(s32)initsleeptime);
-      //printf("vsynctime = %d(%d) %"PRIu64"-%"PRIu64"=(%"PRId64")\n", (s32)(checktime - before),16666666/frame_div,now,before,initsleeptime);
+#ifdef __LIBRETRO__
+      (void)checktime;
+      /* Re-phase after a real stall: more than 50 ms behind means the backlog
+         must not be played back as a burst. */
+      if (phase_ns != 0) {
+        s64 lag = (s64)now - (phase_ns + (s64)(phase_samples * 1000000000ULL / 44100ULL));
+        if (lag > 50000000LL)
+          phase_ns = (s64)now - (s64)(phase_samples * 1000000000ULL / 44100ULL);
+      }
+#else
       {
-        /* Phase-locked: "before" advances by exactly one period regardless of how late this pass was, so jitter of
-           individual passes is compensated in the next one. Previously "before = checktime" lost every wake-up delay
-           permanently; the thread then produced fewer than 44100 samples/s, which the +-1% fine trim in sndsdl.c cannot
-           regulate out (ring slowly empties, an underrun every few seconds, sound slightly too slow).
-           Resync clamp of 3 periods (~50 ms): if the thread falls further behind (real scheduling hiccup) the backlog
-           is discarded instead of being caught up at full speed (a catch-up burst would let the latency grow). The
-           opposite direction is clamped too, so a system clock jump cannot put the thread to sleep for minutes. */
+        /* Standalone: the original phase lock, unchanged. */
         if (!phase_primed) {
           before = checktime;
           phase_primed = 1;
@@ -6285,6 +6351,7 @@ void ScspAsynMainRealtime(void * p) {
             before = checktime;
         }
       }
+#endif
     }
   }
   YabThreadWake(YAB_THREAD_SCSP);
