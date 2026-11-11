@@ -87,6 +87,15 @@ typedef struct
    int scsp_main_mode;
    u32 sync_shift;
    const char *playRecordPath;
+#ifdef __LIBRETRO__
+   /* ST-V: romset assembly inputs (STVSingleInit/STVInit in stv.c).
+      Libretro-only: the standalone has no ST-V path. */
+   const char *stvgamepath;      /* the romset zip */
+   const char *stvgame;          /* romset name from the game list, or NULL */
+   const char *stvbiospath;      /* stvbios.zip */
+   const char *eepromdir;        /* where the per-game .nv lives */
+   int stv_favorite_region;
+#endif
 } yabauseinit_struct;
 
 #define CLKTYPE_26MHZ           0
@@ -143,6 +152,12 @@ typedef struct
    u32 frame_count;
    int extend_backup;
    u32 sync_shift;
+#ifdef __LIBRETRO__
+   /* ST-V (Sega Titan Video): set by STVInit()/STVSingleInit() in stv.c. */
+   u8 isSTV;
+   int stvInputType;
+   int isRotated;
+#endif
 } yabsys_struct;
 
 extern yabsys_struct yabsys;

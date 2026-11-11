@@ -50,6 +50,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <ctype.h>
 
 #include "memory.h"
+#ifdef __LIBRETRO__
+#include "peripheral.h"   /* ST-V IOGA (JAMMA) port hooks */
+#endif
 #include "coffelf.h"
 #include "cs0.h"
 #include "cs1.h"
@@ -95,6 +98,17 @@ writelongfunc WriteLongList[0x1000];
 
 readbytefunc ReadByteList[0x1000];
 readwordfunc ReadWordList[0x1000];
+
+#ifdef __LIBRETRO__
+/* Same as ReadWordList[..](addr) but readable from decrypt.c / stv.c, which
+ * reach it without the SH-2 cache bookkeeping (equivalent of Kronos'
+ * DMAMappedMemoryReadWord; our fork has it in memory.c:92).
+ * Libretro-only: those two files are not part of the standalone build. */
+u16 FASTCALL DMAMappedMemoryReadWord(u32 addr)
+{
+   return ReadWordList[(addr >> 16) & 0xFFF](addr);
+}
+#endif
 readlongfunc ReadLongList[0x1000];
 
 u8 *HighWram;
@@ -519,7 +533,15 @@ static u8 FASTCALL BupRamMemoryReadByte(u32 addr)
 
 static u16 FASTCALL BupRamMemoryReadWord(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read word - %08X\n", addr);
+#ifdef __LIBRETRO__
+   /* ST-V only.  A ROM board's backup RAM is a 16-bit device with only its
+      high byte wired up, so a word read is the byte at addr|1 in bits 8-15
+      (Kronos memory.c).  An ST-V title that checks its card with word reads
+      saw the historical stub's 0 (empty/corrupt card) and never left boot. */
+   if (yabsys.isSTV)
+      return (u16)(BupRamMemoryReadByte(addr | 0x1) << 8);
+#endif
+   LOG("bup	: BackupRam read word - %08X\n", addr);
    return 0;
 }
 
@@ -527,7 +549,12 @@ static u16 FASTCALL BupRamMemoryReadWord(USED_IF_DEBUG u32 addr)
 
 static u32 FASTCALL BupRamMemoryReadLong(USED_IF_DEBUG u32 addr)
 {
-   LOG("bup\t: BackupRam read long - %08X\n", addr);
+#ifdef __LIBRETRO__
+   if (yabsys.isSTV)
+      return (u32)((BupRamMemoryReadByte(addr | 0x1) << 8) |
+                   (BupRamMemoryReadByte(addr | 0x3) << 16));
+#endif
+   LOG("bup	: BackupRam read long - %08X\n", addr);
    return 0;
 }
 
@@ -569,14 +596,27 @@ static void FASTCALL BupRamMemoryWriteByte(u32 addr, u8 val)
 
 static void FASTCALL BupRamMemoryWriteWord(USED_IF_DEBUG u32 addr, UNUSED u16 val)
 {
-   LOG("bup\t: BackupRam write word - %08X\n", addr);
+#ifdef __LIBRETRO__
+   if (yabsys.isSTV) {
+      BupRamMemoryWriteByte(addr | 0x1, (val >> 8) & 0xFF);
+      return;
+   }
+#endif
+   LOG("bup	: BackupRam write word - %08X\n", addr);
 }
 
 //////////////////////////////////////////////////////////////////////////////
 
 static void FASTCALL BupRamMemoryWriteLong(USED_IF_DEBUG u32 addr, UNUSED u32 val)
 {
-   LOG("bup\t: BackupRam write long - %08X\n", addr);
+#ifdef __LIBRETRO__
+   if (yabsys.isSTV) {
+      BupRamMemoryWriteByte(addr | 0x1, (val >> 8) & 0xFF);
+      BupRamMemoryWriteByte(addr | 0x3, (val >> 24) & 0xFF);
+      return;
+   }
+#endif
+   LOG("bup	: BackupRam write long - %08X\n", addr);
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -636,6 +676,20 @@ void MappedMemoryInit()
                                 &LowWramMemoryWriteByte,
                                 &LowWramMemoryWriteWord,
                                 &LowWramMemoryWriteLong);
+#ifdef __LIBRETRO__
+   /* ST-V IOGA ports (JAMMA cabinet inputs).  Without this mapping the whole
+      0x040 area falls through to Unhandled* and the BIOS reads 0 -- i.e. every
+      active-low button (TEST included) looks pressed, so it sits in the
+      hardware-test menu instead of booting the cart.  ST-V only: on Saturn that
+      window is not IOGA, so its mapping (Unhandled) stays as it was. */
+   if (yabsys.isSTV)
+      FillMemoryArea(0x040, 0x041, &IOPortReadByte,
+                                   &IOPortReadWord,
+                                   &UnhandledMemoryReadLong,
+                                   &IOPortWriteByte,
+                                   &UnhandledMemoryWriteWord,
+                                   &UnhandledMemoryWriteLong);
+#endif
    FillMemoryArea(0x100, 0x17F, &UnhandledMemoryReadByte,
                                 &UnhandledMemoryReadWord,
                                 &UnhandledMemoryReadLong,
@@ -1313,6 +1367,13 @@ int MappedMemoryLoadExec(const char *filename, u32 pc)
 
 int LoadBios(const char *filename)
 {
+#ifdef __LIBRETRO__
+   /* On ST-V the ST-V BIOS is already in BiosRom (installed by stv.c); loading
+      the Saturn BIOS on top of it would clobber it.  Ported from
+      libretro/yabause@kronos. */
+   if (yabsys.isSTV)
+      return 0;
+#endif
    return T123Load(BiosRom, 0x80000, 2, filename);
 }
 

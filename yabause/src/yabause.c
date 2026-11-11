@@ -50,6 +50,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <string.h>
 #include <stdlib.h>
 #include "yabause.h"
+#ifdef __LIBRETRO__
+#include "stv.h"
+#endif
 #include "cheat.h"
 #include "cs0.h"
 #include "cs2.h"
@@ -269,6 +272,20 @@ int YabauseInit(yabauseinit_struct *init)
       return -1;
    }
 
+#ifdef __LIBRETRO__
+   /* ST-V (Sega Titan Video): assemble the romset into the CART_ROMSTV board
+      image (stv.c).  Gated on the cart type, as in our fork: STVInit()'s own
+      check needs a romset, and the Saturn path must not enter here. */
+   if (init->carttype == CART_ROMSTV &&
+       STVSingleInit(init->stvgamepath, init->stvbiospath, init->eepromdir, init->stv_favorite_region) != 0) {
+     if (STVInit(init->stvgame, init->cartpath, init->eepromdir, init->stv_favorite_region) != 0)
+     {
+       YabSetError(YAB_ERR_CANNOTINIT, _("STV emulation"));
+       return -1;
+     }
+   }
+
+#endif
    MappedMemoryInit();
 
    VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER, init->rbg_use_compute_shader);
@@ -365,6 +382,16 @@ int YabauseInit(yabauseinit_struct *init)
    OSDChangeCore(OSDCORE_DEFAULT);
 #endif
 
+#ifdef __LIBRETRO__
+   /* ST-V has no Saturn BIOS: stv.c has already installed the ST-V BIOS in
+      BiosRom, so the HLE fallback must not overwrite it (it would also patch
+      the first bytes of the ST-V BIOS).  Ported from libretro/yabause@kronos. */
+   if (yabsys.isSTV)
+   {
+      yabsys.emulatebios = 0;
+   }
+   else
+#endif
    if (init->biospath != NULL && strlen(init->biospath))
    {
       if (LoadBios(init->biospath) != 0)

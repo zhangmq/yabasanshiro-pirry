@@ -46,6 +46,7 @@
 #include <execinfo.h>
 #include <unistd.h>
 #include <time.h>
+#include <sys/stat.h>
 #include <GLES3/gl3.h>
 
 #include "yabause.h"
@@ -62,6 +63,7 @@
 #include "cs0.h"
 #include "osdcore.h"
 #include "peripheral.h"
+#include "stv.h"      /* ST-V romset detection/board bring-up (yabause/src/stv/) */
 #define PERCORE_LIBRETRO 2   /* peripheral core id implemented below */
 #include "ygl.h"
 
@@ -93,6 +95,19 @@ static int engine_up;
 static const char *libretro_content_path;
 static char libretro_bup_path[512];
 static char libretro_bios_path[512];
+static char libretro_save_dir[512];
+static char libretro_system_dir[512];
+
+/* ST-V (Sega Titan Video): the content is a MAME romset zip, not a disc.  The
+   engine side lives in yabause/src/stv/ and only the libretro build compiles
+   it; everything below is inert until a romset is detected. */
+static int   stv_mode;
+static char *stv_game;              /* romset name; owned (STVGetSingle strdup) */
+static int   stv_rotated;           /* per-title rotation, latched at load time */
+static char  stv_bios_path[512];    /* <system>/stvbios.zip */
+static char  stv_eeprom_dir[512];   /* <save>/stv/  (per-game .nv) */
+static char  stv_bup_path[512];     /* <save>/stv/<game>.ram */
+static char  stv_content_path[512]; /* our copy: game->path is call-scoped */
 
 /* engine-side caller mode: retro_run drains the VDP event queue (A+token) */
 extern void Vdp2SetFrontendConsumer(int on);
@@ -596,6 +611,8 @@ static int  opt_multitap[2];
 static int  opt_scsp_dsp = 1;
 static int  opt_cd_volume = 100;
 static int  opt_sfx_volume = 100;
+static int  opt_stv_region = STV_REGION_EU;   /* ST-V BIOS region preference */
+static int  opt_stv_service;                  /* Test/Service/Pause keys */
 
 /* Engine-side hooks without a header of their own. */
 extern int  g_interlace_half_menu;      /* vidogl.c:3619, read per draw          */
@@ -676,6 +693,15 @@ static void yab_options_read(void)
    opt_cd_volume = v != NULL ? atoi(v) : 100;
    v = opt_str("yabasanshiro_sfx_volume");
    opt_sfx_volume = v != NULL ? atoi(v) : 100;
+
+   /* ST-V only.  The BIOS region is a preference among the BIOSes a cart's
+      header allows (stv.c picks one of those); some Japanese carts only come
+      up on the JP one. */
+   if (opt_is("yabasanshiro_stv_region", "US"))      opt_stv_region = STV_REGION_US;
+   else if (opt_is("yabasanshiro_stv_region", "JP")) opt_stv_region = STV_REGION_JP;
+   else if (opt_is("yabasanshiro_stv_region", "TW")) opt_stv_region = STV_REGION_TW;
+   else                                              opt_stv_region = STV_REGION_EU;
+   opt_stv_service = opt_is("yabasanshiro_service_enabled", "enabled");
 }
 
 /* Latch the video standard for this content.  "auto" reads the disc IP.BIN
@@ -685,6 +711,14 @@ static void yab_options_read(void)
 static void yab_videoformat_latch(void)
 {
    int pal = (opt_videoformat == YAB_VF_PAL);
+
+   if (stv_mode) {
+      /* ST-V hardware has no PAL mode, and there is no disc header to read. */
+      opt_videoformat_latched = VIDEOFORMATTYPE_NTSC;
+      LOG_INFO("option: video format ST-V -> NTSC 60Hz%s",
+               opt_videoformat == YAB_VF_PAL ? " (PAL option ignored)" : "");
+      return;
+   }
 
    if (opt_videoformat == YAB_VF_AUTO) {
       char region[17];
@@ -842,7 +876,31 @@ void LibretroEngineContextReset(void)
       yinit.usethreads      = 0;
       yinit.osdcoretype     = OSDCORE_DUMMY;
       yinit.skip_load       = 0;
+      if (stv_mode) {
+         /* ST-V board: no disc and no Saturn BIOS; stv.c assembles the romset
+            into the CART_ROMSTV image and installs the ST-V BIOS in BiosRom.
+            The backup RAM is the board's own 64 KB card, per game (Kronos). */
+         yinit.carttype        = CART_ROMSTV;
+         yinit.cdcoretype      = CDCORE_DUMMY;
+         yinit.cdpath          = NULL;
+         yinit.biospath        = NULL;
+         yinit.extend_backup   = 0;
+         yinit.buppath         = stv_bup_path[0] ? stv_bup_path : NULL;
+         yinit.stvgamepath     = libretro_content_path;
+         yinit.stvgame         = stv_game;
+         yinit.stvbiospath     = stv_bios_path;
+         yinit.eepromdir       = stv_eeprom_dir;
+         yinit.stv_favorite_region = opt_stv_region;
+         LOG_INFO("engine: ST-V mode romset=%s region=%s eeprom=%s",
+                  stv_game ? stv_game : "(none)",
+                  opt_stv_region == STV_REGION_JP ? "JP" :
+                  opt_stv_region == STV_REGION_US ? "US" :
+                  opt_stv_region == STV_REGION_TW ? "TW" : "EU",
+                  stv_eeprom_dir);
+      }
       g_emulated_bios = (yinit.biospath != NULL) ? 0 : 1;   /* standalone: 0 when -b */
+      if (stv_mode)
+         g_emulated_bios = 0;   /* the ST-V BIOS is real, installed by stv.c */
       /* Standalone config defaults (main.cpp): "sound dsp" = 1 -> DSP on.  The
          DSP is emulated hardware state, so it stays on.
          Texture-cache persistence is a core option and defaults OFF: the fixed
@@ -863,6 +921,15 @@ void LibretroEngineContextReset(void)
                      g_texcache_persist, tp, opt_texcache_persist);
       }
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
+      if (stv_mode) {
+         /* The front end may already have asked for av_info before this
+            (retro_get_system_av_info has the same report); send it again now
+            that the game list flag is live, so both orders end up rotated. */
+         unsigned rotation = (unsigned)yabsys.isRotated;
+         if (environ_cb != NULL)
+            environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
+         LOG_INFO("ST-V: rotation=%u (title flag %d)", rotation, stv_rotated);
+      }
       /* Options that are plain engine state rather than init-time fields: set
          them once the engine exists (SCSP/SMPC objects are alive now). */
       g_interlace_half_menu = opt_interlace_half;
@@ -968,6 +1035,12 @@ void LibretroEngineContextDestroy(void)
       audio_async_ok = 0;
    }
    SNDLibretroStop();
+   if (stv_mode) {
+      /* STVDeInit() writes <save>/stv/<game>.nv; it must run before
+         YabauseDeInit() frees the cartridge whose board owns the EEPROM. */
+      LOG_INFO("engine: STVDeInit (EEPROM %s)", stv_eeprom_dir);
+      STVDeInit();
+   }
    LOG_INFO("engine: YabauseDeInit");
    YabauseDeInit();
    engine_up = 0;
@@ -1083,6 +1156,8 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
       const char *save_dir = NULL;
       bool have_save = cb != NULL && cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir);
       if (have_save && save_dir != NULL)
+         snprintf(libretro_save_dir, sizeof(libretro_save_dir), "%s", save_dir);
+      if (have_save && save_dir != NULL)
          snprintf(libretro_bup_path, sizeof(libretro_bup_path), "%s/yabasanshiro.bup", save_dir);
       else
          snprintf(libretro_bup_path, sizeof(libretro_bup_path), "yabasanshiro.bup");
@@ -1095,6 +1170,7 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
                                         "mpr-17933.bin", "mpr-18811-mx.ic1", NULL };
          int i;
          if (cb != NULL && cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sys_dir) && sys_dir) {
+            snprintf(libretro_system_dir, sizeof(libretro_system_dir), "%s", sys_dir);
             for (i = 0; names[i] != NULL; i++) {
                snprintf(libretro_bios_path, sizeof(libretro_bios_path), "%s/%s", sys_dir, names[i]);
                if (access(libretro_bios_path, R_OK) == 0) break;
@@ -1181,6 +1257,43 @@ static const struct { unsigned id; u8 key; } kPadKeys[] = {
 };
 #define PADKEY_NB ((unsigned)(sizeof(kPadKeys) / sizeof(kPadKeys[0])))
 
+/* ST-V cabinet (JAMMA/IOGA).  Port 0 is the player-1 panel, port 1 the
+   player-2 panel; Test/Service/Pause are cabinet keys and only exist when the
+   "Service Mode (ST-V)" option is on.  Same mapping as the reference ST-V
+   port, so an existing front-end profile keeps working. */
+static const struct { unsigned id; u8 key; unsigned player; const char *name; }
+kStvSystemKeys[] = {
+   { RETRO_DEVICE_ID_JOYPAD_L2, PERJAMMA_TEST,    0, "Test"    },
+   { RETRO_DEVICE_ID_JOYPAD_R2, PERJAMMA_SERVICE, 0, "Service" },
+   { RETRO_DEVICE_ID_JOYPAD_L3, PERJAMMA_PAUSE,   0, "Pause"   },
+};
+#define STV_SYSKEY_NB ((unsigned)(sizeof(kStvSystemKeys) / sizeof(kStvSystemKeys[0])))
+
+static const struct { unsigned id; u8 key; unsigned player; const char *name; }
+kStvGameKeys[] = {
+   { RETRO_DEVICE_ID_JOYPAD_SELECT, PERJAMMA_COIN1,      0, "Coin"    },
+   { RETRO_DEVICE_ID_JOYPAD_START,  PERJAMMA_START1,     0, "Start"   },
+   { RETRO_DEVICE_ID_JOYPAD_UP,     PERPAD_UP,           0, "Up"      },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT,  PERPAD_RIGHT,        0, "Right"   },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,   PERPAD_DOWN,         0, "Down"    },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,   PERPAD_LEFT,         0, "Left"    },
+   { RETRO_DEVICE_ID_JOYPAD_B,      PERPAD_A,            0, "Button1" },
+   { RETRO_DEVICE_ID_JOYPAD_A,      PERPAD_B,            0, "Button2" },
+   { RETRO_DEVICE_ID_JOYPAD_Y,      PERPAD_C,            0, "Button3" },
+   { RETRO_DEVICE_ID_JOYPAD_X,      PERPAD_X,            0, "Button4" },
+   { RETRO_DEVICE_ID_JOYPAD_SELECT, PERJAMMA_COIN2,      1, "Coin"    },
+   { RETRO_DEVICE_ID_JOYPAD_START,  PERJAMMA_START2,     1, "Start"   },
+   { RETRO_DEVICE_ID_JOYPAD_UP,     PERJAMMA_P2_UP,      1, "Up"      },
+   { RETRO_DEVICE_ID_JOYPAD_RIGHT,  PERJAMMA_P2_RIGHT,   1, "Right"   },
+   { RETRO_DEVICE_ID_JOYPAD_DOWN,   PERJAMMA_P2_DOWN,    1, "Down"    },
+   { RETRO_DEVICE_ID_JOYPAD_LEFT,   PERJAMMA_P2_LEFT,    1, "Left"    },
+   { RETRO_DEVICE_ID_JOYPAD_B,      PERJAMMA_P2_BUTTON1, 1, "Button1" },
+   { RETRO_DEVICE_ID_JOYPAD_A,      PERJAMMA_P2_BUTTON2, 1, "Button2" },
+   { RETRO_DEVICE_ID_JOYPAD_Y,      PERJAMMA_P2_BUTTON3, 1, "Button3" },
+   { RETRO_DEVICE_ID_JOYPAD_X,      PERJAMMA_P2_BUTTON4, 1, "Button4" },
+};
+#define STV_GAMEKEY_NB ((unsigned)(sizeof(kStvGameKeys) / sizeof(kStvGameKeys[0])))
+
 /* Frontend thread, at load time: negotiate the protocol, reset the port map. */
 static void yab_input_ports_init(void)
 {
@@ -1223,6 +1336,30 @@ static void yab_input_descriptors(void)
    static struct retro_input_descriptor desc[2 * (sizeof(d) / sizeof(d[0])) + 1];
    const unsigned nb = (unsigned)(sizeof(d) / sizeof(d[0]));
    unsigned p, i;
+
+   if (stv_mode) {
+      /* The cabinet table has no Saturn-only ids (and JOYPAD_SELECT, which
+         minarch needs to see for the coin key). */
+      static struct retro_input_descriptor sdesc[STV_SYSKEY_NB + STV_GAMEKEY_NB + 1];
+      unsigned n = 0;
+      memset(sdesc, 0, sizeof(sdesc));
+      if (opt_stv_service)
+         for (i = 0; i < STV_SYSKEY_NB; i++, n++) {
+            sdesc[n].port        = kStvSystemKeys[i].player;
+            sdesc[n].device      = RETRO_DEVICE_JOYPAD;
+            sdesc[n].id          = kStvSystemKeys[i].id;
+            sdesc[n].description = kStvSystemKeys[i].name;
+         }
+      for (i = 0; i < STV_GAMEKEY_NB; i++, n++) {
+         sdesc[n].port        = kStvGameKeys[i].player;
+         sdesc[n].device      = RETRO_DEVICE_JOYPAD;
+         sdesc[n].id          = kStvGameKeys[i].id;
+         sdesc[n].description = kStvGameKeys[i].name;
+      }
+      if (environ_cb != NULL)
+         environ_cb(RETRO_ENVIRONMENT_SET_INPUT_DESCRIPTORS, sdesc);
+      return;
+   }
 
    memset(desc, 0, sizeof(desc));
    for (p = 0; p < 2; p++)
@@ -1319,6 +1456,22 @@ static void PERLIBRETROApplyConfig(void)
    PortData_struct *portdata;
    void *controller;
 
+   if (stv_mode) {
+      /* One JAMMA cabinet controller; the keys are the cabinet's own ids, so
+         PerSetKey(key, key, cab) wires each one to its Press/Release handler. */
+      void *cab;
+      PerPortReset();
+      cab = (void *)PerCabAdd(NULL);
+      if (opt_stv_service)
+         for (i = 0; i < STV_SYSKEY_NB; i++)
+            PerSetKey(kStvSystemKeys[i].key, kStvSystemKeys[i].key, cab);
+      for (i = 0; i < STV_GAMEKEY_NB; i++)
+         PerSetKey(kStvGameKeys[i].key, kStvGameKeys[i].key, cab);
+      players = 2;
+      pad_cfg_dirty = 0;
+      return;
+   }
+
    for (i = 0; i < YAB_MAX_PORTS; i++)
       pad_type[i] = pad_type_pending[i];
    PerPortReset();
@@ -1358,6 +1511,28 @@ static int PERLIBRETROHandleEvents(void)
 
    if (pad_cfg_dirty)
       PERLIBRETROApplyConfig();
+   if (stv_mode) {
+      /* Cabinet inputs only: the Saturn pad loop below would push PERPAD_*
+         through the shared key table and clear what this loop set. */
+      if (opt_stv_service)
+         for (i = 0; i < STV_SYSKEY_NB; i++) {
+            if (input_state_cb_wrapper(kStvSystemKeys[i].player,
+                                       RETRO_DEVICE_JOYPAD, 0, kStvSystemKeys[i].id))
+               PerKeyDown(kStvSystemKeys[i].key);
+            else
+               PerKeyUp(kStvSystemKeys[i].key);
+         }
+      for (i = 0; i < STV_GAMEKEY_NB; i++) {
+         if (input_state_cb_wrapper(kStvGameKeys[i].player,
+                                    RETRO_DEVICE_JOYPAD, 0, kStvGameKeys[i].id))
+            PerKeyDown(kStvGameKeys[i].key);
+         else
+            PerKeyUp(kStvGameKeys[i].key);
+      }
+      if (YabauseExec() != 0)
+         return -1;
+      return 0;
+   }
    for (i = 0; i < players && i < YAB_MAX_PORTS; i++) {
       if (pad_type[i] == RETRO_DEVICE_NONE)
          continue;
@@ -1437,7 +1612,9 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
    memset(info, 0, sizeof(*info));
    info->library_name = "YabaSanshiro";
    info->library_version = CORE_VERSION;
-   info->valid_extensions = "cue|iso|chd|m3u";
+   /* zip: an ST-V game is a MAME romset and stv.c matches its entries by name
+      and CRC32, so the archive must reach the core untouched. */
+   info->valid_extensions = "cue|iso|chd|m3u|zip";
    /* The engine opens the image itself (yinit.cdpath), and a Saturn image is
       300-600 MB: with `false` the front end reads the whole file into RAM before
       retro_load_game and hands over a buffer this core never looks at.  Measured
@@ -1445,7 +1622,10 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
       first emulated second at 24 s, peak RSS 607 MB.  `true` matches the earlier
       h700-libretro core (need_fullpath = true). */
    info->need_fullpath = true;
-   info->block_extract = false;
+   /* true: the front end hands the archive over as-is.  With `false` it would
+      extract a .zip first, and an ST-V romset is exactly the case that must not
+      be unpacked (the engine has no zip reader for CD images either). */
+   info->block_extract = true;
 }
 
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
@@ -1461,6 +1641,24 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.aspect_ratio = 4.0f / 3.0f;
    info->timing.fps = (opt_videoformat_latched == VIDEOFORMATTYPE_PAL) ? 50.0 : 60.0;
    info->timing.sample_rate = 44100.0;
+
+   /* Vertical ST-V boards render sideways and the front end is asked to turn
+      the picture.  The command is sent unconditionally (0 included): a front
+      end keeps the last value it was handed (minarch's ma_gl_rotation is a
+      plain static), so silence would leave the previous title's rotation on.
+      The aspect ratio is inverted only while rotated, so the front end's own
+      width/height swap lands on the right box.  The latch from retro_load_game
+      covers the front ends that ask for av_info before the engine is built;
+      yabsys.isRotated (set by YabauseInit) is the authoritative value later. */
+   {
+      unsigned rotation = 0;
+      if (stv_mode)
+         rotation = (unsigned)(yabsys.isRotated != 0 || stv_rotated);
+      if (environ_cb != NULL)
+         environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
+      if (rotation != 0)
+         info->geometry.aspect_ratio = 1.0f / info->geometry.aspect_ratio;
+   }
 }
 
 RETRO_API void retro_set_controller_port_device(unsigned port, unsigned device)
@@ -2003,18 +2201,90 @@ static void disk_register(void)
             disk_count, content_path_buf[0] ? content_path_buf : "(none)");
 }
 
+/* "x.zip" (case-insensitive) */
+static int path_ext_is_zip(const char *path)
+{
+   const char *ext = strrchr(path, '.');
+   if (ext == NULL)
+      return 0;
+   ext++;
+   return (ext[0] == 'z' || ext[0] == 'Z') && (ext[1] == 'i' || ext[1] == 'I') &&
+          (ext[2] == 'p' || ext[2] == 'P') && ext[3] == '\0';
+}
+
+/* <save>/stv, per-game <game>.nv (EEPROM) and <game>.ram (backup card).  The
+   directory is created here because eeprom_deinit()/the backup card save only
+   work when it exists. */
+static void stv_setup_save_dirs(void)
+{
+   const char *save = libretro_save_dir[0] ? libretro_save_dir : ".";
+
+   snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s/stv", save);
+   if (mkdir(stv_eeprom_dir, 0777) != 0) {
+      struct stat st;
+      if (stat(stv_eeprom_dir, &st) != 0 || !S_ISDIR(st.st_mode))
+         LOG_WARN("ST-V: cannot create %s (EEPROM/backup card will not persist)",
+                  stv_eeprom_dir);
+   }
+   snprintf(stv_bup_path, sizeof(stv_bup_path), "%s/%s.ram", stv_eeprom_dir,
+            stv_game != NULL ? stv_game : "stv");
+}
+
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
+   /* A new load starts from scratch: drop the previous title's ST-V state. */
+   free(stv_game);
+   stv_game = NULL;
+   stv_mode = 0;
+   stv_rotated = 0;
+   stv_content_path[0] = '\0';
+   stv_bios_path[0]  = '\0';
+   stv_eeprom_dir[0] = '\0';
+   stv_bup_path[0]   = '\0';
+
    if (game != NULL) {
-      /* Content is a disc image or an .m3u playlist of them: build the disc list
-         and let the engine boot its first entry. */
-      disk_init_from_content(game->path);
-      libretro_content_path = (content_path_buf[0] != '\0') ? content_path_buf
-                                                            : game->path;
-      LOG_INFO("load_game: %s (%u bytes) -> boot image %s",
-               game->path != NULL ? game->path : "(no path)",
-               (unsigned)game->size,
-               libretro_content_path != NULL ? libretro_content_path : "(none)");
+      const char *content = game->path;
+      if (content != NULL && path_ext_is_zip(content)) {
+         /* ST-V: a MAME romset.  Detection needs the board BIOS (the game list
+            entries are matched together with it), so look for it next to the
+            front end's system files and fail loudly when it is missing. */
+         const char *sysdir = libretro_system_dir[0] ? libretro_system_dir : ".";
+         char *romset = NULL;
+
+         snprintf(stv_bios_path, sizeof(stv_bios_path), "%s/stvbios.zip", sysdir);
+         if (access(stv_bios_path, R_OK) != 0) {
+            LOG_WARN("ST-V: %s is missing; a romset cannot be identified "
+                      "without the ST-V BIOS", stv_bios_path);
+            return false;
+         }
+         STVGetSingle(content, stv_bios_path, &romset);
+         if (romset == NULL) {
+            LOG_WARN("ST-V: %s has no romset in the game list; this core does "
+                      "not read zipped Saturn images", content);
+            return false;
+         }
+         stv_mode = 1;
+         stv_game = romset;                 /* owned from here on */
+         stv_rotated = STVGetRotated(romset);
+         snprintf(stv_content_path, sizeof(stv_content_path), "%s", content);
+         libretro_content_path = stv_content_path;
+         stv_setup_save_dirs();
+         LOG_INFO("load_game: ST-V romset '%s' from %s (rotation=%d, eeprom=%s, "
+                  "card=%s)", stv_game, content, stv_rotated,
+                  stv_eeprom_dir, stv_bup_path);
+      } else {
+         /* Content is a disc image or an .m3u playlist of them: build the disc
+            list and let the engine boot its first entry.  A vertical ST-V title
+            leaves yabsys.isRotated set; a Saturn game reports 0. */
+         yabsys.isRotated = 0;
+         disk_init_from_content(content);
+         libretro_content_path = (content_path_buf[0] != '\0') ? content_path_buf
+                                                               : content;
+         LOG_INFO("load_game: %s (%u bytes) -> boot image %s",
+                  content != NULL ? content : "(no path)",
+                  (unsigned)game->size,
+                  libretro_content_path != NULL ? libretro_content_path : "(none)");
+      }
    } else {
       disk_init_from_content(NULL);
       libretro_content_path = NULL;
@@ -2029,6 +2299,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 
    /* libretro input protocol: ports, bitmask capability, descriptors. */
    yab_input_ports_init();
+   if (stv_mode)
+      players = 2;   /* two cabinet panels, no multitap */
    yab_input_descriptors();
 
    /* Async audio: ask for the front end's audio callback.  Registering it makes
@@ -2054,8 +2326,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
          LOG_INFO("audio: env62 buffer status refused");
    }
 
-   /* Disk control: the front end's disc list for this content. */
-   disk_register();
+   /* Disk control: the front end's disc list for this content.  An ST-V romset
+      has no disc to swap. */
+   if (!stv_mode)
+      disk_register();
 
    return true;
 }
@@ -2075,6 +2349,15 @@ RETRO_API void retro_unload_game(void)
    /* The frontend usually ran hw.context_destroy first; this call is idempotent
       and also covers frontends that only call unload_game. */
    LibretroEngineContextDestroy();
+   free(stv_game);
+   stv_game = NULL;
+   stv_mode = 0;
+   stv_rotated = 0;
+   stv_content_path[0] = '\0';
+   stv_bios_path[0]  = '\0';
+   stv_eeprom_dir[0] = '\0';
+   stv_bup_path[0]   = '\0';
+   players = 2;
 }
 
 RETRO_API unsigned retro_get_region(void)

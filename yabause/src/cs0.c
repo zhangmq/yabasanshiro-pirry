@@ -44,6 +44,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 
 #include <stdlib.h>
 #include "cs0.h"
+#ifdef __LIBRETRO__
+#include "decrypt.h"
+#include "stvcomp.h"
+#endif
 #include "error.h"
 #include "japmodem.h"
 #include "netlink.h"
@@ -1043,6 +1047,205 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 // General Cart functions
 //////////////////////////////////////////////////////////////////////////////
 
+
+#ifdef __LIBRETRO__
+/* ST-V ROM board mapped on A-bus CS0 (first 32 MiB) + CS1 (rest).
+   Ported from libretro/yabause@kronos (yabause/src/sys/memory/src/cs0.c, case CART_ROMSTV). */
+/* ST-V ROM decryption: the cart drives decrypt.c through cs1; the command is
+   encoded in the low nibble of the address.  Ported from
+   libretro/yabause@kronos yabause/src/sys/memory/src/cs0.c. */
+static u8 decryptOn = 0;
+
+
+#ifdef __LIBRETRO__
+/* 315-5838 board: the chip pulls its encrypted source words straight from the
+   cart image of the bank the SH-2 selected (MAME stv.cpp sega5838_source_r). */
+static u16 STVCompSourceRead(u32 word_addr)
+{
+   u32 logical = ((u32)STVCompGetBank() << 23) | (((u32)word_addr << 1) & 0x7FFFFF);
+   return T1ReadWord(CartridgeArea->rom, logical);
+}
+#endif
+
+static u8 FASTCALL ROMSTVCs0ReadByte(u32 addr)
+{
+   return T1ReadByte(CartridgeArea->rom, addr & 0x1FFFFFF);
+}
+
+static u16 FASTCALL ROMSTVCs0ReadWord(u32 addr)
+{
+   return T1ReadWord(CartridgeArea->rom, addr & 0x1FFFFFF);
+}
+
+static u32 FASTCALL ROMSTVCs0ReadLong(u32 addr)
+{
+#ifdef __LIBRETRO__
+   /* DecAthlete's 315-5838 decodes on the fly: 0x027FFFF8 + bank*8 MiB
+      returns two decompressed bytes (MAME sega5838_r). */
+   if (STVCompIsEnabled()) {
+      u32 off = addr & 0x1FFFFFF;
+      if (off < 0x1800000 && (off & 0x7FFFFF) == 0x7FFFF8) {
+         int bank = (off >> 23) & 3;
+         if (STVCompDecodeEnabled())
+            return ((u32)STVCompDataRead() << 16) | STVCompDataRead();
+         return T1ReadLong(CartridgeArea->rom, (bank << 23) | 0x7FFFF8);
+      }
+   }
+#endif
+   return T1ReadLong(CartridgeArea->rom, addr & 0x1FFFFFF);
+}
+
+static void FASTCALL ROMSTVCs0WriteByte(u32 addr, u8 val)
+{
+#ifdef __LIBRETRO__
+   if (STVCompIsEnabled() && (addr & 0x1FFFFFF) < 0x1800000)
+      return;
+#endif
+   T1WriteByte(CartridgeArea->rom, addr & 0x1FFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs0WriteWord(u32 addr, u16 val)
+{
+#ifdef __LIBRETRO__
+   /* The SH-2 writes the 5838 registers as two 16-bit halves as well (MAME's
+      32-bit handler receives them with a mem_mask): 0x...FFF0/FFF2 are the
+      source address, 0x...FFF4/FFF6 the tree/dictionary upload. */
+   if (STVCompIsEnabled()) {
+      u32 off = addr & 0x1FFFFFF;
+      if (off < 0x1800000) {
+         STVCompSetBank((off >> 23) & 3);
+         switch (off & 0x7FFFFF) {
+         case 0x7FFFF0:
+            STVCompSourceWrite((u32)val << 16, 0xFFFF0000);
+            break;
+         case 0x7FFFF2:
+            STVCompSourceWrite((u32)val, 0x0000FFFF);
+            break;
+         case 0x7FFFF4:
+            STVCompTableWrite(0, val);
+            break;
+         case 0x7FFFF6:
+            STVCompTableWrite(1, val);
+            break;
+         default:
+            break;
+         }
+         return;
+      }
+   }
+#endif
+   T1WriteWord(CartridgeArea->rom, addr & 0x1FFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs0WriteLong(u32 addr, u32 val)
+{
+#ifdef __LIBRETRO__
+   /* 315-5838: every 32-bit write in the 24 MiB window selects the source
+      bank; 0x...7FFFF0 feeds an encrypted source word and 0x...7FFFF4 the
+      dictionary/tree upload (MAME sega5838_w). */
+   if (STVCompIsEnabled()) {
+      u32 off = addr & 0x1FFFFFF;
+      if (off < 0x1800000) {
+         STVCompSetBank((off >> 23) & 3);
+         switch (off & 0x7FFFFF) {
+         case 0x7FFFF0:
+            STVCompSourceWrite(val, 0xFFFFFFFF);
+            break;
+         case 0x7FFFF4:
+            STVCompTableWrite(0, (u16)(val >> 16));
+            STVCompTableWrite(1, (u16)(val & 0xFFFF));
+            break;
+         default:
+            break;
+         }
+         return;
+      }
+   }
+#endif
+   T1WriteLong(CartridgeArea->rom, addr & 0x1FFFFFF, val);
+}
+
+static u8 FASTCALL ROMSTVCs1ReadByte(u32 addr)
+{
+   return T1ReadByte(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
+}
+
+static u16 FASTCALL ROMSTVCs1ReadWord(u32 addr)
+{
+   /* Only the two command latches at the very top of the CS1 window are
+    * readable: twcup98 writes 0x1234 to 0x04FFFFF8 and polls until it reads
+    * back (0x0600967C), so returning the cartridge bytes there hung the game
+    * for ever.
+    *
+    * The first version of this gated on "addr & 0xF == 8 / A", which hijacked
+    * every 16-bit CS1 read whose low nibble happened to be 8 or A -- that is
+    * one address in eight of the whole cartridge window.  tatacot reads its
+    * own graphics data through CS1 at such addresses and got the latch values
+    * instead: its background lost whole columns (evenly spaced black vertical
+    * bars) and its colours were wrong.  Gate on the full register address
+    * instead (Kronos reads the ROM unconditionally here at all). */
+   switch (addr & 0xFFFFFF) {
+   case 0xFFFFF8: return cyptoGetLowAddr();
+   case 0xFFFFFA: return cyptoGetHighAddr();
+   default:       break;
+   }
+   return T1ReadWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
+}
+
+static u32 FASTCALL ROMSTVCs1ReadLong(u32 addr)
+{
+#ifdef YAB_STV_DEBUG
+#endif
+   u8 decryptCmd = addr & 0xF;
+   if ((decryptOn & 0x1) && decryptCmd == 0xc) {
+      u16 res = cryptoDecrypt();
+      u16 res2 = cryptoDecrypt();
+      res = (u16)(((res & 0xff00) >> 8) | ((res & 0x00ff) << 8));
+      res2 = (u16)(((res2 & 0xff00) >> 8) | ((res2 & 0x00ff) << 8));
+      return (u32)(res2 | (res << 16));
+   }
+   return T1ReadLong(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF);
+}
+
+static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val)
+{
+   u8 decryptCmd = addr & 0xF;
+   if (decryptCmd == 0x1) { decryptOn = val & 0x1; return; }
+   T1WriteByte(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+}
+
+static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
+{
+#ifdef __LIBRETRO__
+   /* 315-5838 control register at 0x04200000 (bit 1 = decoder output). */
+   if (STVCompIsEnabled() && (addr & 0xFFFFFF) == 0x200000) {
+      STVCompSetControl(val);
+      return;
+   }
+#endif
+#ifdef YAB_STV_DEBUG
+#endif
+   u8 decryptCmd = addr & 0xF;
+   if (decryptCmd == 0x1) {
+      decryptOn = val & 0x1;
+   } else if (decryptCmd == 0x8) {
+      cyptoSetLowAddr(val);
+   } else if (decryptCmd == 0xa) {
+      cyptoSetHighAddr(val);
+   } else if (decryptCmd == 0xc) {
+      cyptoSetSubkey(val);
+   } else {
+      T1WriteWord(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+   }
+}
+
+static void FASTCALL ROMSTVCs1WriteLong(u32 addr, u32 val)
+{
+   T1WriteLong(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
+}
+
+#endif
+
 int CartInit(const char * filename, int type)
 {
    if ((CartridgeArea = (cartridge_struct *)calloc(1, sizeof(cartridge_struct))) == NULL)
@@ -1243,6 +1446,33 @@ int CartInit(const char * filename, int type)
          CartridgeArea->Cs0WriteLong = &ROM16MBITCs0WriteLong;
          break;
       }
+#ifdef __LIBRETRO__
+      case CART_ROMSTV: // ST-V ROM board (48 MiB linear image, filled by stv.c)
+      {
+         if ((CartridgeArea->rom = T1MemoryInit(CART_ROMSTV_SIZE)) == NULL)
+            return -1;
+
+         CartridgeArea->cartid = 0xFF; // same as Kronos; the real id is unknown
+
+         // Setup Functions
+         CartridgeArea->Cs0ReadByte = &ROMSTVCs0ReadByte;
+         CartridgeArea->Cs0ReadWord = &ROMSTVCs0ReadWord;
+         CartridgeArea->Cs0ReadLong = &ROMSTVCs0ReadLong;
+         CartridgeArea->Cs0WriteByte = &ROMSTVCs0WriteByte;
+         CartridgeArea->Cs0WriteWord = &ROMSTVCs0WriteWord;
+         CartridgeArea->Cs0WriteLong = &ROMSTVCs0WriteLong;
+
+         CartridgeArea->Cs1ReadByte = &ROMSTVCs1ReadByte;
+         CartridgeArea->Cs1ReadWord = &ROMSTVCs1ReadWord;
+         CartridgeArea->Cs1ReadLong = &ROMSTVCs1ReadLong;
+         CartridgeArea->Cs1WriteByte = &ROMSTVCs1WriteByte;
+         CartridgeArea->Cs1WriteWord = &ROMSTVCs1WriteWord;
+         CartridgeArea->Cs1WriteLong = &ROMSTVCs1WriteLong;
+
+         STVCompSetSourceReader(STVCompSourceRead);
+         break;
+      }
+#endif
       case CART_JAPMODEM: // Sega Saturn Modem(Japanese)
       {
          CartridgeArea->cartid = 0xFF;

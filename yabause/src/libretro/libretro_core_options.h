@@ -302,6 +302,24 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
       "100"
    },
 
+   {
+      "yabasanshiro_stv_region",
+      "ST-V BIOS Region (restart)",
+      NULL,
+      "ST-V only: which region's BIOS from stvbios.zip to prefer. The cart "
+      "header limits the choice, some Japanese titles only boot on JP.",
+      NULL,
+      "system",
+      {
+         { "EU", "Europe" },
+         { "US", "USA" },
+         { "JP", "Japan" },
+         { "TW", "Taiwan" },
+         { NULL, NULL },
+      },
+      "EU"
+   },
+
    /* ---- input --------------------------------------------------------- */
    {
       "yabasanshiro_multitap_port1",
@@ -322,6 +340,21 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
       "6Player Adaptor (Port 2)",
       NULL,
       "Enable a 6-player adaptor on controller port 2.",
+      NULL,
+      "input",
+      {
+         { "disabled", NULL },
+         { "enabled",  NULL },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+   {
+      "yabasanshiro_service_enabled",
+      "Service Mode (ST-V)",
+      NULL,
+      "ST-V only: expose the cabinet Test/Service/Pause keys "
+      "(L2/R2/L3 by default).",
       NULL,
       "input",
       {

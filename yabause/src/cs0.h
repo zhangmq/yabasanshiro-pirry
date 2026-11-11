@@ -97,3 +97,10 @@ int CartSaveState(FILE *fp);
 int CartLoadState(FILE *fp, int version, int size);
 
 #endif
+
+#ifdef __LIBRETRO__
+/* ST-V (Sega Titan Video): the game is a ROM board, not a CD.  Libretro-only:
+   the standalone never builds stv.c and has no ST-V path. */
+#define CART_ROMSTV            12
+#define CART_ROMSTV_SIZE       0x3000000 /* 48 MiB, matches Kronos CART_ROMSTV */
+#endif
