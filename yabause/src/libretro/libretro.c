@@ -1198,7 +1198,13 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
    info->library_name = "YabaSanshiro";
    info->library_version = CORE_VERSION;
    info->valid_extensions = "cue|iso|chd|m3u";
-   info->need_fullpath = false; /* placeholder needs no content */
+   /* The engine opens the image itself (yinit.cdpath), and a Saturn image is
+      300-600 MB: with `false` the front end reads the whole file into RAM before
+      retro_load_game and hands over a buffer this core never looks at.  Measured
+      on the 421 MB Castlevania ISO: RSS 44 -> 434 MB while the front end read it,
+      first emulated second at 24 s, peak RSS 607 MB.  `true` matches the earlier
+      h700-libretro core (need_fullpath = true). */
+   info->need_fullpath = true;
    info->block_extract = false;
 }
 
