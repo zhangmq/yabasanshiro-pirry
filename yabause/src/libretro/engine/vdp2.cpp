@@ -151,10 +151,9 @@ static s64 onesecondticks = 0;
 
 static int enableFrameLimit = 1;
 static int frameLimitShift = 0;
-/* Core-only: run the autoframeskip decision without the 60 Hz sleep.  The front
-   end's vsync paces the core (the swap happens after retro_run returns, outside
-   this handler), so sleeping here would pace twice.  Set by VDP2SetFrameLimit(3). */
-static int frameLimitNoSleep = 0;
+/* Set at the end of vdp2VBlankIN(), cleared by Vdp2FinishField(): the limiter and Sync run
+   after the front end's present, never before it (see vdp2VBlankIN). */
+static int limit_pending = 0;
 
 //#define LOG yprintf
 #define PROFILE_RENDERING 0
@@ -309,6 +308,7 @@ extern "C" void Vdp1JoinPendingRendersC(void) { Vdp1JoinPendingRenders(); }
 
 extern "C" void * VdpProc(void *arg);      // rendering thread.
 static void vdp2VBlankIN(void); // VBLANK-IN handler
+extern "C" void Vdp2FinishField(void);   // second half of it, after the front end's present
 static void vdp2VBlankOUT(void);// VBLANK-OUT handler
 void VDP2genVRamCyclePattern();
 int Vdp2GenerateCCode();
@@ -857,6 +857,7 @@ extern "C" void Vdp2DrainQueueNoRender(void)
     return;
   while (YaGetQueueSize(evqueue) > 0)
     YabWaitEventQueue(evqueue);
+  Vdp2FinishField();   /* a consumed VIN may have left the limiter pending */
 }
 
 /* Implemented by libretro.c: poll + publish the pad snapshot for the field that
@@ -908,6 +909,9 @@ static void Vdp2HandleEvent(int evcode) {
 
 extern "C" int Vdp2ConsumeFrontendEvent(void) {
   int evcode;
+  /* A field that the caller consumed but did not present (command paths, the shutdown drain)
+     still needs its limiter: the machine is parked on this field's VIN token until it runs. */
+  Vdp2FinishField();
   if (evqueue == NULL || YaGetQueueSize(evqueue) == 0) return 0;
   evcode = YabWaitEventQueue(evqueue);
   Vdp2HandleEvent(evcode);
@@ -939,6 +943,7 @@ extern "C" void * VdpProc( void *arg ){
     }
     evcode = YabWaitEventQueue(evqueue);
     Vdp2HandleEvent(evcode);
+    Vdp2FinishField();   /* worker thread: it presents inside Vdp2DrawEnd, so nothing defers it */
   }
   return NULL;
 }
@@ -1111,16 +1116,9 @@ void VDP2SetFrameLimit(int mode) {
     onesecondticks = 0;
     lastticks = YabauseGetTicks();
     break;
-  case 3:
-    /* libretro core: keep the autoframeskip decision, drop the sleep.  Otherwise
-       identical to mode 0 (60 Hz budget). */
-    enableFrameLimit = 1;
-    frameLimitShift = 0;
-    frameLimitNoSleep = 1;
-    framecount = 0;
-    onesecondticks = 0;
-    lastticks = YabauseGetTicks();
-    break;
+  /* Mode 3 (skip decision without the 60 Hz sleep) was removed 2026-11-11: the sleep is the
+     standalone's own pacing mechanism.  A caller that still passes 3 lands in `default`, which
+     is mode 0 exactly. */
   default:
     enableFrameLimit = 1;
     frameLimitShift = 0;
@@ -1158,15 +1156,7 @@ void frameSkipAndLimit() {
     diffticks = curticks - lastticks;
 
 
-    /* Core mode 3 only: the front end's vsync owns the schedule, so the residual
-       against the ideal 60 Hz grid stays slightly positive and a strict
-       comparison skips almost every field (measured: Golden Axe skip ~26/s vs
-       the standalone's ~4/s).  Require a real overrun: a quarter of a field
-       behind.  The standalone can stay strict because its own sleep pins every
-       field to the grid. */
-    const s64 skip_slack = frameLimitNoSleep
-                           ? (s64)(yabsys.OneFrameTime >> (frameLimitShift + 2)) : 0;
-    if ( autoframeskipenab && (onesecondticks + diffticks) > targetTime + skip_slack )
+    if ( autoframeskipenab && (onesecondticks + diffticks) > targetTime )
     {
       // Skip the next frame
       skipnextframe = 1;
@@ -1178,7 +1168,7 @@ void frameSkipAndLimit() {
 
     // just wait for next vsync
     targetTime -= 1000;
-    if (!frameLimitNoSleep && (s64)(onesecondticks + diffticks) < targetTime)
+    if ((s64)(onesecondticks + diffticks) < targetTime)
     {
 
       s64 sleeptime = (targetTime - (onesecondticks + diffticks));
@@ -1216,8 +1206,6 @@ void vdp2VBlankIN(void) {
    //if (Vdp1External.manualchange) Vdp1Regs->EDSR >>= 1;
 
    VIDCore->Vdp2DrawEnd();
-   frameSkipAndLimit();
-   VIDCore->Sync();
    /* In decoupled mode the emulation thread sets both itself (Vdp2VBlankIN); doing it here would
       fire a second time. */
    if (!g_vin_decoupled) {
@@ -1230,10 +1218,25 @@ void vdp2VBlankIN(void) {
    //   SH2SendInterrupt(SSH2, 0x43, 0x6);
    FrameProfileAdd("VIN flag");
    FRAMELOG("**** VIN(T) *****\n");
+   /* The limiter and Sync must run AFTER the front end's present: the standalone presents
+      inside Vdp2DrawEnd (YglRender ends with YuiSwapBuffers) and only then lets
+      frameSkipAndLimit() read the clock (vdp2.cpp:1108-1109), so the swap's wait is measured
+      as part of this field and absorbed by this field's sleep.  A core that presents after
+      the limiter pays that wait one field late, on top of a sleep already spent.  The caller
+      (retro_run) presents between the two halves and then calls Vdp2FinishField(). */
+   limit_pending = 1;
+
+}
+
+/* Second half of vdp2VBlankIN(), run by the caller after its present (and by any consumer that
+   does not present, so the machine is never left parked on the VIN token). */
+extern "C" void Vdp2FinishField(void) {
+   if (!limit_pending) return;
+   limit_pending = 0;
+   frameSkipAndLimit();
+   VIDCore->Sync();
    yab_input_publish();   /* input snapshot belongs to the field released below */
    YabAddEventQueue(rcv_evqueue, 0);
-   
-
 }
 
 //////////////////////////////////////////////////////////////////////////////

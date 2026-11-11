@@ -99,6 +99,9 @@ extern void Vdp2SetFrontendConsumer(int on);
 extern void Vdp2SetRenderThreadHere(void);
 extern void Vdp2SetEventPostedHook(void (*fn)(void));
 extern int  Vdp2ConsumeFrontendEvent(void);
+/* Second half of the engine's VIN handler: limiter + Sync + VIN token, run after the
+   present so the limiter measures the swap (see vdp2VBlankIN's comment). */
+extern void Vdp2FinishField(void);
 extern void Vdp2AbortJoins(int on);
 extern void Vdp2DrainQueueNoRender(void);
 extern unsigned Vdp2FieldSeq(void);
@@ -773,13 +776,15 @@ static void yab_options_apply(void)
    }
    if (opt_frameskip != applied_frameskip) {
       applied_frameskip = opt_frameskip;
-      if (opt_frameskip) {
-         VDP2SetFrameLimit(3);
+      /* Only the skip decision is toggled, like the standalone's
+         EnableAutoFrameSkip()/DisableAutoFrameSkip(): the frame limit stays what YabauseInit()
+         set (yinit.framelimit = 0, the 60/50 Hz schedule with its sleep).  VDP2SetFrameLimit()
+         re-anchors the limiter (framecount/onesecondticks/lastticks = 0), so calling it on a
+         skip toggle would wipe the lateness the decision accumulates. */
+      if (opt_frameskip)
          EnableAutoFrameSkip();
-      } else {
-         VDP2SetFrameLimit(0);
+      else
          DisableAutoFrameSkip();
-      }
       LOG_INFO("option: autoframeskip %s", opt_frameskip ? "on" : "off");
    }
    if (opt_resolution_mode != applied_resolution) {
@@ -894,29 +899,20 @@ void LibretroEngineContextReset(void)
          }
       }
    {
-      extern void VDP2SetFrameLimit(int mode);
-      /* Autoframeskip is available but OFF by default.  The engine's skip
-         decision compares wall time against an ideal 60 Hz schedule and is
-         coupled to frameSkipAndLimit()'s own sleep; in the core the schedule
-         comes from the front end's vsync (the swap happens after retro_run
-         returns), so that measure sees every field as "behind" and the engine
-         skips continuously (measured: Golden Axe 34 fps, skip ~21/s, machine
-         still 16.7 ms).  Opt in with YAB_FRAMESKIP=1 only to study it.
-         Mode 3 = 60 Hz budget without the sleep (the front end paces). */
+      /* Autoframeskip is available but OFF by default.  The decision and its 60/50 Hz schedule
+         are the engine's own (frameSkipAndLimit), exactly as in the standalone; the frame limit
+         itself is fixed at mode 0 by YabauseInit() (yinit.framelimit = 0), so nothing here
+         touches VDP2SetFrameLimit() -- see the option handler above for why. */
       {
          const char *fs = getenv("YAB_FRAMESKIP");
          if ((fs != NULL && fs[0] == '1') || opt_frameskip) {
-            VDP2SetFrameLimit(3);
             EnableAutoFrameSkip();
             if (fs != NULL && fs[0] == '1' && !opt_frameskip)
                LOG_WARN("option: autoframeskip OFF but forced by YAB_FRAMESKIP=1");
-            LOG_INFO("engine frame limit: 60 Hz budget, autoframeskip ON (option or YAB_FRAMESKIP=1)");
+            LOG_INFO("engine frame limit: 60 Hz schedule, autoframeskip ON (option or YAB_FRAMESKIP=1)");
          } else {
-            /* Standalone `-nf` parity: the limiter itself stays on (framelimit 0
-               = the 60 Hz schedule with its sleep/busy-wait), only the skip
-               decision is disabled.  Mode 1 would short-circuit the whole
-               function and leave a different execution path. */
-            VDP2SetFrameLimit(0);
+            /* The limiter itself stays on (mode 0 = the schedule with its sleep/busy-wait),
+               only the skip decision is disabled -- the standalone's `-nf` path. */
             DisableAutoFrameSkip();
             LOG_INFO("engine frame limit: 60 Hz schedule, frameskip off (standalone -nf path)");
          }
@@ -1490,11 +1486,13 @@ RETRO_API void retro_reset(void)
 
 RETRO_API void retro_run(void)
 {
-   /* libretro contract: poll at least once per retro_run, on this thread.  The
-      input snapshot is published from the engine's VIN handler (vdp2.cpp). */
-   if (input_poll_cb != NULL)
-      input_poll_cb();
-   SNDLibretroHeartbeat();   /* the only pause signal libretro offers us */
+   /* libretro contract: poll at least once per retro_run, on this thread
+      (libretro.h:9358).  A call can cover more than one field -- a skipped field
+      presents nothing, so the call continues into the next one -- and the
+      standalone samples the pad once per field, so the poll sits at the top of
+      the field loop below (and once here for the no-engine path).
+      SNDLibretroHeartbeat() is the only pause signal libretro offers us. */
+   SNDLibretroHeartbeat();
    yab_in_run = 1;
 
    if (engine_up) {
@@ -1514,57 +1512,73 @@ RETRO_API void retro_run(void)
          outside the render stack (a change is then visible one field late, which
          is what the standalone's fixed window hides anyway). */
       core_apply_resolution();
-      /* One field per call, and the call does not return before that field has
-         been handled: consume the events, and when the queue is empty block on
-         the machine's post notification (no timeout).  Draining the whole queue
-         instead would pump the machine to 86-97 fps, because it posts its VIN
-         event before running the field.
-
-         The break is per FIELD, not per presented frame: with autoframeskip a
-         field may present nothing (VIDDummy), and returning only on presentation
-         would halve the front end's call rate and therefore the game's speed. */
-      const unsigned seq0 = Vdp2FieldSeq();
-      struct timespec t0, t1, t2, w0, d0, d1;
+      /* One call = one video frame (libretro.h:9357).  A field that autoframeskip drops
+         presents nothing -- the standalone does not swap on a skipped field either -- so the
+         call keeps running fields until one is actually drawn, and only that field's
+         present ends the call.  Inside a field the order is the standalone's:
+         Vdp2DrawEnd (the engine renders into the front end's FBO) -> video_cb (the swap,
+         which is where the standalone's YuiSwapBuffers sits) -> Vdp2FinishField (the
+         limiter reads the clock only now, then sleeps, then Sync).  Presenting after the
+         limiter instead would charge the swap's wait to the next field, on top of a sleep
+         that was already spent.
+         Draining the whole queue without a field boundary would pump the machine to 86-97
+         fps, because it posts its VIN event before running the field. */
+      unsigned ready0 = frame_ready;
+      struct timespec t1, t2, w0, d0, d1;
       double draw_ms = 0.0, wait_ms = 0.0;
-      clock_gettime(CLOCK_MONOTONIC, &t0);
       for (;;) {
-         /* Drawing and waiting for the machine are measured apart: a heavy game
-            keeps this thread waiting for VOUT most of the field, and folding
-            that into one "render" number hides which side is the bottleneck. */
-         clock_gettime(CLOCK_MONOTONIC, &d0);
-         while (Vdp2ConsumeFrontendEvent()) {
+         const unsigned seq0 = Vdp2FieldSeq();
+         int drew;
+         /* Input once per field (standalone parity): the snapshot is published from the
+            engine's VIN handler, before the machine runs this field's VBlank routine. */
+         if (input_poll_cb != NULL)
+            input_poll_cb();
+         /* Drawing and waiting for the machine are measured apart: a heavy game keeps this
+            thread waiting for VOUT most of the field, and folding that into one "render"
+            number hides which side is the bottleneck.  The limiter's sleep is outside this
+            number now that Vdp2FinishField() runs it after the present. */
+         for (;;) {
+            clock_gettime(CLOCK_MONOTONIC, &d0);
+            while (Vdp2ConsumeFrontendEvent()) {
+               if (Vdp2FieldSeq() != seq0) break;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &d1);
+            draw_ms += (d1.tv_sec - d0.tv_sec) * 1e3 + (d1.tv_nsec - d0.tv_nsec) / 1e6;
             if (Vdp2FieldSeq() != seq0) break;
+            clock_gettime(CLOCK_MONOTONIC, &w0);
+            pthread_mutex_lock(&ev_mtx);
+            if (ev_posted == ev_seen)
+               pthread_cond_wait(&ev_cv, &ev_mtx);
+            ev_seen = ev_posted;
+            pthread_mutex_unlock(&ev_mtx);
+            {
+               struct timespec w1;
+               clock_gettime(CLOCK_MONOTONIC, &w1);
+               wait_ms += (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
+            }
          }
-         clock_gettime(CLOCK_MONOTONIC, &d1);
-         draw_ms += (d1.tv_sec - d0.tv_sec) * 1e3 + (d1.tv_nsec - d0.tv_nsec) / 1e6;
-         if (Vdp2FieldSeq() != seq0) break;
-         clock_gettime(CLOCK_MONOTONIC, &w0);
-         pthread_mutex_lock(&ev_mtx);
-         if (ev_posted == ev_seen)
-            pthread_cond_wait(&ev_cv, &ev_mtx);
-         ev_seen = ev_posted;
-         pthread_mutex_unlock(&ev_mtx);
-         {
-            struct timespec w1;
-            clock_gettime(CLOCK_MONOTONIC, &w1);
-            wait_ms += (w1.tv_sec - w0.tv_sec) * 1e3 + (w1.tv_nsec - w0.tv_nsec) / 1e6;
+         /* This field's present: frame_ready advances inside YuiSwapBuffers, i.e. only when
+            VIDCore->Vdp2DrawEnd() really ran (a skipped field ran VIDDummy's no-op). */
+         drew = (frame_ready != ready0);
+         if (drew) {
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            frame_sent = frame_ready;
+            video_cb(RETRO_HW_FRAME_BUFFER_VALID,
+                     (unsigned)(frame_width > 0 ? frame_width : TEST_W),
+                     (unsigned)(frame_height > 0 ? frame_height : TEST_H), 0);
+            clock_gettime(CLOCK_MONOTONIC, &t2);
+            acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
          }
+         Vdp2FinishField();   /* limiter (clock + skip decision + sleep), Sync, VIN token */
+         if (drew)
+            break;
       }
       acc_draw_ms += draw_ms;
       acc_wait_ms += wait_ms;
-      clock_gettime(CLOCK_MONOTONIC, &t1);
-      /* Every call ends with a picture.  A field that autoframeskip dropped ran
-         VIDDummy, so the FBO still holds the previous picture and re-presenting it
-         is exactly what the standalone shows when it does not swap.  No
-         video_cb(NULL): the hw-render frame buffer is always valid. */
-      frame_sent = frame_ready;
-      video_cb(RETRO_HW_FRAME_BUFFER_VALID,
-               (unsigned)(frame_width > 0 ? frame_width : TEST_W),
-               (unsigned)(frame_height > 0 ? frame_height : TEST_H), 0);
-      clock_gettime(CLOCK_MONOTONIC, &t2);
-      acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
       acc_calls++;
    } else {
+      if (input_poll_cb != NULL)
+         input_poll_cb();
       render_test_card();
    }
 
