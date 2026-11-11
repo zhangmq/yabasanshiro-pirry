@@ -84,6 +84,12 @@ extern CDInterface ArchCD;
 
 extern CDInterface WebApiCD;
 
+#ifdef __LIBRETRO__
+/* Read the IP.BIN region field of an image without initialising the CD block
+   (libretro "Video Format = auto").  0 on success, -1 when unreadable. */
+int ISOCDReadRegionCode(const char *image_path, char *region, size_t region_size);
+#endif
+
 
 #if defined (__cplusplus)
 }

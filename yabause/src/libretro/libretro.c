@@ -39,6 +39,7 @@
 #include <string.h>
 
 #include "libretro.h"
+#include "libretro_core_options.h"   /* core options v2 table */
 #include "log.h"
 #include <pthread.h>
 #include <signal.h>
@@ -51,6 +52,8 @@
 #include "vdp1.h"     /* VIDCore->GetNativeResolution / Resize */
 #include "vidogl.h"
 #include "sh2core.h"
+#include "sh2int.h"   /* SH2CORE_INTERPRETER (core option) */
+#include "smpc.h"     /* SmpcSetSystemLanguage (core option) */
 #include "scsp.h"
 #include "sndlibretro.h"
 #include "m68kcore.h"
@@ -519,6 +522,236 @@ static void yab_audio_set_state(bool enabled)
    LOG_DEBUG("audio: front end audio driver %s", enabled ? "active" : "inactive");
 }
 
+/* ------------------------------------------------------------------------- *
+ * Core options (libretro protocol)
+ *
+ * The table is in libretro_core_options.h; this block reads the values and
+ * applies them.  Two kinds:
+ *   - restart-type (the name carries "(restart)"): latched in
+ *     LibretroEngineContextReset(), i.e. read when the engine is built.  The
+ *     front end cannot restart a core by itself, so the name is the only signal
+ *     it can show; see REQ-CORE-OPTIONS-20261111.md.
+ *   - live: applied from retro_run, on the render thread with the front end's
+ *     context current.  Values that rebuild GL objects are only touched there,
+ *     before the field's VDP events are consumed.
+ * ------------------------------------------------------------------------- */
+enum { YAB_VF_AUTO = 0, YAB_VF_NTSC = 1, YAB_VF_PAL = 2 };
+
+static int  opt_videoformat = YAB_VF_AUTO;
+static int  opt_videoformat_latched = VIDEOFORMATTYPE_NTSC;  /* for av_info/region */
+static int  opt_resolution_mode = 3;            /* RES_ORIGINAL */
+static int  opt_rbg_resolution_mode = 0;        /* RBG_RES_ORIGINAL */
+static int  opt_rbg_use_compute_shader = 1;
+static int  opt_texcache_persist = 0;   /* off by default: helps few games, hurts some */
+static int  opt_interlace_half = 0;
+static int  opt_frameskip = 0;
+static int  opt_sh2coretype = 3;                /* dynarec (DYNAREC_DEVMIYAX) */
+static int  opt_addon_cart = CART_DRAM32MBIT;
+static int  opt_force_hle_bios = 0;
+static int  opt_system_language = 0;
+static int  opt_multitap[2];
+static int  opt_scsp_dsp = 1;
+static int  opt_cd_volume = 100;
+static int  opt_sfx_volume = 100;
+
+/* Engine-side hooks without a header of their own. */
+extern int  g_interlace_half_menu;      /* vidogl.c:3619, read per draw          */
+extern void ScspSetCddaVolume(int v);   /* scsp.c:1962, read per mix             */
+extern void ScspSetSfxVolume(int v);    /* scsp.c:1963, read per mix             */
+
+/* Applied-state cache: the engine already has these after an init, so the first
+   retro_run does not re-apply (a resolution change rebuilds GL objects). */
+static int  applied_resolution = -1, applied_rbg_res = -1, applied_rbg_cs = -1;
+static int  applied_frameskip = -1, applied_dsp = -1, applied_cdvol = -1;
+static int  applied_sfxvol = -1, applied_interlace = -1, applied_texcache = -1;
+static int  applied_multitap[2] = { -1, -1 };
+
+static const char *opt_str(const char *key)
+{
+   struct retro_variable var;
+
+   if (environ_cb == NULL)
+      return NULL;
+   var.key = key;
+   var.value = NULL;
+   if (!environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var))
+      return NULL;
+   return var.value;
+}
+
+static int opt_is(const char *key, const char *value)
+{
+   const char *v = opt_str(key);
+   return v != NULL && strcmp(v, value) == 0;
+}
+
+/* Read every option into the state above (no engine work). */
+static void yab_options_read(void)
+{
+   const char *v;
+
+   if (opt_is("yabasanshiro_videoformattype", "PAL"))       opt_videoformat = YAB_VF_PAL;
+   else if (opt_is("yabasanshiro_videoformattype", "NTSC")) opt_videoformat = YAB_VF_NTSC;
+   else                                                     opt_videoformat = YAB_VF_AUTO;
+
+   if (opt_is("yabasanshiro_resolution_mode", "2x"))        opt_resolution_mode = 2;
+   else if (opt_is("yabasanshiro_resolution_mode", "4x"))   opt_resolution_mode = 1;
+   else                                                     opt_resolution_mode = 3;
+
+   if (opt_is("yabasanshiro_rbg_resolution_mode", "2x"))         opt_rbg_resolution_mode = 1;
+   else if (opt_is("yabasanshiro_rbg_resolution_mode", "720p"))  opt_rbg_resolution_mode = 2;
+   else if (opt_is("yabasanshiro_rbg_resolution_mode", "1080p")) opt_rbg_resolution_mode = 3;
+   else                                                          opt_rbg_resolution_mode = 0;
+
+   opt_rbg_use_compute_shader = !opt_is("yabasanshiro_rbg_use_compute_shader", "disabled");
+   opt_texcache_persist       =  opt_is("yabasanshiro_texcache_persist", "enabled");
+   opt_interlace_half         =  opt_is("yabasanshiro_interlace_half", "enabled");
+   opt_frameskip              =  opt_is("yabasanshiro_frameskip", "auto");
+
+   opt_sh2coretype = opt_is("yabasanshiro_sh2coretype", "interpreter")
+                     ? SH2CORE_INTERPRETER : 3;
+
+   if (opt_is("yabasanshiro_addon_cart", "none"))                 opt_addon_cart = CART_NONE;
+   else if (opt_is("yabasanshiro_addon_cart", "1M_extended_ram")) opt_addon_cart = CART_DRAM8MBIT;
+   else                                                           opt_addon_cart = CART_DRAM32MBIT;
+
+   opt_force_hle_bios = opt_is("yabasanshiro_force_hle_bios", "enabled");
+
+   if (opt_is("yabasanshiro_system_language", "german"))        opt_system_language = 1;
+   else if (opt_is("yabasanshiro_system_language", "french"))   opt_system_language = 2;
+   else if (opt_is("yabasanshiro_system_language", "spanish"))  opt_system_language = 3;
+   else if (opt_is("yabasanshiro_system_language", "italian"))  opt_system_language = 4;
+   else if (opt_is("yabasanshiro_system_language", "japanese")) opt_system_language = 5;
+   else                                                         opt_system_language = 0;
+
+   opt_multitap[0] = opt_is("yabasanshiro_multitap_port1", "enabled");
+   opt_multitap[1] = opt_is("yabasanshiro_multitap_port2", "enabled");
+
+   opt_scsp_dsp = !opt_is("yabasanshiro_scsp_dsp", "disabled");
+
+   v = opt_str("yabasanshiro_cd_volume");
+   opt_cd_volume = v != NULL ? atoi(v) : 100;
+   v = opt_str("yabasanshiro_sfx_volume");
+   opt_sfx_volume = v != NULL ? atoi(v) : 100;
+}
+
+/* Latch the video standard for this content.  "auto" reads the disc IP.BIN
+   region (E/A/L = PAL, J/U/T/K/B = NTSC), the same rule the engine's SMPC
+   autodetect uses; unreadable images stay NTSC.  Runs in retro_load_game: the
+   front end asks for retro_get_system_av_info() before the engine exists. */
+static void yab_videoformat_latch(void)
+{
+   int pal = (opt_videoformat == YAB_VF_PAL);
+
+   if (opt_videoformat == YAB_VF_AUTO) {
+      char region[17];
+      if (libretro_content_path != NULL &&
+          ISOCDReadRegionCode(libretro_content_path, region, sizeof(region)) == 0) {
+         switch (region[0]) {
+            case 'E': case 'A': case 'L': pal = 1; break;
+            case 'J': case 'U': case 'T': case 'K': case 'B': pal = 0; break;
+            default: pal = 0; break;
+         }
+         LOG_INFO("option: video format auto -> region '%s' = %s",
+                  region, pal ? "PAL 50Hz" : "NTSC 60Hz");
+      } else {
+         LOG_INFO("option: video format auto, disc region unreadable -> NTSC 60Hz");
+      }
+   } else {
+      LOG_INFO("option: video format forced %s", pal ? "PAL 50Hz" : "NTSC 60Hz");
+   }
+   opt_videoformat_latched = pal ? VIDEOFORMATTYPE_PAL : VIDEOFORMATTYPE_NTSC;
+}
+
+/* The engine has just been built with the option values: remember them, so the
+   live applier only writes what really changed. */
+static void yab_options_seed(void)
+{
+   applied_resolution = opt_resolution_mode;
+   applied_rbg_res    = opt_rbg_resolution_mode;
+   applied_rbg_cs     = opt_rbg_use_compute_shader;
+   applied_frameskip  = opt_frameskip;
+   applied_dsp        = opt_scsp_dsp;
+   applied_cdvol      = opt_cd_volume;
+   applied_sfxvol     = opt_sfx_volume;
+   applied_interlace  = opt_interlace_half;
+   applied_texcache   = opt_texcache_persist;
+   applied_multitap[0] = opt_multitap[0];
+   applied_multitap[1] = opt_multitap[1];
+}
+
+/* Push changed live options into the engine.  retro_run only (render thread,
+   front end context current); the resolution change rebuilds GL objects. */
+static void yab_options_apply(void)
+{
+   if (opt_texcache_persist != applied_texcache) {
+      applied_texcache = opt_texcache_persist;
+      g_texcache_persist = opt_texcache_persist;
+      LOG_INFO("option: texture cache persist %s", opt_texcache_persist ? "on" : "off");
+   }
+   if (opt_interlace_half != applied_interlace) {
+      applied_interlace = opt_interlace_half;
+      g_interlace_half_menu = opt_interlace_half;
+      LOG_INFO("option: interlace backgrounds %s", opt_interlace_half ? "on" : "off");
+   }
+   if (opt_scsp_dsp != applied_dsp) {
+      applied_dsp = opt_scsp_dsp;
+      g_scsp_dsp_off = opt_scsp_dsp ? 0 : 1;
+      LOG_INFO("option: SCSP DSP %s", opt_scsp_dsp ? "on" : "off");
+   }
+   if (opt_cd_volume != applied_cdvol) {
+      applied_cdvol = opt_cd_volume;
+      ScspSetCddaVolume(opt_cd_volume);
+      LOG_INFO("option: CD volume %d", opt_cd_volume);
+   }
+   if (opt_sfx_volume != applied_sfxvol) {
+      applied_sfxvol = opt_sfx_volume;
+      ScspSetSfxVolume(opt_sfx_volume);
+      LOG_INFO("option: SFX volume %d", opt_sfx_volume);
+   }
+   if (opt_multitap[0] != applied_multitap[0] || opt_multitap[1] != applied_multitap[1]) {
+      applied_multitap[0] = opt_multitap[0];
+      applied_multitap[1] = opt_multitap[1];
+      /* No multitap support in the peripheral core yet: record the choice so it
+         is not silently ignored, see REQ-CORE-OPTIONS-20261111.md. */
+      LOG_INFO("option: 6Player adaptor port1=%d port2=%d (not implemented yet)",
+               opt_multitap[0], opt_multitap[1]);
+   }
+
+   if (!engine_up)
+      return;
+
+   if (opt_rbg_resolution_mode != applied_rbg_res) {
+      applied_rbg_res = opt_rbg_resolution_mode;
+      VideoSetSetting(VDP_SETTING_RBG_RESOLUTION_MODE, opt_rbg_resolution_mode);
+      LOG_INFO("option: RBG resolution mode %d", opt_rbg_resolution_mode);
+   }
+   if (opt_rbg_use_compute_shader != applied_rbg_cs) {
+      applied_rbg_cs = opt_rbg_use_compute_shader;
+      VideoSetSetting(VDP_SETTING_RBG_USE_COMPUTESHADER, opt_rbg_use_compute_shader);
+      LOG_INFO("option: RBG compute shader %s", opt_rbg_use_compute_shader ? "on" : "off");
+   }
+   if (opt_frameskip != applied_frameskip) {
+      applied_frameskip = opt_frameskip;
+      if (opt_frameskip) {
+         VDP2SetFrameLimit(3);
+         EnableAutoFrameSkip();
+      } else {
+         VDP2SetFrameLimit(0);
+         DisableAutoFrameSkip();
+      }
+      LOG_INFO("option: autoframeskip %s", opt_frameskip ? "on" : "off");
+   }
+   if (opt_resolution_mode != applied_resolution) {
+      applied_resolution = opt_resolution_mode;
+      /* Rebuilds the engine's framebuffers (vidogl.c VIDOGLSetSettingValueMode);
+         safe here: this thread owns the GL context and the machine thread does
+         not touch GL. */
+      VideoSetSetting(VDP_SETTING_RESOLUTION_MODE, opt_resolution_mode);
+      LOG_INFO("option: resolution mode %d", opt_resolution_mode);
+   }
+}
+
 void LibretroEngineContextReset(void)
 {
    if (engine_up) return;
@@ -528,20 +761,20 @@ void LibretroEngineContextReset(void)
    {
       static yabauseinit_struct yinit;
       memset(&yinit, 0, sizeof(yinit));
-      yinit.sh2coretype     = 3;
+      yinit.sh2coretype     = opt_sh2coretype;   /* core option "SH2 Core" */
       yinit.vidcoretype     = VIDCORE_OGL;
       yinit.sndcoretype     = SNDCORE_LIBRETRO;   /* SCSP thread -> retro_run -> audio_batch_cb */
       yinit.m68kcoretype    = M68KCORE_MUSASHI;
       yinit.percoretype     = PERCORE_LIBRETRO;   /* pad on port 1, see PERLIBRETROJoy */
-      yinit.carttype        = CART_DRAM32MBIT;
+      yinit.carttype        = opt_addon_cart;    /* core option "Addon Cartridge" */
       yinit.clocksync       = 0;
       yinit.use_new_scsp    = 1;
       yinit.extend_backup   = 1;
       yinit.video_filter_type = 0;
       yinit.polygon_generation_mode = PERSPECTIVE_CORRECTION;
       yinit.frameskip       = 0;
-      yinit.resolution_mode = 3;   /* match the standalone baseline (-r 3) */
-      yinit.rbg_use_compute_shader = true;   /* standalone default ("Use compute shader") */
+      yinit.resolution_mode = opt_resolution_mode;   /* core option, default RES_ORIGINAL */
+      yinit.rbg_use_compute_shader = opt_rbg_use_compute_shader ? true : false;
       yinit.cdcoretype      = CDCORE_ISO;
       /* The rest of the standalone's yinit (main.cpp), field by field: the engine
          branches on these, so leaving them at their zero value is a silent config
@@ -550,35 +783,51 @@ void LibretroEngineContextReset(void)
       yinit.scsp_main_mode  = 1;              /* Realtime SCSP thread (non-Jetson) */
       yinit.scsp_sync_count_per_frame = 1;    /* g_scsp_sync */
       yinit.rotate_screen   = 0;
-      yinit.rbg_resolution_mode = 0;
+      yinit.rbg_resolution_mode = opt_rbg_resolution_mode;
       yinit.basetime        = 0;
       yinit.cartpath        = NULL;
       yinit.mpegpath        = NULL;
       yinit.regionid        = 0;
-      yinit.biospath        = libretro_bios_path[0] ? libretro_bios_path : NULL;
+      yinit.biospath        = (opt_force_hle_bios || !libretro_bios_path[0])
+                              ? NULL : libretro_bios_path;   /* "Force HLE BIOS" */
       yinit.buppath         = libretro_bup_path[0] ? libretro_bup_path : NULL;
       yinit.cdpath          = libretro_content_path;
-      yinit.videoformattype = VIDEOFORMATTYPE_NTSC;
+      yinit.videoformattype = opt_videoformat_latched;   /* "Video Format", latched at load */
       yinit.framelimit      = 0;
       yinit.usethreads      = 0;
       yinit.osdcoretype     = OSDCORE_DUMMY;
       yinit.skip_load       = 0;
-      g_emulated_bios = (libretro_bios_path[0] != 0) ? 0 : 1;   /* standalone: 0 when -b */
-      /* Standalone config defaults (main.cpp): "sound dsp" = 1 -> DSP on;
-         "texcache persist" = true.  The DSP is emulated hardware state, so it
-         stays on, and texture-cache persistence follows the standalone as well:
-         without it every field rebuilds the atlas (YglTMReset + YglCacheReset in
-         VIDOGLVdp2DrawStart) and re-uploads the sprites.  Measured on a fixed
-         in-game savestate (DoA, both front ends): persist off 39 fps (core) /
-         42 (standalone), persist on 55 for both - the earlier "persist costs
-         draw time" note came from mixing light and heavy attract scenes.
-         YAB_TEXCACHE_PERSIST=0 still turns it off for A/B measurements. */
-      g_scsp_dsp_off = 0;
+      g_emulated_bios = (yinit.biospath != NULL) ? 0 : 1;   /* standalone: 0 when -b */
+      /* Standalone config defaults (main.cpp): "sound dsp" = 1 -> DSP on.  The
+         DSP is emulated hardware state, so it stays on.
+         Texture-cache persistence is a core option and defaults OFF: the fixed
+         savestate measurement that once made it the default (DoA in-game, 39 ->
+         55 fps) is the exception - most titles gain little, and some regress
+         because the atlas grows and the dirty-band uploads get bigger.  The
+         option ("Texture Cache Persist", enabled) turns it back on,
+         YAB_TEXCACHE_PERSIST=0/1 still overrides it for A/B runs. */
+      g_scsp_dsp_off = opt_scsp_dsp ? 0 : 1;   /* core option "SCSP DSP" */
       {
+         /* The env override exists for A/B runs only; say so loudly when it
+            wins, otherwise an option seems to be ignored. */
          const char *tp = getenv("YAB_TEXCACHE_PERSIST");
-         g_texcache_persist = (tp != NULL) ? atoi(tp) : 1;
+         g_texcache_persist = (tp != NULL) ? atoi(tp) : opt_texcache_persist;
+         if (tp != NULL)
+            LOG_WARN("option: texture cache persist = %d OVERRIDDEN by "
+                     "YAB_TEXCACHE_PERSIST=%s (option wanted %d)",
+                     g_texcache_persist, tp, opt_texcache_persist);
       }
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
+      /* Options that are plain engine state rather than init-time fields: set
+         them once the engine exists (SCSP/SMPC objects are alive now). */
+      g_interlace_half_menu = opt_interlace_half;
+      ScspSetCddaVolume(opt_cd_volume);
+      ScspSetSfxVolume(opt_sfx_volume);
+      SmpcSetSystemLanguage(opt_system_language);
+      yab_options_seed();
+      LOG_INFO("option: initial state dsp=%d cd=%d sfx=%d language=%d interlace=%d texcache=%d",
+               opt_scsp_dsp, opt_cd_volume, opt_sfx_volume, opt_system_language,
+               opt_interlace_half, g_texcache_persist);
       /* Audio: the SCSP thread produces at its own wall-clock rate.  With env 22
          the front end's audio thread pulls 512-frame periods from the ring and
          submits them from inside its own callback; without it, the consumer
@@ -616,10 +865,12 @@ void LibretroEngineContextReset(void)
          Mode 3 = 60 Hz budget without the sleep (the front end paces). */
       {
          const char *fs = getenv("YAB_FRAMESKIP");
-         if (fs != NULL && fs[0] == '1') {
+         if ((fs != NULL && fs[0] == '1') || opt_frameskip) {
             VDP2SetFrameLimit(3);
             EnableAutoFrameSkip();
-            LOG_INFO("engine frame limit: 60 Hz budget, autoframeskip ON (YAB_FRAMESKIP=1)");
+            if (fs != NULL && fs[0] == '1' && !opt_frameskip)
+               LOG_WARN("option: autoframeskip OFF but forced by YAB_FRAMESKIP=1");
+            LOG_INFO("engine frame limit: 60 Hz budget, autoframeskip ON (option or YAB_FRAMESKIP=1)");
          } else {
             /* Standalone `-nf` parity: the limiter itself stays on (framelimit 0
                = the 60 Hz schedule with its sleep/busy-wait), only the skip
@@ -825,6 +1076,14 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
    if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
       LOG_WARN("front end rejected RGB565; it keeps its default pixel format");
 
+   /* Core options: the protocol asks for registration as early as possible
+      (retro_set_environment).  The table is v2, with the fallback chain down to
+      SET_VARIABLES for old front ends. */
+   {
+      bool cats = false;
+      libretro_set_core_options(cb, &cats);
+      LOG_INFO("options: registered (categories %s)", cats ? "supported" : "unsupported");
+   }
 }
 
 RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb; }
@@ -1164,7 +1423,7 @@ RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
    info->geometry.max_height = GEOMETRY_MAX_H;
    /* Saturn pixels are not square: every TV mode (320/352/704 wide) is 4:3. */
    info->geometry.aspect_ratio = 4.0f / 3.0f;
-   info->timing.fps = yabsys.IsPal ? 50.0 : 60.0;
+   info->timing.fps = (opt_videoformat_latched == VIDEOFORMATTYPE_PAL) ? 50.0 : 60.0;
    info->timing.sample_rate = 44100.0;
 }
 
@@ -1200,6 +1459,16 @@ RETRO_API void retro_run(void)
 
    if (engine_up) {
       Vdp2SetRenderThreadHere();   /* this thread renders now, not VdpProc */
+      /* Core options: the front end flags a change, re-read and apply it here
+         (render thread, GL context current, before this field's events). */
+      {
+         bool updated = false;
+         if (environ_cb != NULL &&
+             environ_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated) {
+            yab_options_read();
+            yab_options_apply();
+         }
+      }
       /* Saturn mode changes are applied before anything of this field is drawn.
          The engine's Resize()/YglGLInit() rebuilds GL objects, so it has to stay
          outside the render stack (a change is then visible one field late, which
@@ -1698,6 +1967,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       LOG_INFO("load_game: no content (placeholder)");
    }
 
+   /* Core options: restart-type values are latched here, before the engine is
+      built.  The video standard has to be known now because the front end asks
+      for retro_get_system_av_info() right after load_game returns. */
+   yab_options_read();
+   yab_videoformat_latch();
+
    /* libretro input protocol: ports, bitmask capability, descriptors. */
    yab_input_ports_init();
    yab_input_descriptors();
@@ -1750,7 +2025,7 @@ RETRO_API void retro_unload_game(void)
 
 RETRO_API unsigned retro_get_region(void)
 {
-   return yabsys.IsPal ? RETRO_REGION_PAL : RETRO_REGION_NTSC;
+   return (opt_videoformat_latched == VIDEOFORMATTYPE_PAL) ? RETRO_REGION_PAL : RETRO_REGION_NTSC;
 }
 
 RETRO_API void *retro_get_memory_data(unsigned id)
