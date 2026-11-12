@@ -4597,6 +4597,21 @@ void YglRender(void)
   unsigned int i, j;
   int ccwindow = 0;
 
+#ifdef __LIBRETRO__
+  /* The frontend rotates its hw-render ring once per presented frame and may
+     recreate its textures on a resolution change, so the render target has to
+     be re-pointed at the frontend's current framebuffer before anything is
+     drawn -- the same block the old libretro port runs at the top of YglRender. */
+  {
+    extern void *LibretroFrontFbo(void);
+    void *fbo_ = LibretroFrontFbo();
+    if (fbo_ != NULL) {
+      _Ygl->default_fbo = (GLuint)(unsigned long)fbo_;
+      glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->default_fbo);
+    }
+  }
+#endif
+
   YGLLOG("YglRender\n");
 
   // Invalidate the program bind cache at the start of the VDP2 composition pass (like at

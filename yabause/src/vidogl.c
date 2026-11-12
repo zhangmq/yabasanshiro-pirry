@@ -8962,6 +8962,19 @@ void VIDOGLVdp2SetResolution(u16 TVMD)
     break;
   }
 
+#ifdef __LIBRETRO__
+  /* The window size IS the frontend frame size here, and SetSaturnResolution()
+     derives GlWidth/GlHeight from _Ygl->screen_width/height -- which would still
+     be the previous mode's value, so this field would be drawn with the old
+     viewport.  Give the port a chance to install the new size first.  The weak
+     symbol keeps the standalone linkable, but this file is libretro-only code:
+     the standalone has no such hook and must keep 1.6.2 behaviour untouched. */
+  {
+    extern void Vdp2ModeChanged(int w, int h) __attribute__((weak));
+    if (Vdp2ModeChanged)
+      Vdp2ModeChanged(width, height);
+  }
+#endif
   SetSaturnResolution(width, height);
   Vdp1SetTextureRatio(wratio, hratio);
 }

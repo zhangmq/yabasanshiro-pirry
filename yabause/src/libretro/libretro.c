@@ -371,6 +371,19 @@ static int game_height = 224;
 static int frame_width  = 0;          /* size last reported to the front end */
 static int frame_height = 0;
 
+/* Called by VIDOGLVdp2SetResolution() (vidogl.c) on the machine thread, at the
+   guest's TVMD write.  It only marks the change: the GL-side resize, the FBO pin
+   and SET_GEOMETRY must run on the frontend thread, in core_apply_resolution(). */
+static volatile int g_mode_pending;
+void Vdp2ModeChanged(int native_w, int native_h)
+{
+   if (native_w <= 0 || native_h <= 0)
+      return;
+   if (native_w == game_width && native_h == game_height && !g_mode_pending)
+      return;
+   g_mode_pending = 1;
+}
+
 static void core_apply_resolution(void)
 {
    int nw = 0, nh = 0, interlace = 0;
@@ -382,8 +395,9 @@ static void core_apply_resolution(void)
    VIDCore->GetNativeResolution(&nw, &nh, &interlace);
    if (nw <= 0 || nh <= 0)
       return;
-   if (frame_width > 0 && nw == game_width && nh == game_height)
+   if (!g_mode_pending && frame_width > 0 && nw == game_width && nh == game_height)
       return;
+   g_mode_pending = 0;
 
    game_width = nw;
    game_height = nh;
