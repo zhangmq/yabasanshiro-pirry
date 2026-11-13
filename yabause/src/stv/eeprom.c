@@ -136,6 +136,14 @@ void eeprom_init(const char* filename) {
   T123Load((u8*)reg, 0x80, 1, eeprom_filename);
 }
 
+/* Factory table in memory, the saved file is never read.  Used when the EEPROM
+   is not persisted (the default): every boot sees a fresh NVRAM, which is what
+   a deterministic test wants. */
+void eeprom_init_fresh(const char* filename) {
+  memcpy(eeprom_filename, filename, sizeof(eeprom_filename));
+  eeprom_start(NULL);
+}
+
 void eeprom_deinit() {
   T123Save((u8*)reg, 0x80, 1, eeprom_filename);
 }

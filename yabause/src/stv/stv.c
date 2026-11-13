@@ -17,6 +17,11 @@
 #include "junzip.h"
 #include "yabause.h"
 #include "eeprom.h"
+
+/* 1 = read <save>/stv/<game>.nv at boot and write it on exit; 0 (default) =
+   fresh in-memory NVRAM, the file is neither read nor written.  Set from the
+   libretro core option yabasanshiro_stv_eeprom_save. */
+int stv_eeprom_persist = 0;
 #include "decrypt.h"
 #include "zlib.h"
 #include "log.h"   /* the core's log layer (this file is libretro-only) */
@@ -3144,7 +3149,17 @@ int STVSingleInit(const char *gamepath, const char *biospath, const char *eeprom
   if (loadGame(romset) == 0) {
     char eeprom_path[4096];
     snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
-    eeprom_init(eeprom_path);
+    if (stv_eeprom_persist) {
+      eeprom_init(eeprom_path);
+      #ifdef __LIBRETRO__
+      LOG_INFO("ST-V EEPROM: loaded from %s", eeprom_path);
+#endif
+    } else {
+      eeprom_init_fresh(eeprom_path);
+      #ifdef __LIBRETRO__
+      LOG_INFO("ST-V EEPROM: fresh in-memory NVRAM (persist off; %s neither read nor written)", eeprom_path);
+#endif
+    }
     /* DecAthlete's cart carries the 315-5838 compression/encryption chip. */
     if (strcmp(romset, "decathlt") == 0 || strcmp(romset, "decathlto") == 0)
       STVCompEnable(STVCOMP_315_5838);
@@ -3172,7 +3187,17 @@ int STVInit(const char* romset, const char *path, const char *eepromdir, int fav
   if (loadGame(romset) == 0) {
     char eeprom_path[4096];
     snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
-    eeprom_init(eeprom_path);
+    if (stv_eeprom_persist) {
+      eeprom_init(eeprom_path);
+      #ifdef __LIBRETRO__
+      LOG_INFO("ST-V EEPROM: loaded from %s", eeprom_path);
+#endif
+    } else {
+      eeprom_init_fresh(eeprom_path);
+      #ifdef __LIBRETRO__
+      LOG_INFO("ST-V EEPROM: fresh in-memory NVRAM (persist off; %s neither read nor written)", eeprom_path);
+#endif
+    }
     /* DecAthlete's cart carries the 315-5838 compression/encryption chip. */
     if (strcmp(romset, "decathlt") == 0 || strcmp(romset, "decathlto") == 0)
       STVCompEnable(STVCOMP_315_5838);
@@ -3188,7 +3213,7 @@ int STVInit(const char* romset, const char *path, const char *eepromdir, int fav
 
 int STVDeInit(){
   if (CartridgeArea == NULL || CartridgeArea->carttype != CART_ROMSTV) return 0;
-  eeprom_deinit();
+  if (stv_eeprom_persist) eeprom_deinit();
   yabsys.isSTV = 0;
   return 0;
 }
