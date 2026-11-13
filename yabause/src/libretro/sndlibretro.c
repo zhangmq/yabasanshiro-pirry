@@ -97,6 +97,15 @@ static u32 stat_fade;             /* underrun frames faded to silence           
 static u32 stat_dropped;
 static u32 stat_stale;             /* trimmed by the prefill target */
 
+/* Level probe (2026-11-13, read-only): what the engine hands us versus what we
+   hand the front end.  It exists to compare the SCSP output level across cores
+   - "some titles play too quietly" needs a number, and every other counter here
+   is a count, not an amplitude.  Nothing in the audio path depends on it. */
+static u32 stat_in_peak;           /* max |sample| the engine delivered (s32)     */
+static u32 stat_out_peak;          /* max |sample| handed to the front end (s16)  */
+static u64 stat_out_sq;            /* sum of squares of the delivered samples     */
+static u32 stat_out_n;             /* delivered frames                            */
+
 /* Async (env 22) path: the front end's audio thread pulls, so there is no
    consumer thread and no wall-clock schedule of our own. */
 static s64 hb_us;                  /* last retro_run, CLOCK_MONOTONIC us */
@@ -466,6 +475,8 @@ static int snd_prefill_gate(void)
    audio callback, outside ring_lock (that call may block). */
 unsigned SNDLibretroPump(s16 *dst)
 {
+   u32 i;
+
    pthread_mutex_lock(&ring_lock);
    if (snd_prefill_gate())
    {
@@ -474,6 +485,16 @@ unsigned SNDLibretroPump(s16 *dst)
       return SND_PERIOD_FRAMES;
    }
    snd_render_period(dst);
+   /* Level probe: exactly what this call returns to the front end. */
+   for (i = 0; i < SND_PERIOD_FRAMES; i++)
+   {
+      s32 l = dst[2 * i], r = dst[2 * i + 1];
+      u32 al = (u32)(l < 0 ? -l : l), ar = (u32)(r < 0 ? -r : r);
+      if (al > stat_out_peak) stat_out_peak = al;
+      if (ar > stat_out_peak) stat_out_peak = ar;
+      stat_out_sq += (u64)((s64)l * l) + (u64)((s64)r * r);
+   }
+   stat_out_n += SND_PERIOD_FRAMES;
    pthread_mutex_unlock(&ring_lock);
    return SND_PERIOD_FRAMES;
 }
@@ -540,6 +561,30 @@ void SNDLibretroSnapshot(u32 *produced, u32 *consumed, u32 *dropped,
       *plc_frames = stat_plc;
    if (fade_frames)
       *fade_frames = stat_fade;
+   pthread_mutex_unlock(&ring_lock);
+}
+
+/* Level probe readout: peak (both sides), and the RMS of what has been handed
+   to the front end since the last reset.  `reset` clears the accumulators, so
+   the caller can log one interval at a time. */
+void SNDLibretroLevels(u32 *in_peak, u32 *out_peak, u32 *out_rms, int reset)
+{
+   pthread_mutex_lock(&ring_lock);
+   if (in_peak)
+      *in_peak = stat_in_peak;
+   if (out_peak)
+      *out_peak = stat_out_peak;
+   if (out_rms)
+      *out_rms = (stat_out_n > 0)
+                   ? (u32)sqrt((double)stat_out_sq / (double)stat_out_n)
+                   : 0;
+   if (reset)
+   {
+      stat_in_peak = 0;
+      stat_out_peak = 0;
+      stat_out_sq = 0;
+      stat_out_n = 0;
+   }
    pthread_mutex_unlock(&ring_lock);
 }
 
@@ -639,6 +684,13 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
    for (i = 0; i < num_samples; i++)
    {
       s32 l, r;
+
+      {  /* probe: the SCSP's own output, before any gain this layer applies */
+         u32 al = (u32)(srcl[i] < 0 ? -srcl[i] : srcl[i]);
+         u32 ar = (u32)(srcr[i] < 0 ? -srcr[i] : srcr[i]);
+         if (al > stat_in_peak) stat_in_peak = al;
+         if (ar > stat_in_peak) stat_in_peak = ar;
+      }
 
       if (muted)
       {

@@ -229,6 +229,17 @@ extern int use_new_scsp;
    the extern "C" block so the C++ caller links against the C symbol. */
 void ScspSetCddaMute(int on_val);
 
+#ifdef __LIBRETRO__
+/* Audio level probe (libretro only): peak of the dry slot mix, of the DSP/EFREG
+   returns and of the CD-DA input, over the samples since the last reset. */
+void ScspGetAudioProbe(u32 *dry_peak, u32 *wet_peak, u32 *cd_peak,
+                       unsigned *cd_samples, unsigned *efsdl16,
+                       unsigned *efsdl17, unsigned *mvol,
+                       unsigned *disdl16, unsigned *disdl17,
+                       unsigned *dac18b, unsigned *panmask,
+                       unsigned *panmax, int reset);
+#endif
+
 #if defined (__cplusplus)
 }
 #endif

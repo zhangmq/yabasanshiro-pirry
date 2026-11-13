@@ -161,6 +161,17 @@ int use_new_scsp = 0;
    `sound dsp`); the menu toggles it live. With the DSP off, DSP-only slots (DISDL 0, IMXL > 0, e.g. Grandia
    music) are output dry at the IMXL level so nothing goes silent. */
 int g_scsp_dsp_off = 1;
+#ifdef __LIBRETRO__
+/* Audio level probe (2026-11-13, read-only).  "Some titles play too quietly"
+   needs to be split into the paths that carry the sound: the dry slot mix, the
+   DSP effect returns, and the CD-DA stream.  These are maxima over the samples
+   generated since the last reset; nothing in the mixer reads them. */
+u32 scsp_probe_dry_peak, scsp_probe_wet_peak, scsp_probe_cd_peak;
+unsigned scsp_probe_cd_samples;      /* samples that had CD-DA data queued   */
+unsigned scsp_probe_efsdl16, scsp_probe_efsdl17, scsp_probe_mvol;
+unsigned scsp_probe_disdl16, scsp_probe_disdl17;
+unsigned scsp_probe_panmask, scsp_probe_panmax;   /* slots 0-15 with DIPAN != 0 */
+#endif
 int new_scsp_outbuf_pos = 0;
 s32 new_scsp_outbuf_l[900] = { 0 };
 s32 new_scsp_outbuf_r[900] = { 0 };
@@ -1540,6 +1551,34 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
    s32 outl32 = 0;
    s32 outr32 = 0;
    s32 cdl32 = 0, cdr32 = 0;   /* CD inputs (slots 16/17) summed separately */
+#ifdef __LIBRETRO__
+   {
+      u32 p = (u32)(cd_in_l < 0 ? -cd_in_l : cd_in_l);
+      if (p > scsp_probe_cd_peak) scsp_probe_cd_peak = p;
+      p = (u32)(cd_in_r < 0 ? -cd_in_r : cd_in_r);
+      if (p > scsp_probe_cd_peak) scsp_probe_cd_peak = p;
+      scsp_probe_mvol = (unsigned)mvol;
+      {
+         static unsigned pan_div;
+         if ((pan_div++ & 511u) == 0u)
+         {
+            unsigned mask = 0, mx = 0;
+            int k;
+            for (k = 0; k < 16; k++)
+            {
+               unsigned pan = (unsigned)(s->slots[k].regs.dipan & 0x1f);
+               if (pan) { mask |= 1u << k; if (pan > mx) mx = pan; }
+            }
+            scsp_probe_panmask = mask;
+            scsp_probe_panmax = mx;
+         }
+      }
+      scsp_probe_efsdl16 = (unsigned)(s->slots[16].regs.efsdl);
+      scsp_probe_efsdl17 = (unsigned)(s->slots[17].regs.efsdl);
+      scsp_probe_disdl16 = (unsigned)(s->slots[16].regs.disdl);
+      scsp_probe_disdl17 = (unsigned)(s->slots[17].regs.disdl);
+   }
+#endif
 
    static int dw_off = -1, dw_prev = 0;
    if (dw_off < 0) {
@@ -1639,10 +1678,27 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       panned_l = (efsdl_applied >> pan_val_l)>>1;
       panned_r = (efsdl_applied >> pan_val_r)>>1;
 
+#ifdef __LIBRETRO__
+      if (i < 16)
+      {
+         u32 p = (u32)(panned_l < 0 ? -panned_l : panned_l);
+         if (p > scsp_probe_wet_peak) scsp_probe_wet_peak = p;
+         p = (u32)(panned_r < 0 ? -panned_r : panned_r);
+         if (p > scsp_probe_wet_peak) scsp_probe_wet_peak = p;
+      }
+#endif
       if (i < 16) { outl32 = outl32 + panned_l; outr32 = outr32 + panned_r; }
       else        { cdl32  = cdl32  + panned_l; cdr32  = cdr32  + panned_r; }
    }
 
+#ifdef __LIBRETRO__
+   {
+      u32 p = (u32)(outl32 < 0 ? -outl32 : outl32);
+      if (p > scsp_probe_dry_peak) scsp_probe_dry_peak = p;
+      p = (u32)(outr32 < 0 ? -outr32 : outr32);
+      if (p > scsp_probe_dry_peak) scsp_probe_dry_peak = p;
+   }
+#endif
    /* The "SFX" menu volume scales the direct path and DSP return of slots 0-15, not the CD
       inputs 16/17 (g_cdda_vol already handles those at the feed). No computation at 100%. */
    if (g_sfx_vol != 100) {
@@ -5778,6 +5834,9 @@ void new_scsp_run_sample()
 
       cdda_out_left -= 4;   /* must also run when muted, or the boost hysteresis in ScspReceiveCDDA tips over */
       CDDA_UNLOCK();
+#ifdef __LIBRETRO__
+      scsp_probe_cd_samples++;
+#endif
       if (CddaMute()) { cd_in_l = 0; cd_in_r = 0; }
       /* CD music volume from the menu; 0 = off */
       else if (g_cdda_vol != 100) {
@@ -8014,3 +8073,34 @@ ScspSlotDebugAudioSaveWav (u8 slotnum, const char *filename)
 }
 
 //////////////////////////////////////////////////////////////////////////////
+
+#ifdef __LIBRETRO__
+/* Read out (and optionally reset) the audio level probe declared above. */
+void ScspGetAudioProbe(u32 *dry_peak, u32 *wet_peak, u32 *cd_peak,
+                       unsigned *cd_samples, unsigned *efsdl16,
+                       unsigned *efsdl17, unsigned *mvol,
+                       unsigned *disdl16, unsigned *disdl17,
+                       unsigned *dac18b, unsigned *panmask,
+                       unsigned *panmax, int reset)
+{
+   if (dry_peak)   *dry_peak   = scsp_probe_dry_peak;
+   if (wet_peak)   *wet_peak   = scsp_probe_wet_peak;
+   if (cd_peak)    *cd_peak    = scsp_probe_cd_peak;
+   if (cd_samples) *cd_samples = scsp_probe_cd_samples;
+   if (efsdl16)    *efsdl16    = scsp_probe_efsdl16;
+   if (efsdl17)    *efsdl17    = scsp_probe_efsdl17;
+   if (mvol)       *mvol       = scsp_probe_mvol;
+   if (disdl16)    *disdl16    = scsp_probe_disdl16;
+   if (disdl17)    *disdl17    = scsp_probe_disdl17;
+   if (dac18b)     *dac18b     = scsp_dac18b;
+   if (panmask)    *panmask    = scsp_probe_panmask;
+   if (panmax)     *panmax     = scsp_probe_panmax;
+   if (reset)
+   {
+      scsp_probe_dry_peak = 0;
+      scsp_probe_wet_peak = 0;
+      scsp_probe_cd_peak = 0;
+      scsp_probe_cd_samples = 0;
+   }
+}
+#endif

@@ -33,6 +33,7 @@
  * (callbacks, log sink, pixel format, geometry) is meant to survive that step.
  */
 
+#include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1955,6 +1956,25 @@ RETRO_API void retro_run(void)
                   here; fade should stay near zero. */
                LOG_INFO("audio conceal: plc=%u fade=%u under=%u ratio=%.4f",
                         plc_f - lplc, fade_f - lfade, u - lu, SNDLibretroRatio());
+               {
+                  /* Level probe: engine output peak (s32, the SCSP's own scale)
+                     vs. what we hand the front end.  dBFS is on the s16 scale,
+                     so inpk is comparable only after the same clamp. */
+                  u32 in_pk, out_pk, out_rms;
+                  u32 dry_pk, wet_pk, cd_pk;
+                  unsigned cd_n, ef16, ef17, mv, di16, di17, dac, pmask, pmax;
+                  SNDLibretroLevels(&in_pk, &out_pk, &out_rms, 1);
+                  ScspGetAudioProbe(&dry_pk, &wet_pk, &cd_pk, &cd_n, &ef16, &ef17, &mv,
+                                    &di16, &di17, &dac, &pmask, &pmax, 1);
+                  LOG_INFO("audio level: inpk=%u outpk=%u rms=%u outdb=%.1f rmsdb=%.1f "
+                           "dry=%u wet=%u cd=%u cdn=%u efsdl16=%u/17=%u disdl16=%u/17=%u "
+                           "dac18b=%u mvol=%u panmask=%X panmax=%u",
+                           in_pk, out_pk, out_rms,
+                           out_pk ? 20.0 * log10((double)out_pk / 32768.0) : -999.0,
+                           out_rms ? 20.0 * log10((double)out_rms / 32768.0) : -999.0,
+                           dry_pk, wet_pk, cd_pk, cd_n, ef16, ef17, di16, di17, dac, mv,
+                           pmask, pmax);
+               }
                lp = p; lc = c; ld = d; lu = u; lplc = plc_f; lfade = fade_f;
                aud_calls = aud_short = 0;
                aud_wmax = 0;

@@ -45,4 +45,9 @@ void SNDLibretroSnapshot(u32 *produced, u32 *consumed, u32 *dropped,
                          u32 *underrun, unsigned *fill_frames,
                          u32 *plc_frames, u32 *fade_frames);
 
+/* Level probe (read-only): peak of what the engine delivered since the last
+   reset, peak and RMS of what was handed to the front end.  `reset` clears the
+   accumulators; the audio path never reads these. */
+void SNDLibretroLevels(u32 *in_peak, u32 *out_peak, u32 *out_rms, int reset);
+
 #endif
