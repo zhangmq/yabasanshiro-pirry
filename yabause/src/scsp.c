@@ -1507,6 +1507,22 @@ void get_panning(int pan, int * pan_val_l, int * pan_val_r)
    }
 }
 
+/* 18-bit D/A converter mode (register 0x400 bit 8).
+
+   In this mode the chip stops halving the output word: the same mix reaches an
+   18-bit converter at four times the digital value, i.e. with 12 dB more range.
+   MAME models it exactly that way (it writes the unshifted value with a 131072
+   clamp instead of ">> 2" with 32768).  A title that turns it on keeps its voice
+   levels low to spend that range, so applying the 16-bit scaling anyway makes it
+   play far too quietly - Daytona USA runs with the bit set and its CD music
+   measured 12 dB low on the device before this.
+
+   File scope rather than a field of struct scsp_t: generate_sample() is defined
+   before that struct, and this is one global register bit anyway.  No savestate
+   field either - the whole SCSP register file is in the chunk, so SoundLoadState
+   derives it from scsp_reg[0x403]. */
+static u32 scsp_dac18b = 0;
+
 int get_sdl_shift(int sdl)
 {
    if (sdl == 0)
@@ -1641,6 +1657,15 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
          np = 1;
       }
       if (np) { outl32 <<= 1; outr32 <<= 1; }
+   }
+
+   /* 18-bit D/A mode: the word is not halved, so the same mix goes out four
+      times larger (12 dB more range).  Applied before the master volume, which
+      is a gain after the converter's saturation in MAME. */
+   if (scsp_dac18b)
+   {
+      outl32 <<= 2;
+      outr32 <<= 2;
    }
 
    /* Master volume (register 0x401, low nibble) is the D/A converter's gain: a
@@ -2902,6 +2927,7 @@ scsp_set_b (u32 a, u8 d)
     {
     case 0x00: // MEM4MB/DAC18B
       scsp.mem4b = (d >> 1) & 0x1;
+      scsp_dac18b = (d >> 0) & 0x1;
       if (scsp.mem4b)
         {
           M68K->SetFetch(0x000000, 0x080000, (pointer)SoundRam);
@@ -3073,6 +3099,7 @@ scsp_set_w (u32 a, u16 d)
     case 0x00: // MEM4MB/DAC18B/VER/MVOL
       scsp.mem4b = (d >> 9) & 0x1;
       scsp.mvol = d & 0xF;
+      scsp_dac18b = (d >> 8) & 1;
       if (scsp.mem4b)
         {
           M68K->SetFetch(0x000000, 0x080000, (pointer)SoundRam);
@@ -4889,6 +4916,7 @@ scsp_reset (void)
   memset(scsp_reg, 0, 0x1000);
 
   scsp.mem4b     = 0;
+  scsp_dac18b    = 0;
   scsp.mvol      = 0;
   scsp.rbl       = 0;
   scsp.rbp       = 0;
@@ -7257,6 +7285,11 @@ SoundLoadState (FILE *fp, int version, int size)
 
   // Now for the SCSP registers
   yread (&check, (void *)scsp_reg, 0x1000, 1, fp);
+  /* 0x400 bit 8 (DAC18B) lives in that register file - scsp_ccr points at
+     &scsp_reg[0x400] and the high byte is index 3 - so every state carries it,
+     whatever chunk version wrote the file.  Derive the mixer's copy from it
+     instead of adding a field and a format bump. */
+  scsp_dac18b = (scsp_reg[0x403] >> 0) & 0x1;
 
   // Lastly, sound ram
   yread (&check, (void *)SoundRam, 0x80000, 1, fp);
