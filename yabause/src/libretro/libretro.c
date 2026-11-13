@@ -651,19 +651,23 @@ static int  opt_system_language = 0;
 static int  opt_multitap[2];
 static int  opt_scsp_dsp = 1;
 static int  opt_cd_volume = 100;
+static int  opt_mute_cdda;                     /* ScspSetCddaMute, machine */
 static int  opt_sfx_volume = 100;
 static int  opt_stv_region = STV_REGION_EU;   /* ST-V BIOS region preference */
+static int  opt_stv_eeprom_save;                /* write <save>/stv/<game>.nv on exit? */
 static int  opt_stv_service;                  /* Test/Service/Pause keys */
 
 /* Engine-side hooks without a header of their own. */
 extern int  g_interlace_half_menu;      /* vidogl.c:3619, read per draw          */
 extern void ScspSetCddaVolume(int v);   /* scsp.c:1962, read per mix             */
+extern void ScspSetCddaMute(int on_val); /* scsp.c:5707, read per sample          */
 extern void ScspSetSfxVolume(int v);    /* scsp.c:1963, read per mix             */
 
 /* Applied-state cache: the engine already has these after an init, so the first
    retro_run does not re-apply (a resolution change rebuilds GL objects). */
 static int  applied_resolution = -1, applied_rbg_res = -1, applied_rbg_cs = -1;
 static int  applied_frameskip = -1, applied_dsp = -1, applied_cdvol = -1;
+static int  applied_mute_cdda = -1;
 static int  applied_sfxvol = -1, applied_interlace = -1, applied_texcache = -1;
 static int  applied_multitap[2] = { -1, -1 };
 
@@ -732,6 +736,7 @@ static void yab_options_read(void)
 
    v = opt_str("yabasanshiro_cd_volume");
    opt_cd_volume = v != NULL ? atoi(v) : 100;
+   opt_mute_cdda = opt_is("yabasanshiro_mute_cdda", "enabled");
    v = opt_str("yabasanshiro_sfx_volume");
    opt_sfx_volume = v != NULL ? atoi(v) : 100;
 
@@ -743,6 +748,10 @@ static void yab_options_read(void)
    else if (opt_is("yabasanshiro_stv_region", "TW")) opt_stv_region = STV_REGION_TW;
    else                                              opt_stv_region = STV_REGION_EU;
    opt_stv_service = opt_is("yabasanshiro_service_enabled", "enabled");
+   /* Off by default: the ST-V EEPROM is machine NVRAM (region, coin mode,
+      credits, bookkeeping) and writing it changes the user's save directory
+      without anything asking for it. */
+   opt_stv_eeprom_save = opt_is("yabasanshiro_stv_eeprom_save", "enabled");
 }
 
 /* Latch the video standard for this content.  "auto" reads the disc IP.BIN
@@ -791,6 +800,7 @@ static void yab_options_seed(void)
    applied_frameskip  = opt_frameskip;
    applied_dsp        = opt_scsp_dsp;
    applied_cdvol      = opt_cd_volume;
+   applied_mute_cdda  = opt_mute_cdda;
    applied_sfxvol     = opt_sfx_volume;
    applied_interlace  = opt_interlace_half;
    applied_texcache   = opt_texcache_persist;
@@ -816,6 +826,11 @@ static void yab_options_apply(void)
       applied_dsp = opt_scsp_dsp;
       g_scsp_dsp_off = opt_scsp_dsp ? 0 : 1;
       LOG_INFO("option: SCSP DSP %s", opt_scsp_dsp ? "on" : "off");
+   }
+   if (opt_mute_cdda != applied_mute_cdda) {
+      applied_mute_cdda = opt_mute_cdda;
+      ScspSetCddaMute(opt_mute_cdda);
+      LOG_INFO("option: mute CDDA %s", opt_mute_cdda ? "on" : "off");
    }
    if (opt_cd_volume != applied_cdvol) {
       applied_cdvol = opt_cd_volume;
@@ -1078,9 +1093,12 @@ void LibretroEngineContextDestroy(void)
    }
    SNDLibretroStop();
    if (stv_mode) {
-      /* STVDeInit() writes <save>/stv/<game>.nv; it must run before
-         YabauseDeInit() frees the cartridge whose board owns the EEPROM. */
-      LOG_INFO("engine: STVDeInit (EEPROM %s)", stv_eeprom_dir);
+      /* STVDeInit() is the only path that writes <save>/stv/<game>.nv
+         (eeprom_deinit() -> T123Save()).  It must run before YabauseDeInit()
+         frees the cartridge whose board owns the EEPROM, and only when the
+         option asks for it: the EEPROM is machine NVRAM, not game data. */
+      LOG_INFO("engine: STVDeInit (EEPROM %s, persist=%s)", stv_eeprom_dir,
+               stv_eeprom_persist ? "read+write" : "off");
       STVDeInit();
    }
    LOG_INFO("engine: YabauseDeInit");
@@ -2415,6 +2433,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       right after load_game returns, and the engine is built later (context_reset
       on the machine thread). */
    sram_seed_from_backup(stv_mode ? stv_bup_path : libretro_bup_path);
+
+   /* ST-V EEPROM: with the option off (default) the machine starts from the
+      factory table in memory and nothing is written on exit, so a test run
+      always sees the same fresh NVRAM. */
+   if (stv_mode)
+      stv_eeprom_persist = opt_stv_eeprom_save;
 
    /* Core options: restart-type values are latched here, before the engine is
       built.  The video standard has to be known now because the front end asks

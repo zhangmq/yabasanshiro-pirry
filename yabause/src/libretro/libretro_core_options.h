@@ -264,6 +264,22 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
       "enabled"
    },
    {
+      "yabasanshiro_mute_cdda",
+      "Mute CD Audio",
+      NULL,
+      "Silence the CD-DA stream without changing its volume (the SCSP mixer "
+      "still receives the disc audio; it is muted in the sample path).",
+      NULL,
+      "audio",
+      {
+         { "disabled", "Disabled (default)" },
+         { "enabled",  "Enabled" },
+         { NULL, NULL },
+      },
+      "disabled"
+   },
+
+   {
       "yabasanshiro_cd_volume",
       "CD Music Volume",
       NULL,
@@ -318,6 +334,24 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
          { NULL, NULL },
       },
       "EU"
+   },
+
+   {
+      "yabasanshiro_stv_eeprom_save",
+      "Save ST-V EEPROM on exit",
+      NULL,
+      "ST-V only: write <save>/stv/<game>.nv when the core unloads. That file "
+      "is the board's NVRAM (region, coin mode, credits, bookkeeping), not game "
+      "save data; it is off by default so the core does not write to the save "
+      "directory unless asked.",
+      NULL,
+      "system",
+      {
+         { "disabled", "Disabled (default)" },
+         { "enabled",  "Enabled" },
+         { NULL, NULL },
+      },
+      "disabled"
    },
 
    /* ---- input --------------------------------------------------------- */
