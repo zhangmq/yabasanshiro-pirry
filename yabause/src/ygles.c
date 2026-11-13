@@ -18,6 +18,7 @@
 */
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <math.h>
 #include "ygl.h"
 #include "yui.h"
@@ -1417,6 +1418,22 @@ void VIDOGLVdp1ReadFrameBuffer(u32 type, u32 addr, void *out)
 }
 
 //////////////////////////////////////////////////////////////////////////////
+/* LIBRETRO-PORT (ported from the old libretro branch, ygles.c): pirry 1.6.2
+   aborts the process on any GL failure while (re)building the frame buffers.
+   In a frontend that means losing the core; the port logs the failure and
+   returns 0 instead, so the rebuild is retried on a later frame.  This is a
+   policy change, not a fix for a measured failure (no [FB] line has been seen
+   on the device).  __LIBRETRO__ only: the standalone keeps the original
+   abort() behaviour. */
+#ifdef __LIBRETRO__
+#define YGL_FB_FAIL(where) do { \
+   fprintf(stderr, "[FB] YglGenFrameBuffer: " where " (gle=0x%x, %dx%d)\n", \
+           (unsigned)error, _Ygl->width, _Ygl->height); \
+   fflush(stderr); return 0; } while (0)
+#else
+#define YGL_FB_FAIL(where) abort()
+#endif
+
 int YglGenFrameBuffer()
 {
   int status;
@@ -1445,13 +1462,13 @@ int YglGenFrameBuffer()
   glBindTexture(GL_TEXTURE_2D, _Ygl->vdp1FrameBuff[0]);
   if ((error = glGetError()) != GL_NO_ERROR)
   {
-    abort();
+    YGL_FB_FAIL("bind VDP1 frame buffer 0");
   }
 
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _Ygl->width, _Ygl->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   if ((error = glGetError()) != GL_NO_ERROR)
   {
-    abort();
+    YGL_FB_FAIL("texImage2D VDP1 frame buffer 0");
   }
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -1462,7 +1479,7 @@ int YglGenFrameBuffer()
   glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _Ygl->width, _Ygl->height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
   if ((error = glGetError()) != GL_NO_ERROR)
   {
-    abort();
+    YGL_FB_FAIL("texImage2D VDP1 frame buffer 1");
   }
 
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1482,7 +1499,7 @@ int YglGenFrameBuffer()
     _Ygl->rboid_stencil = _Ygl->rboid_depth;
     if ((error = glGetError()) != GL_NO_ERROR)
     {
-      abort();
+      YGL_FB_FAIL("depth/stencil renderbuffer (DEPTH24_STENCIL8)");
     }
   }
   else
@@ -1500,7 +1517,7 @@ int YglGenFrameBuffer()
     glRenderbufferStorage(GL_RENDERBUFFER, GL_STENCIL_INDEX8, _Ygl->width, _Ygl->height);
     if ((error = glGetError()) != GL_NO_ERROR)
     {
-      abort();
+      YGL_FB_FAIL("stencil renderbuffer (STENCIL_INDEX8)");
     }
   }
 
@@ -1515,7 +1532,7 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
-    abort();
+    YGL_FB_FAIL("framebuffer 0 incomplete");
   }
   glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT);
@@ -1529,7 +1546,7 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
-    abort();
+    YGL_FB_FAIL("framebuffer 1 incomplete");
   }
 
   /* Two preconfigured static FBOs instead of one FBO whose color/depth/stencil
@@ -1552,7 +1569,7 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
-    abort();
+    YGL_FB_FAIL("framebuffer 2 incomplete");
   }
 
   glBindFramebuffer(GL_FRAMEBUFFER, _Ygl->vdp1fbo2[1]);
@@ -1564,7 +1581,7 @@ int YglGenFrameBuffer()
   status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
   if (status != GL_FRAMEBUFFER_COMPLETE)
   {
-    abort();
+    YGL_FB_FAIL("framebuffer 3 incomplete");
   }
 
   if (YglIsNeedFrameBuffer() == 1)
@@ -1601,6 +1618,8 @@ int YglGenFrameBuffer()
 
   return 0;
 }
+
+#undef YGL_FB_FAIL
 
 //////////////////////////////////////////////////////////////////////////////
 int YglIsNeedFrameBuffer()
