@@ -1,5 +1,5 @@
 # libretro core — independent CMake project (offline dev build).
-# Generated from the standalone build's object list; see .notes/CURRENT/BUILD-CORE.md.
+# Build it with ./build-libretro.sh at the repository root (see its header).
 cmake_minimum_required(VERSION 3.16)
 project(yabasanshiro_libretro C CXX ASM)
 
@@ -18,7 +18,7 @@ endif()
 # They are checked out into YAB_DEPS_CACHE (daily dev: reused, no network) and
 # built here from source; `build-libretro.sh --release` starts from a fresh cache
 # so everything is fetched online.
-set(YAB_DEPS_CACHE "${CMAKE_CURRENT_SOURCE_DIR}/../../../.notes/deps" CACHE PATH "dependency source cache")
+set(YAB_DEPS_CACHE "${CMAKE_CURRENT_SOURCE_DIR}/../../../deps" CACHE PATH "dependency source cache")
 set(LIBCHDR_ROOT "${YAB_DEPS_CACHE}/libchdr")
 set(LIBCHDR_SRC  "${LIBCHDR_ROOT}/src")
 set(ZLIB_ROOT    "${YAB_DEPS_CACHE}/zlib")
@@ -36,10 +36,10 @@ set(ENGINE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/..)
 # so everything it links must be PIC (the standalone's archives are not).
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(NOT EXISTS "${LIBCHDR_ROOT}/CMakeLists.txt")
-  message(FATAL_ERROR "libchdr sources missing at ${LIBCHDR_ROOT} (run .notes/tools/build-libretro.sh)")
+  message(FATAL_ERROR "libchdr sources missing at ${LIBCHDR_ROOT} (run ./build-libretro.sh)")
 endif()
 if(NOT EXISTS "${ZLIB_ROOT}/CMakeLists.txt")
-  message(FATAL_ERROR "zlib sources missing at ${ZLIB_ROOT} (run .notes/tools/build-libretro.sh)")
+  message(FATAL_ERROR "zlib sources missing at ${ZLIB_ROOT} (run ./build-libretro.sh)")
 endif()
 add_subdirectory(${LIBCHDR_ROOT} ${CMAKE_BINARY_DIR}/libchdr)
 

@@ -18,6 +18,7 @@ yabause/src/android/app/.settings/*
 # Local build directories and binaries
 build*/
 yaba-*
+deps/
 
 # Not tracked in this project (agent notes and the operator guide)
 .note*/
