@@ -6379,9 +6379,10 @@ int ScspGetMainMode(void) { return g_scsp_main_mode; }
    lock (ScspExecAsync), which is also the order every other path uses. */
 static pthread_mutex_t token_mtx = PTHREAD_MUTEX_INITIALIZER;
 static u64 token_done;          /* 68k cycles already executed (absolute) */
-static unsigned token_field;    /* cycles into the current audio field */
+static unsigned token_field;    /* cycles into the current delivery slice */
 static int token_pal = -1;      /* video standard token_field belongs to */
-static unsigned token_framecnt = 188160;
+static unsigned token_framecnt = 188160;   /* one field of 68k cycles        */
+static unsigned token_deliver = 47040;     /* deliver every quarter field    */
 
 /* Execute the 68k from token_done up to `target` absolute cycles, producing the
    audio samples that go with them and handing each field to the sound core.
@@ -6395,6 +6396,7 @@ static void ScspTokenAdvance(u64 target)
     if (is_pal != token_pal) {
       token_pal = is_pal;
       token_framecnt = (is_pal ? 225792u : 188160u);
+      token_deliver = token_framecnt / 4;
       token_field = 0;
     }
   }
@@ -6409,8 +6411,8 @@ static void ScspTokenAdvance(u64 target)
       scsp_update_timer(1);
     }
     token_field += (unsigned)samplecnt;
-    if (token_field >= token_framecnt) {
-      token_field -= token_framecnt;
+    if (token_field >= token_deliver) {
+      token_field -= token_deliver;
       ScspInternalVars->scsptiming2 = 0;
       ScspInternalVars->scsptiming1 = scsplines;
       ScspExecAsync();
@@ -6496,9 +6498,9 @@ void ScspAsynMainMachineToken(void * p) {
    The work is bounded by the grant the machine has already published (at most
    one emulation pass, 1 deciline in the boot phase), so this never waits for the
    SCSP thread to make progress: it does the few hundred 68k cycles itself. */
+#ifdef __LIBRETRO__
 void ScspCatchUp68k(void)
 {
-#ifdef __LIBRETRO__
   u64 grant;
 
   if (g_scsp_main_mode != SCSP_MAIN_MODE_MACHINE_TOKEN)
@@ -6516,8 +6518,8 @@ void ScspCatchUp68k(void)
     ScspTokenAdvance(grant);
   }
   pthread_mutex_unlock(&token_mtx);
-#endif
 }
+#endif  /* __LIBRETRO__ */
 
 
 

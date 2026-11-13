@@ -135,10 +135,17 @@ void FASTCALL SoundRamWriteLong(u32 addr, u32 val);
 
 int ScspInit(int coreid, int scsp_sync_count_per_frame, int scsp_main_mode);
 int ScspGetMainMode(void);
+#ifdef __LIBRETRO__
 /* Run the 68k up to the machine's last published grant before an SH-2 SoundRam
-   access, so the access observes the mailbox at the SH-2's own instant.  A no-op
-   unless the machine-token SCSP mode is active (see scsp.c). */
+   access, so the access observes the mailbox at the SH-2's own instant (see
+   scsp.c).  Machine-token mode only, which only the libretro build selects. */
 void ScspCatchUp68k(void);
+#else
+/* The standalone has no machine-token mode: the call sites in the SoundRam
+   accessors must cost nothing there, so the call compiles away entirely rather
+   than being an empty function call on a hot path. */
+#define ScspCatchUp68k() do { } while (0)
+#endif
 int ScspChangeSoundCore(int coreid);
 void ScspDeInit(void);
 void M68KStart(void);

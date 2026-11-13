@@ -910,12 +910,15 @@ int YabauseEmulate(void) {
          if (yabsys.LineCount == yabsys.VBlankLineCount) {
 
 #if defined(ASYNC_SCSP)
+#ifdef __LIBRETRO__
             /* CPUTIME and REALTIME only.  The machine-token SCSP thread follows
                the grant published at the bottom of the emulation loop, so
                clamping the counter to a whole field here would push the 68k
                ahead of the SH-2 by the VBlank part of the field - the drift the
-               token mode exists to remove. */
+               token mode exists to remove.  Both hooks are compiled out of the
+               standalone, which has no token mode. */
             if (ScspGetMainMode() != SCSP_MAIN_MODE_MACHINE_TOKEN)
+#endif
                setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
 #endif
             PROFILE_START("vblankin");
@@ -923,11 +926,13 @@ int YabauseEmulate(void) {
             SmpcINTBACKEnd();
             Vdp2VBlankIN();
 #if defined(ASYNC_SCSP)
+#ifdef __LIBRETRO__
             /* CPUTIME only (SyncCPUtoSCSP does nothing for REALTIME): the machine
                waits for the 68k to finish the field.  The machine-token mode is
                one-way - the SCSP waits for the machine, never the other way
                round - so it must not call this. */
             if (ScspGetMainMode() != SCSP_MAIN_MODE_MACHINE_TOKEN)
+#endif
                SyncCPUtoSCSP();
 #endif
             PROFILE_STOP("vblankin");
