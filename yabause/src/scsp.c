@@ -1521,7 +1521,6 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
 {
    int step_num = 0;
    int i = 0;
-   int mvol_shift = 0;
    s32 outl32 = 0;
    s32 outr32 = 0;
    s32 cdl32 = 0, cdr32 = 0;   /* CD inputs (slots 16/17) summed separately */
@@ -1644,29 +1643,25 @@ void generate_sample(struct Scsp * s, int rbp, int rbl, s16 * out_l, s16* out_r,
       if (np) { outl32 <<= 1; outr32 <<= 1; }
    }
 
-   {  /* hardware master-volume curve (~3 dB per step) instead of 6 dB per step */
-      static int mk = -1;
-      if (mk < 0) {
-         mk = 1;
-      }
-      if (mk) {
-         s32 mv = 0x2 << (mvol >> 1);
-         if (!(mvol & 1)) mv -= (mv >> 2);
-         if (!mvol) mv = 0;
-         outl32 = (s32)(((s64)outl32 * mv) >> 8);
-         outr32 = (s32)(((s64)outr32 * mv) >> 8);
-         *out_l = min(SHRT_MAX, max(SHRT_MIN, outl32));
-         *out_r = min(SHRT_MAX, max(SHRT_MIN, outr32));
-         return;
-      }
-   }
+   /* Master volume (register 0x401, low nibble) is the D/A converter's gain: a
+      LINEAR 0..15 over the whole mix, applied after the converter's saturation.
+      ST-077 p88 says it plainly ("clipping noise does not disappear even if the
+      gain is lowered by lowering MVOL ... reset DISDL and EFSDL") and MAME models
+      it as set_output_gain(0, MVOL()/15.0) after put_int_clamp.
 
-   mvol_shift = 0xf - mvol;
+      Two earlier attempts here were wrong in different ways: the original code
+      shifted the mix right by (15 - mvol), i.e. -6 dB per step, and a later
+      "~3 dB per step" exponential curve was still 6.6 dB low at mvol=12.  Titles
+      that keep MVOL at 15 cannot see any of this; a title that writes less (the
+      sokyugrt report runs at 12) plays far too quietly.
 
-   outl32 = outl32 >> mvol_shift;
-   *out_l = min(SHRT_MAX, max(SHRT_MIN, outl32));
-   outr32 = outr32 >> mvol_shift;
-   *out_r = min(SHRT_MAX, max(SHRT_MIN, outr32));
+      Clamp first, then scale.  The product is 64-bit: the pre-volume mix is a sum
+      of up to 18 slot terms with no per-slot headroom, so it can leave the s16
+      range.  mvol=15 is bit-identical to what came before (x*15/15 == x). */
+   outl32 = min(SHRT_MAX, max(SHRT_MIN, outl32));
+   outr32 = min(SHRT_MAX, max(SHRT_MIN, outr32));
+   *out_l = (s16)(((s64)outl32 * mvol) / 15);
+   *out_r = (s16)(((s64)outr32 * mvol) / 15);
 }
 
 void new_scsp_reset(struct Scsp* s)
