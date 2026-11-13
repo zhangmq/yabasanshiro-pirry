@@ -910,14 +910,25 @@ int YabauseEmulate(void) {
          if (yabsys.LineCount == yabsys.VBlankLineCount) {
 
 #if defined(ASYNC_SCSP)
-            setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
+            /* CPUTIME and REALTIME only.  The machine-token SCSP thread follows
+               the grant published at the bottom of the emulation loop, so
+               clamping the counter to a whole field here would push the 68k
+               ahead of the SH-2 by the VBlank part of the field - the drift the
+               token mode exists to remove. */
+            if (ScspGetMainMode() != SCSP_MAIN_MODE_MACHINE_TOKEN)
+               setM68kCounter((u64)(44100 * 256 / 60) << SCSP_FRACTIONAL_BITS);
 #endif
             PROFILE_START("vblankin");
             // VBlankIN
             SmpcINTBACKEnd();
             Vdp2VBlankIN();
 #if defined(ASYNC_SCSP)
-            SyncCPUtoSCSP();
+            /* CPUTIME only (SyncCPUtoSCSP does nothing for REALTIME): the machine
+               waits for the 68k to finish the field.  The machine-token mode is
+               one-way - the SCSP waits for the machine, never the other way
+               round - so it must not call this. */
+            if (ScspGetMainMode() != SCSP_MAIN_MODE_MACHINE_TOKEN)
+               SyncCPUtoSCSP();
 #endif
             PROFILE_STOP("vblankin");
             CheatDoPatches();
@@ -997,7 +1008,11 @@ int YabauseEmulate(void) {
 #else
       {
         /* One pass can cover several decilines (per-line path), so scale the M68K
-           counter accordingly; otherwise SCSP/M68K would run at a tenth of the speed. */
+           counter accordingly; otherwise SCSP/M68K would run at a tenth of the speed.
+           This is also the grant point of the machine-token SCSP loop: the counter
+           is the emulated time the machine has actually advanced, so the 68k can
+           only ever stand at or behind the SH-2, whatever the renderer joins do
+           to this thread. */
         saved_m68k_cycles  += (u64)m68k_cycles_per_deciline * decilines_per_pass;
         setM68kCounter(saved_m68k_cycles);
 #endif

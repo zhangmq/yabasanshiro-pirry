@@ -5223,6 +5223,7 @@ scu_interrupt_handler (void)
 u8 FASTCALL
 SoundRamReadByte (u32 addr)
 {
+  ScspCatchUp68k();
   addr &= 0xFFFFF;
   u8 val = 0;
 
@@ -5242,6 +5243,7 @@ SoundRamReadByte (u32 addr)
 void FASTCALL
 SoundRamWriteByte (u32 addr, u8 val)
 {
+  ScspCatchUp68k();
   addr &= 0xFFFFF;
 
   // If mem4b is set, mirror ram every 256k
@@ -5295,6 +5297,7 @@ void SyncSh2And68k(){
 u16 FASTCALL
 SoundRamReadWord (u32 addr)
 {
+  ScspCatchUp68k();
   addr &= 0xFFFFF;
   u16 val = 0;
 
@@ -5318,6 +5321,7 @@ SoundRamReadWord (u32 addr)
 void FASTCALL
 SoundRamWriteWord (u32 addr, u16 val)
 {
+  ScspCatchUp68k();
   addr &= 0xFFFFF;
 
   // If mem4b is set, mirror ram every 256k
@@ -5337,6 +5341,7 @@ SoundRamWriteWord (u32 addr, u16 val)
 u32 FASTCALL
 SoundRamReadLong (u32 addr)
 {
+  ScspCatchUp68k();
   addr &= 0xFFFFF;
   u32 val;
 
@@ -5390,6 +5395,7 @@ SoundRamReadLong (u32 addr)
 void FASTCALL
 SoundRamWriteLong (u32 addr, u32 val)
 {
+  ScspCatchUp68k();
   addr &= 0xFFFFF;
   //u32 pre_cycle = m68kcycle;
 
@@ -6357,16 +6363,182 @@ void ScspAsynMainRealtime(void * p) {
   YabThreadWake(YAB_THREAD_SCSP);
 }
 
+int ScspGetMainMode(void) { return g_scsp_main_mode; }
+
+#ifdef __LIBRETRO__
+/* Idle period of the machine-token loop when no new grant has arrived.  200 us
+   is about nine 44.1 kHz samples (0.01 field) of emulated time: short enough to
+   keep the 68k within about one percent of a field of the SH-2, long enough not
+   to turn the wait into a wake-up storm. */
+#define SCSP_TOKEN_IDLE_US 200
+
+/* Machine-token state: the 68k is executed up to the cycle the machine has
+   granted, nothing more, and both the SCSP thread and the SH-2's SoundRam
+   accesses drive the same advance, so a cycle is executed exactly once.
+   token_mtx is the only lock; inside it the advance takes the sound core's ring
+   lock (ScspExecAsync), which is also the order every other path uses. */
+static pthread_mutex_t token_mtx = PTHREAD_MUTEX_INITIALIZER;
+static u64 token_done;          /* 68k cycles already executed (absolute) */
+static unsigned token_field;    /* cycles into the current audio field */
+static int token_pal = -1;      /* video standard token_field belongs to */
+static unsigned token_framecnt = 188160;
+
+/* Execute the 68k from token_done up to `target` absolute cycles, producing the
+   audio samples that go with them and handing each field to the sound core.
+   Caller holds token_mtx. */
+static void ScspTokenAdvance(u64 target)
+{
+  const int samplecnt = 256;   /* 68k cycles per 44.1 kHz sample */
+
+  {
+    const int is_pal = yabsys.IsPal ? 1 : 0;
+    if (is_pal != token_pal) {
+      token_pal = is_pal;
+      token_framecnt = (is_pal ? 225792u : 188160u);
+      token_field = 0;
+    }
+  }
+
+  while (token_done + (u64)samplecnt <= target) {
+    token_done += (u64)samplecnt;
+    MM68KExec(samplecnt);
+    if (use_new_scsp) {
+      new_scsp_exec(samplecnt << 1);
+    }
+    else {
+      scsp_update_timer(1);
+    }
+    token_field += (unsigned)samplecnt;
+    if (token_field >= token_framecnt) {
+      token_field -= token_framecnt;
+      ScspInternalVars->scsptiming2 = 0;
+      ScspInternalVars->scsptiming1 = scsplines;
+      ScspExecAsync();
+    }
+  }
+}
+
+/* Machine-token loop (libretro only).
+
+   The machine publishes a grant of 68k cycles as it advances emulated time
+   (yabause.c, per emulation pass: setM68kCounter(saved_m68k_cycles), already
+   scaled by decilines_per_pass so the ratio does not depend on the per-line
+   optimisation).  This thread executes exactly the cycles that were granted and
+   never more, so the 68k stands where the SH-2 stands.  One-way: the machine
+   never waits for this thread, and this thread has no field handshake at all.
+
+   Why not the wall clock (SCSP_MAIN_MODE_REALTIME): the machine thread parks in
+   the renderer joins (Vdp2JoinPendingVIN / Vdp1JoinPendingRenders) for the
+   better part of a field, and a thread paced on real time runs the 68k ahead by
+   exactly that amount.  Measured on astrass: 1.6 fields ahead, which moved guest
+   visible SoundRam traffic by a field and derailed the boot path.
+
+   Why not SCSP_MAIN_MODE_CPUTIME: its per-field lock step makes the machine wait
+   (SyncCPUtoSCSP) for the 68k to finish the field, i.e. the machine waits for
+   the SCSP.
+
+   Granularity: the grant is consumed in samplecnt (256) cycles, the same quantum
+   as the other two loops, and one new_scsp_exec() call per quantum produces
+   exactly one 44.1 kHz sample.  735 (NTSC) / 882 (PAL) quanta are one field of
+   audio, handed to the sound core at the field boundary like the realtime loop
+   does.  The SH-2's SoundRam accesses advance the same state (ScspCatchUp68k),
+   so the 68k also stands at the SH-2's own instant whenever guest code looks at
+   the mailbox; this thread only covers the time the SH-2 is not looking. */
+void ScspAsynMainMachineToken(void * p) {
+  (void)p;
+
+  while (thread_running) {
+    u64 grant;
+
+    if (g_scsp_lock) LoadSndPark();   /* lock loop with park notification */
+
+    pthread_mutex_lock(&token_mtx);
+    grant = getM68KCounter() >> SCSP_FRACTIONAL_BITS;
+    if (grant < token_done) {
+      /* The machine reset the counter (reset or state load): what was pending
+         belongs to a timeline that is gone. */
+      token_done = grant;
+      token_field = 0;
+    }
+    else if (grant > token_done) {
+      ScspTokenAdvance(grant);
+      grant = 0;   /* re-use: flag "did something" */
+    }
+    else {
+      grant = 1;
+    }
+    pthread_mutex_unlock(&token_mtx);
+
+    if (grant != 0) {
+      /* Starved: the machine has advanced no emulated time since the last pass
+         (it is inside a join, or between two emulation passes).  Sleep about one
+         quantum instead of spinning; nothing here asks the machine to wait. */
+      YabThreadUSleep(SCSP_TOKEN_IDLE_US);
+    }
+  }
+  YabThreadWake(YAB_THREAD_SCSP);
+}
+#endif  /* __LIBRETRO__ */
+
+/* Called at every SH-2 access to SoundRam (memory.c maps the 0x5A0 area to the
+   SoundRam* accessors; the 68k's own bus goes through the T2Read and T2Write
+   helpers directly, so this cannot recurse into itself).
+
+   The 68k must stand at the SH-2's own instant when the SH-2 looks at SoundRam.
+   Mednafen's Saturn core (sound.c: SOUND_Update) is the reference for this: the
+   SH-2 timestamp is converted to 68k cycles and the sound CPU is run up to it
+   before the bus access is served.  Without it the SH-2 observes a SoundRam
+   state that is up to one emulation pass old - enough to miss a mailbox
+   transition that only lives for a few dozen SH-2 blocks (astrass: SoundRam
+   +0x700 goes 0x0C -> 0x00 -> 0x0D inside 14 blocks), which is what made the
+   boot path derail in ~20% of the runs even with the token in place.
+
+   The work is bounded by the grant the machine has already published (at most
+   one emulation pass, 1 deciline in the boot phase), so this never waits for the
+   SCSP thread to make progress: it does the few hundred 68k cycles itself. */
+void ScspCatchUp68k(void)
+{
+#ifdef __LIBRETRO__
+  u64 grant;
+
+  if (g_scsp_main_mode != SCSP_MAIN_MODE_MACHINE_TOKEN)
+    return;
+
+  pthread_mutex_lock(&token_mtx);
+  grant = getM68KCounter() >> SCSP_FRACTIONAL_BITS;
+  if (grant < token_done) {
+    /* The machine reset the counter (reset or state load): the cycles counted
+       so far belong to a timeline that is gone. */
+    token_done = grant;
+    token_field = 0;
+  }
+  else if (grant > token_done) {
+    ScspTokenAdvance(grant);
+  }
+  pthread_mutex_unlock(&token_mtx);
+#endif
+}
+
+
 
 void ScspExec(){
   if (thread_running == 0){
     thread_running = 1;
-    if (g_scsp_main_mode == 0) {
+    if (g_scsp_main_mode == SCSP_MAIN_MODE_CPUTIME) {
       YabThreadStart(YAB_THREAD_SCSP, ScspAsynMainCpuTime, NULL);
     }
+    else if (g_scsp_main_mode == SCSP_MAIN_MODE_REALTIME) {
+      YabThreadStart(YAB_THREAD_SCSP, ScspAsynMainRealtime, NULL);
+    }
+#ifdef __LIBRETRO__
+    else {
+      YabThreadStart(YAB_THREAD_SCSP, ScspAsynMainMachineToken, NULL);
+    }
+#else
     else {
       YabThreadStart(YAB_THREAD_SCSP, ScspAsynMainRealtime, NULL);
     }
+#endif
     YabThreadUSleep(100000);
   }
 }

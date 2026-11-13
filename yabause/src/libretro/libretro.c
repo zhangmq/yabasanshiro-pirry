@@ -915,7 +915,11 @@ void LibretroEngineContextReset(void)
          branches on these, so leaving them at their zero value is a silent config
          divergence (e.g. scsp_main_mode 0 = CpuTime changes the SCSP thread and
          makes SyncCPUtoSCSP wait every field).  See CONFIG-ALIGN-20261109.md. */
-      yinit.scsp_main_mode  = 1;              /* Realtime SCSP thread (non-Jetson) */
+      yinit.scsp_main_mode  = SCSP_MAIN_MODE_MACHINE_TOKEN; /* SCSP follows the
+                              machine's emulated time, one-way: the 68k cannot
+                              run ahead of the SH-2 while this thread sits in a
+                              renderer join, and the machine never waits for the
+                              SCSP.  See the thread comment in scsp.c. */
       yinit.scsp_sync_count_per_frame = 1;    /* g_scsp_sync */
       yinit.rotate_screen   = 0;
       yinit.rbg_resolution_mode = opt_rbg_resolution_mode;

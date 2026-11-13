@@ -119,7 +119,26 @@ void FASTCALL SoundRamWriteByte(u32 addr, u8 val);
 void FASTCALL SoundRamWriteWord(u32 addr, u16 val);
 void FASTCALL SoundRamWriteLong(u32 addr, u32 val);
 
+/* How the SCSP thread advances the 68k (yabauseinit_struct.scsp_main_mode).
+   CPUTIME: the thread follows the machine's 68k cycle counter, but the machine
+            waits for it at every field boundary (SyncCPUtoSCSP).
+   REALTIME: the thread paces itself on the wall clock (field period, or the
+            sample clock in the libretro build) and ignores the counter.
+   MACHINE_TOKEN: the thread follows the machine's 68k cycle counter and nothing
+            else; the machine never waits for it.  The grant is published by
+            YabauseEmulate as the machine advances emulated time, so the 68k
+            cannot run ahead of the SH-2 while the machine thread is parked in
+            a renderer join.  libretro only. */
+#define SCSP_MAIN_MODE_CPUTIME       0
+#define SCSP_MAIN_MODE_REALTIME      1
+#define SCSP_MAIN_MODE_MACHINE_TOKEN 2
+
 int ScspInit(int coreid, int scsp_sync_count_per_frame, int scsp_main_mode);
+int ScspGetMainMode(void);
+/* Run the 68k up to the machine's last published grant before an SH-2 SoundRam
+   access, so the access observes the mailbox at the SH-2's own instant.  A no-op
+   unless the machine-token SCSP mode is active (see scsp.c). */
+void ScspCatchUp68k(void);
 int ScspChangeSoundCore(int coreid);
 void ScspDeInit(void);
 void M68KStart(void);
@@ -130,6 +149,7 @@ void M68KExec(s32 cycles);
 void ScspExec(void);
 #ifdef __LIBRETRO__
 void ScspFlushOutput(void);
+void ScspAsynMainMachineToken(void * p);
 #endif
 void ScspConvert32uto16s(s32 *srcL, s32 *srcR, s16 *dst, u32 len);
 void ScspReceiveCDDA(const u8 *sector);
