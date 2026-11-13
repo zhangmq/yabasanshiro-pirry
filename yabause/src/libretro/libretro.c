@@ -638,6 +638,7 @@ static int  opt_rbg_use_compute_shader = 1;
 static int  opt_texcache_persist = 0;   /* off by default: helps few games, hurts some */
 static int  opt_interlace_half = 0;
 static int  opt_frameskip = 0;
+static int  opt_scsp_realtime;                  /* SCSP Timing: wall clock 68k? */
 static int  opt_sh2coretype = 3;                /* dynarec (DYNAREC_DEVMIYAX) */
 static int  opt_addon_cart = CART_DRAM32MBIT;
 static int  opt_force_hle_bios = 0;
@@ -706,6 +707,7 @@ static void yab_options_read(void)
    opt_texcache_persist       =  opt_is("yabasanshiro_texcache_persist", "enabled");
    opt_interlace_half         =  opt_is("yabasanshiro_interlace_half", "enabled");
    opt_frameskip              =  opt_is("yabasanshiro_frameskip", "auto");
+   opt_scsp_realtime          =  opt_is("yabasanshiro_scsp_timing", "realtime");
 
    opt_sh2coretype = opt_is("yabasanshiro_sh2coretype", "interpreter")
                      ? SH2CORE_INTERPRETER : 3;
@@ -909,11 +911,15 @@ void LibretroEngineContextReset(void)
          branches on these, so leaving them at their zero value is a silent config
          divergence (e.g. scsp_main_mode 0 = CpuTime changes the SCSP thread and
          makes SyncCPUtoSCSP wait every field).  See CONFIG-ALIGN-20261109.md. */
-      yinit.scsp_main_mode  = SCSP_MAIN_MODE_MACHINE_TOKEN; /* SCSP follows the
-                              machine's emulated time, one-way: the 68k cannot
-                              run ahead of the SH-2 while this thread sits in a
-                              renderer join, and the machine never waits for the
-                              SCSP.  See the thread comment in scsp.c. */
+      /* SCSP Timing core option.  Machine (strict, default): the 68k follows
+         the machine's emulated time one-way - it cannot run ahead of the SH-2
+         while the machine thread sits in a renderer join, and every SoundRam
+         access catches it up to the SH-2's instant.  Realtime: the original
+         wall-clock behaviour, full-rate clean audio but the 68k drifts ahead of
+         the main CPUs.  Latched here, so a change needs a restart.  See the
+         thread comment in scsp.c. */
+      yinit.scsp_main_mode  = opt_scsp_realtime ? SCSP_MAIN_MODE_REALTIME
+                                                : SCSP_MAIN_MODE_MACHINE_TOKEN;
       yinit.scsp_sync_count_per_frame = 1;    /* g_scsp_sync */
       yinit.rotate_screen   = 0;
       yinit.rbg_resolution_mode = opt_rbg_resolution_mode;
