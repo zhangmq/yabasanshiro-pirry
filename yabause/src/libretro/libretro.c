@@ -60,6 +60,7 @@
 #include "m68kcore.h"
 #include "cdbase.h"
 #include "cs2.h"      /* Cs2ForceOpenTray / Cs2ForceCloseTray (disk control) */
+#include "memory.h"   /* BupRam / FormatBackupRam: the save-RAM card */
 #include "cs0.h"
 #include "osdcore.h"
 #include "peripheral.h"
@@ -108,6 +109,15 @@ static char  stv_bios_path[512];    /* <system>/stvbios.zip */
 static char  stv_eeprom_dir[512];   /* <save>/stv/  (per-game .nv) */
 static char  stv_bup_path[512];     /* <save>/stv/<game>.ram */
 static char  stv_content_path[512]; /* our copy: game->path is call-scoped */
+
+/* The frontend's save-RAM slot (RETRO_MEMORY_SAVE_RAM) is the engine's backup
+   card (ported from the reference line's libretro.c). */
+#define YABA_INTERNAL_BUP_SIZE 0x10000
+static u8  sram_shadow[YABA_INTERNAL_BUP_SIZE];
+static int sram_apply_pending = 0; /* push shadow -> BupRam once BupRam exists */
+static void set_memory_maps(void);
+static void sram_seed_from_backup(const char *path);
+static void sram_sync(void);
 
 /* engine-side caller mode: retro_run drains the VDP event queue (A+token) */
 extern void Vdp2SetFrontendConsumer(int on);
@@ -160,6 +170,13 @@ static char cmd_disc_path[YAB_PATH_MAX];
 
 extern int YabSaveStateBuffer(void **buffer, size_t *size);
 extern int YabLoadStateBuffer(const void *buffer, size_t size);
+/* Engine-side repair after a state load/reset: the state restores Vdp1Regs/
+   Vdp2Regs/RAM but not the renderer's field state machine (queues, snapshots,
+   VDP1 status), so the machine can end up parked.  Same hook the reference
+   line calls from its state command. */
+extern void Vdp2AfterLoadState(void);
+extern int stv_eeprom_persist;   /* stv.c: gates EEPROM read and write */
+static volatile int g_mode_pending;   /* defined further down; used by the state command */
 
 /* Engine work of one command.  Runs on the machine thread normally, and on the
    frontend thread when no machine thread exists (nothing can race then). */
@@ -179,8 +196,17 @@ static int yab_cmd_exec(int type, const void *load, size_t load_size,
       }
    } else if (type == YAB_CMD_LOAD) {
       ok = (YabLoadStateBuffer(load, load_size) == 0) ? 1 : 0;
+      if (ok) {
+         Vdp2AfterLoadState();
+         SNDLibretroDropBacklog();
+         /* A state can carry a different video mode: let the render thread
+            rebuild the geometry/GL objects before it draws the next field. */
+         g_mode_pending = 1;
+      }
    } else if (type == YAB_CMD_RESET) {
       YabauseReset();
+      Vdp2AfterLoadState();
+      g_mode_pending = 1;
       ok = 1;
    } else if (type == YAB_CMD_DISC) {
       /* The CD block belongs to the machine thread (Cs2Exec runs there), so the
@@ -287,6 +313,7 @@ static void *machine_main(void *arg)
          PERCore->HandleEvents();
       else
          YabauseExec();
+      sram_sync();
       clock_gettime(CLOCK_MONOTONIC, &m1);
       pthread_mutex_lock(&st_mtx);
       acc_machine_ms += (m1.tv_sec - m0.tv_sec) * 1e3 + (m1.tv_nsec - m0.tv_nsec) / 1e6;
@@ -935,6 +962,7 @@ void LibretroEngineContextReset(void)
                      g_texcache_persist, tp, opt_texcache_persist);
       }
       if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
+      set_memory_maps();   /* HighWram/LowWram exist only after YabauseInit() */
       if (stv_mode) {
          /* The front end may already have asked for av_info before this
             (retro_get_system_av_info has the same report); send it again now
@@ -1171,10 +1199,22 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
       bool have_save = cb != NULL && cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir);
       if (have_save && save_dir != NULL)
          snprintf(libretro_save_dir, sizeof(libretro_save_dir), "%s", save_dir);
-      if (have_save && save_dir != NULL)
-         snprintf(libretro_bup_path, sizeof(libretro_bup_path), "%s/yabasanshiro.bup", save_dir);
-      else
+      /* Same layout as the reference line: the Saturn card is
+         <save>/yabasanshiro/backup.bin and the ST-V EEPROM/card live in
+         <save>/stv/.  Both directories are created here because the engine
+         just fopen()s those paths; without the directory every write fails
+         silently and the card/EEPROM contents are lost on exit. */
+      if (have_save && save_dir != NULL) {
+         char dir[512];
+         snprintf(dir, sizeof(dir), "%s/yabasanshiro", save_dir);
+         (void)mkdir(dir, 0777);
+         snprintf(dir, sizeof(dir), "%s/stv", save_dir);
+         (void)mkdir(dir, 0777);
+         snprintf(libretro_bup_path, sizeof(libretro_bup_path),
+                  "%s/yabasanshiro/backup.bin", save_dir);
+      } else {
          snprintf(libretro_bup_path, sizeof(libretro_bup_path), "yabasanshiro.bup");
+      }
       LOG_INFO("bup path (env=%d dir=%s): %s", (int)have_save,
                save_dir ? save_dir : "(null)", libretro_bup_path);
 
@@ -2233,15 +2273,79 @@ static void stv_setup_save_dirs(void)
 {
    const char *save = libretro_save_dir[0] ? libretro_save_dir : ".";
 
-   snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s/stv", save);
+   snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s/stv/", save);
    if (mkdir(stv_eeprom_dir, 0777) != 0) {
       struct stat st;
       if (stat(stv_eeprom_dir, &st) != 0 || !S_ISDIR(st.st_mode))
          LOG_WARN("ST-V: cannot create %s (EEPROM/backup card will not persist)",
                   stv_eeprom_dir);
    }
-   snprintf(stv_bup_path, sizeof(stv_bup_path), "%s/%s.ram", stv_eeprom_dir,
+   snprintf(stv_bup_path, sizeof(stv_bup_path), "%s%s.ram", stv_eeprom_dir,
             stv_game != NULL ? stv_game : "stv");
+}
+
+/* Publish the Saturn work-RAM layout so the frontend can address it (cheat
+   search, RetroAchievements).  Called once the engine has allocated the
+   buffers: same descriptors as the reference line. */
+static void set_memory_maps(void)
+{
+   static struct retro_memory_descriptor descs[2];
+   struct retro_memory_map mmap;
+
+   if (!HighWram || !LowWram)
+      return;
+
+   memset(descs, 0, sizeof(descs));
+
+   /* High Work RAM -- HWRAM @ 0x06000000, 1 MB. */
+   descs[0].flags     = RETRO_MEMDESC_SYSTEM_RAM;
+   descs[0].ptr       = HighWram;
+   descs[0].start     = 0x06000000;
+   descs[0].len       = 0x100000;
+   descs[0].addrspace = "HWRAM";
+
+   /* Low Work RAM -- LWRAM @ 0x00200000, 1 MB. */
+   descs[1].flags     = RETRO_MEMDESC_SYSTEM_RAM;
+   descs[1].ptr       = LowWram;
+   descs[1].start     = 0x00200000;
+   descs[1].len       = 0x100000;
+   descs[1].addrspace = "LWRAM";
+
+   mmap.descriptors     = descs;
+   mmap.num_descriptors = 2;
+   if (environ_cb != NULL)
+      environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmap);
+}
+
+static void sram_seed_from_backup(const char *path)
+{
+   FILE *bf = (path != NULL && path[0] != '\0') ? fopen(path, "rb") : NULL;
+   size_t n = 0;
+   if (bf)
+   {
+      n = fread(sram_shadow, 1, sizeof(sram_shadow), bf);
+      fclose(bf);
+      if (n < sizeof(sram_shadow))
+         FormatBackupRam(sram_shadow, sizeof(sram_shadow));
+   }
+   else
+      FormatBackupRam(sram_shadow, sizeof(sram_shadow));
+   LOG_INFO("backup RAM: %s (%s)", (path != NULL && path[0]) ? path : "(none)",
+            (bf && n == sizeof(sram_shadow)) ? "loaded" : "fresh card");
+   sram_apply_pending = 1;
+}
+
+static void sram_sync(void)
+{
+   if (!BupRam)
+      return;
+   if (sram_apply_pending)
+   {
+      memcpy(BupRam, sram_shadow, sizeof(sram_shadow));
+      sram_apply_pending = 0;
+   }
+   else
+      memcpy(sram_shadow, BupRam, sizeof(sram_shadow));
 }
 
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
@@ -2304,6 +2408,13 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       libretro_content_path = NULL;
       LOG_INFO("load_game: no content (placeholder)");
    }
+
+   /* Prime the SAVE_RAM shadow from the core's own backup card; the frontend
+      may then overlay its .srm on top before the first machine frame.  This has
+      to happen synchronously here: the frontend reads retro_get_memory_data()
+      right after load_game returns, and the engine is built later (context_reset
+      on the machine thread). */
+   sram_seed_from_backup(stv_mode ? stv_bup_path : libretro_bup_path);
 
    /* Core options: restart-type values are latched here, before the engine is
       built.  The video standard has to be known now because the front end asks
@@ -2381,12 +2492,18 @@ RETRO_API unsigned retro_get_region(void)
 
 RETRO_API void *retro_get_memory_data(unsigned id)
 {
-   (void)id;
-   return NULL;
+   switch (id) {
+      case RETRO_MEMORY_SAVE_RAM:   return sram_shadow;
+      case RETRO_MEMORY_SYSTEM_RAM: return HighWram;
+      default:                      return NULL;
+   }
 }
 
 RETRO_API size_t retro_get_memory_size(unsigned id)
 {
-   (void)id;
-   return 0;
+   switch (id) {
+      case RETRO_MEMORY_SAVE_RAM:   return sizeof(sram_shadow);
+      case RETRO_MEMORY_SYSTEM_RAM: return 0x100000;
+      default:                      return 0;
+   }
 }
