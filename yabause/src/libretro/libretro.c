@@ -348,6 +348,7 @@ static retro_audio_sample_batch_t audio_batch_cb;
 static struct retro_audio_callback audio_cb_cfg;
 static int audio_async_ok;       /* env 22 accepted by this front end */
 static int audio_async_on;       /* engine is running on the async path */
+static int audio_sync_on;        /* front end refused env 22: retro_run submits */
 static s16 async_pcm[512 * 2];   /* one period, filled by SNDLibretroPump() */
 static unsigned aud_calls, aud_short;
 
@@ -505,13 +506,6 @@ void *LibretroFrontFbo(void)
 int LibretroHasVideo(void)
 {
    return video_cb != NULL;
-}
-
-/* Audio submit hook: called from the consumer thread in sndlibretro.c. */
-static void libretro_audio_submit(const int16_t *pcm, unsigned frames)
-{
-   if (audio_batch_cb != NULL)
-      audio_batch_cb(pcm, frames);
 }
 
 static unsigned yab_audio_want_periods(void);   /* env 62 driven, defined below */
@@ -1010,7 +1004,27 @@ void LibretroEngineContextReset(void)
          audio_async_on = 1;
          LOG_INFO("audio: async mode (front end pulls through env 22)");
       } else {
-         SNDLibretroStart(libretro_audio_submit);
+         /* The core must be able to render audio through the normal interface,
+            and the only legal place for that is retro_run() itself (libretro.h,
+            RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK: "the core must be able to
+            render audio with the 'normal' interface"; the float-audio contract
+            names exactly two legal call sites, retro_run() and that callback).
+            Audio produced since the previous call is handed over at the end of
+            retro_run. */
+         audio_sync_on = 1;
+         LOG_INFO("audio: sync mode (retro_run hands over what the SCSP produced)");
+      }
+      /* Debug switch: force the synchronous path even though the front end
+         accepts env 22, so it can be exercised on a front end that never takes
+         the fallback (minarch does accept env 22).  Nothing changes unless
+         YAB_AUDIO_SYNC=1. */
+      {
+         const char *sy = getenv("YAB_AUDIO_SYNC");
+         if (sy != NULL && sy[0] == '1') {
+            audio_async_on = 0;
+            audio_sync_on = 1;
+            LOG_WARN("audio: YAB_AUDIO_SYNC=1 forces sync mode (debug)");
+         }
       }
       /* Per-line CPU sync, exactly as the standalone does it (main.cpp, right after
          YabauseInit, which resets the mode): request it here, and vdp2's FPSDisplay
@@ -1089,13 +1103,13 @@ void LibretroEngineContextDestroy(void)
    /* Stop the async path first: the front end may call the audio callback from
       its audio thread at any time, and that thread must not outlive the ring. */
    audio_async_on = 0;
+   audio_sync_on = 0;
    if (audio_async_ok && environ_cb != NULL) {
       struct retro_audio_callback none;
       memset(&none, 0, sizeof(none));
       environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK, &none);
       audio_async_ok = 0;
    }
-   SNDLibretroStop();
    if (stv_mode) {
       /* STVDeInit() is the only path that writes <save>/stv/<game>.nv
          (eeprom_deinit() -> T123Save()).  It must run before YabauseDeInit()
@@ -1764,9 +1778,9 @@ RETRO_API void retro_run(void)
       (libretro.h:9358).  A call can cover more than one field -- a skipped field
       presents nothing, so the call continues into the next one -- and the
       standalone samples the pad once per field, so the poll sits at the top of
-      the field loop below (and once here for the no-engine path).
-      SNDLibretroHeartbeat() is the only pause signal libretro offers us. */
-   SNDLibretroHeartbeat();
+      the field loop below (and once here for the no-engine path).  No audio
+      heartbeat: the SCSP runs on the machine's clock, so a front end that stops
+      calling us stops production by itself (sndlibretro.c). */
    yab_in_run = 1;
 
    if (engine_up) {
@@ -1850,6 +1864,21 @@ RETRO_API void retro_run(void)
       acc_draw_ms += draw_ms;
       acc_wait_ms += wait_ms;
       acc_calls++;
+
+      /* Synchronous audio: hand over everything the SCSP produced since the
+         previous call, one 512-frame period at a time, from inside retro_run
+         (the "normal interface").  In async mode this is a no-op: the front end
+         pulls through its own callback instead. */
+      if (audio_sync_on && audio_batch_cb != NULL) {
+         unsigned n = SNDLibretroReadyPeriods();
+         while (n-- > 0) {
+            unsigned got = SNDLibretroPump(audio_buf);
+            if (got == 0)
+               break;
+            if (audio_batch_cb(audio_buf, got) < got)
+               break;
+         }
+      }
    } else {
       if (input_poll_cb != NULL)
          input_poll_cb();
@@ -1900,24 +1929,27 @@ RETRO_API void retro_run(void)
                   async mode calls/frames come from the front end's audio
                   thread; in thread mode they come from the consumer thread and
                   only the frame counters move. */
-               static u32 lp, lc, ld, lu;
-               u32 p, c, d, u;
+               static u32 lp, lc, ld, lu, lplc, lfade;
+               u32 p, c, d, u, plc_f, fade_f;
                unsigned fill_frames;
-               SNDLibretroSnapshot(&p, &c, &d, &u, &fill_frames);
-               static unsigned lpe, lre;
-               unsigned pe = SNDLibretroPauseEvents(), re = SNDLibretroResumeEvents();
+               SNDLibretroSnapshot(&p, &c, &d, &u, &fill_frames, &plc_f, &fade_f);
                unsigned wmax = aud_wmax, wmin = aud_wmin;
                if (wmin == 0xFFFFFFFFu) wmin = 0;
-               LOG_INFO("audio: mode=%s paused=%d occ=%d dry=%d ratio=%.4f calls=%u frames=%u wmax=%u wmin=%u pump_us=%.2f/%.2f under=%u short=%u fill=%u prod=%u cons=%u drop=%u pause=%u resume=%u",
-                        audio_async_on ? "async" : "thread", SNDLibretroPaused(),
+               LOG_INFO("audio: mode=%s occ=%d dry=%d ratio=%.4f calls=%u frames=%u wmax=%u wmin=%u pump_us=%.2f/%.2f under=%u short=%u fill=%u prod=%u cons=%u drop=%u",
+                        audio_async_on ? "async" : "sync",
                         __atomic_load_n(&aud_occ, __ATOMIC_RELAXED),
                         __atomic_load_n(&aud_underrun_likely, __ATOMIC_RELAXED),
                         SNDLibretroRatio(), aud_calls, c - lc, wmax, wmin,
                         aud_calls ? aud_us_sum / aud_calls : 0.0, aud_us_max,
                         u - lu, aud_short, fill_frames,
-                        p - lp, c - lc, d - ld, pe - lpe, re - lre);
-               lp = p; lc = c; ld = d; lu = u;
-               lpe = pe; lre = re;
+                        p - lp, c - lc, d - ld);
+               /* How the underrun frames were filled: a repeated pitch period
+                  (inaudible continuation) or a fade to silence (a hole).  With
+                  the machine below 60 fields/s the production deficit shows up
+                  here; fade should stay near zero. */
+               LOG_INFO("audio conceal: plc=%u fade=%u under=%u ratio=%.4f",
+                        plc_f - lplc, fade_f - lfade, u - lu, SNDLibretroRatio());
+               lp = p; lc = c; ld = d; lu = u; lplc = plc_f; lfade = fade_f;
                aud_calls = aud_short = 0;
                aud_wmax = 0;
                aud_wmin = 0xFFFFFFFFu;
@@ -2463,6 +2495,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    audio_cb_cfg.callback = yab_audio_callback;
    audio_cb_cfg.set_state = yab_audio_set_state;
    audio_async_on = 0;
+   audio_sync_on = 0;
    audio_async_ok = (environ_cb != NULL &&
                      environ_cb(RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK,
                                 &audio_cb_cfg)) ? 1 : 0;

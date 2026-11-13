@@ -14,43 +14,35 @@
 
 extern SoundInterface_struct SNDLibretro;
 
-/* Starts the consumer thread: 512-frame periods at 44100 Hz, every period
-   handed to fn(pcm, 512) as interleaved s16.  fn is called from that thread and
-   may block on the front end; returns 0 on success, -1 when the thread cannot
-   be started (fn == NULL starts nothing). */
-int SNDLibretroStart(void (*fn)(const s16 *pcm, unsigned frames));
-
-/* Stops the consumer thread (joins it). */
-void SNDLibretroStop(void);
-
-/* Async path (RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK): the front end's audio
-   thread calls SNDLibretroPump() when it can take audio, and libretro.c hands
-   the frames to audio_batch_cb from inside that same callback.  At most one
-   period per call (512 frames, the standalone's device period); returns the
-   frames taken (0 when the ring holds nothing). */
+/* Pull side.  There is no consumer thread of our own: the two legal libretro
+   contexts call SNDLibretroPump() instead.
+     - RETRO_ENVIRONMENT_SET_AUDIO_CALLBACK (env 22, asynchronous audio): the
+       front end's audio thread notifies us and we hand the frames to
+       audio_batch_cb from inside that callback.
+     - Synchronous front ends: retro_run() calls SNDLibretroReadyPeriods() and
+       pumps that many periods from inside retro_run.
+   One call renders at most one period (512 frames, the standalone's device
+   period) and returns the frames written. */
 unsigned SNDLibretroPump(s16 *dst);
 
-/* Drops everything queued: stale audio from a timeline that has already moved
-   on (pause/resume, or the start of a session). */
-void SNDLibretroDropBacklog(void);
+/* Whole 512-frame periods the ring can feed right now (0 while the startup
+   cushion is still filling).  Synchronous delivery loop: pump this many. */
+unsigned SNDLibretroReadyPeriods(void);
 
-/* retro_run() calls this once per frame.  The consumer thread and the pump use
-   it to tell a real stall from a pause: the front end not calling retro_run is
-   the only pause signal libretro offers (there is no pause environment call;
-   env 22's set_state is about the audio driver, not the game). */
-void SNDLibretroHeartbeat(void);
-unsigned SNDLibretroSinceHeartbeatMs(void);
+/* Drops everything queued: audio from a timeline that has already moved on
+   (state load, or the start of a session).  A front end pause needs no such
+   call: the SCSP runs on the machine's clock, so nothing is produced while the
+   machine is parked and the ring simply keeps what it already holds. */
+void SNDLibretroDropBacklog(void);
 
 /* Current resampling ratio (output frames per input frame), for the log. */
 double SNDLibretroRatio(void);
 
-/* Pause state and transition counters (for the once-per-second log). */
-int SNDLibretroPaused(void);
-unsigned SNDLibretroPauseEvents(void);
-unsigned SNDLibretroResumeEvents(void);
-
-/* Per-second counters: produced / consumed / dropped frames, ring fill. */
+/* Cumulative counters: produced / consumed / dropped frames, ring fill, and how
+   the underrun frames were concealed (repeated pitch period vs. faded to
+   silence).  The caller takes differences, like it does for the others. */
 void SNDLibretroSnapshot(u32 *produced, u32 *consumed, u32 *dropped,
-                         u32 *underrun, unsigned *fill_frames);
+                         u32 *underrun, unsigned *fill_frames,
+                         u32 *plc_frames, u32 *fade_frames);
 
 #endif

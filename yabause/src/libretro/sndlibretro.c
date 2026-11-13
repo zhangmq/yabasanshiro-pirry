@@ -35,10 +35,9 @@
     frames = 160 ms) but is not primed: nothing is fed ahead of time here, so
     the depth is jitter/overflow headroom.
 
-    Deliberately not here (phase 2, AUDIO-LIBRETRO-20261109.md §3a): prefill,
-    +-1 % resampler with rate control, PLC/fade on underrun, pause/refill for
-    save states, and moving the period source to the front end's audio thread
-    (SET_AUDIO_CALLBACK) once a front end offers it.
+    Deliberately not here (phase 2, AUDIO-LIBRETRO-20261109.md §3a): moving the
+    period source to the front end's audio thread (SET_AUDIO_CALLBACK) once a
+    front end offers it.
 */
 
 #include <errno.h>
@@ -60,13 +59,6 @@
 #define SND_PERIOD_FRAMES 512
 
 #define SND_MAXVOLUME     128
-
-/* On resume the ring holds whatever the SCSP produced while the front end was
-   paused.  Its old end is a timeline that has moved on, but throwing all of it
-   away leaves the front end's own buffer empty (it then polls us in a tight
-   loop with nothing to give); keep the newest two periods, i.e. the audio from
-   the moment of the resume. */
-#define SND_RESUME_KEEP   (2 * SND_PERIOD_FRAMES)
 
 /* Adaptive resampling trim, ported from the standalone (sndsdl.c:600-740).
    The SCSP thread produces by the wall clock, the front end's device consumes
@@ -95,21 +87,15 @@ static u32 frames_per_field;               /* 44100 / vertfreq, for the log */
 static u8 volume = SND_MAXVOLUME;
 static int muted;
 
-/* Consumer thread. */
-static pthread_t consumer_thread;
-static volatile int consumer_run;
-static int consumer_started;
-static s16 period_buf[SND_PERIOD_FRAMES * 2];
-static void (*submit_pcm)(const s16 *pcm, unsigned frames);
-static unsigned submit_frames;
-
 /* Per-second statistics, guarded by ring_lock. */
 static u64 stat_ticks;
 static u32 stat_produced;
 static u32 stat_consumed;
 static u32 stat_underrun;
+static u32 stat_plc;              /* underrun frames filled by repeating a pitch period */
+static u32 stat_fade;             /* underrun frames faded to silence                        */
 static u32 stat_dropped;
-static u32 stat_stale;             /* dropped at a pause/resume boundary */
+static u32 stat_stale;             /* trimmed by the prefill target */
 
 /* Async (env 22) path: the front end's audio thread pulls, so there is no
    consumer thread and no wall-clock schedule of our own. */
@@ -124,70 +110,15 @@ static double soundfrac;           /* fractional read position in the window */
 static s16 stretch_last[2];        /* last input frame, for interpolation */
 static s16 stretch_win[SND_STRETCH_WIN_FRAMES * 2];
 
-/* Pause detection.  libretro has no pause environment call (env 22's set_state
-   is about the front end's audio driver), so "the front end stopped calling
-   retro_run" is the signal: the menu blocks the main loop, the game stops, and
-   the audio must stop with it.  250 ms is 2.5x the longest field measured on
-   this device with autoframeskip; it is overridable for experiments. */
-/* 1000 ms, not the 250 ms first tried: a legitimate Saturn mode switch
-   (320x224 -> 704x448 interlace) blocks the machine thread for ~506 ms on this
-   device (measured 2026-11-11, join: vin_ms=506), and 250 ms turned that into a
-   false "resume", which dropped the ring and made the front end underrun. */
-#define SND_PAUSE_MS_DEFAULT 1000
-static unsigned pause_ms = SND_PAUSE_MS_DEFAULT;
-static int paused;
-static int resume_pending;         /* retro_run came back after a long gap */
-static unsigned pause_events, resume_events;
+/* No pause handling: the SCSP runs on the machine's emulated clock
+   (scsp.c, machine-token mode), so a front end that stops calling retro_run
+   simply stops the machine and nothing is produced while it is away.  What the
+   ring already holds is valid audio for the moment it was produced in, and the
+   consumer may play it out; the next machine frame starts from exactly the same
+   emulated time.  Nothing to detect, nothing to drop, nothing to refill.
+   (The wall-clock SCSP thread needed a heartbeat to tell it that the front end
+   had stopped, because it kept producing into a timeline nobody was watching.) */
 
-static u64 snd_ticks(void)
-{
-   return YabauseGetTicks();
-}
-
-static u64 snd_tickfreq(void)
-{
-   return yabsys.tickfreq ? yabsys.tickfreq : 1;
-}
-
-static int snd_pause_gate(void);   /* defined with the pump below */
-
-static void SNDLibretroLogStats(void)
-{
-   const u64 freq = snd_tickfreq();
-   u64 now;
-   int due;
-   u32 produced, consumed, underrun, dropped, fill_now, per_field;
-
-   pthread_mutex_lock(&ring_lock);
-   now = snd_ticks();
-   if (stat_ticks == 0)
-   {
-      stat_ticks = now;
-      pthread_mutex_unlock(&ring_lock);
-      return;
-   }
-   due = (now - stat_ticks >= freq);
-   produced = stat_produced;
-   consumed = stat_consumed;
-   underrun = stat_underrun;
-   dropped = stat_dropped;
-   fill_now = fill;
-   per_field = frames_per_field;
-   if (due)
-   {
-      stat_ticks = now;
-      stat_produced = 0;
-      stat_consumed = 0;
-      stat_underrun = 0;
-      stat_dropped = 0;
-   }
-   pthread_mutex_unlock(&ring_lock);
-
-   if (due)
-      LOG_DEBUG("audio: field=%u produced=%u consumed=%u underrun=%u dropped=%u fill=%u/%u",
-                per_field, produced, consumed, underrun, dropped, fill_now,
-                (u32)SND_RING_FRAMES);
-}
 
 /* Steer the ring towards the fill target (constants above).  Caller holds
    ring_lock.  Proportional only, like the standalone: a small standing error
@@ -260,8 +191,28 @@ static double snd_plc_score(u32 pos_f, int P)
    return (cross > 0.0) ? (cross * cross) / en : 0.0;
 }
 
-static int snd_plc_run;
+static int snd_plc_run;           /* consecutive periods with an underrun (statistics only) */
 static int snd_plc_lastP;
+
+/* Upstream caps the concealment at four consecutive periods (sndsdl.c:238
+   `plc_run <= 4`) because it was written for an isolated dropout: repeating a
+   pitch period forever after one lost packet would turn a stall into a buzzing
+   loop.
+
+   The case this port runs into is the opposite one.  When the machine cannot
+   emulate a field in 1/60 s the SCSP produces less than 44.1 kHz and *every*
+   period is short - by 15-25 frames at astrass' title screen.  With the
+   counter cap the first four periods get a pitch-period repetition and all the
+   rest take the fade path: a 0.3-0.5 ms fade to silence every 11.6 ms, audible
+   as a periodic rough edge.
+
+   So the criterion is the gap length, not the number of consecutive events: a
+   short gap is bridged by repeating the last pitch period (cheap, keeps the
+   waveform going, no pitch change), a long one still fades so a real stall
+   cannot become a loop.  220 frames = 5 ms covers the gaps the SCSP leaves
+   when it delivers a quarter of a field at a time; a whole empty period (512)
+   still fades. */
+#define SND_PLC_MAX_GAP_FRAMES 220
 
 static void snd_conceal(s16 *dst, u32 from)
 {
@@ -273,7 +224,7 @@ static void snd_conceal(s16 *dst, u32 from)
    nframes = SND_PERIOD_FRAMES - from;
    snd_plc_run++;
 
-   if (snd_plc_run <= 4 && from > 0)
+   if (from > 0 && nframes <= SND_PLC_MAX_GAP_FRAMES)
    {
       const int P_MIN = 32, P_MAX = 480;
       double best = 0.0;
@@ -327,11 +278,13 @@ static void snd_conceal(s16 *dst, u32 from)
             }
          }
          plc_done = 1;
+         stat_plc += nframes;
       }
    }
 
    if (!plc_done)
    {
+      stat_fade += nframes;
       const u32 FADE = 64;
       s16 fl = 0, fr = 0;
       u32 fade_n = (nframes < FADE) ? nframes : FADE;
@@ -465,70 +418,6 @@ static void snd_render_period(s16 *dst)
    snd_regulate();
 }
 
-/* One consumer period: exactly SND_PERIOD_FRAMES frames, resampled from the
-   ring and steered towards the fill target. */
-static void SNDLibretroPeriod(void)
-{
-   pthread_mutex_lock(&ring_lock);
-   if (snd_pause_gate() || snd_prefill_gate())
-      memset(period_buf, 0, sizeof(s16) * 2 * SND_PERIOD_FRAMES);
-   else
-      snd_render_period(period_buf);
-   submit_frames = SND_PERIOD_FRAMES;
-   pthread_mutex_unlock(&ring_lock);
-   SNDLibretroLogStats();
-}
-
-/* Consumer thread: absolute schedule of SND_PERIOD_FRAMES at 44100 Hz, phase
-   locked to CLOCK_MONOTONIC.  A wake-up more than three periods late is
-   resynchronised instead of catching up in a burst (same clamp spirit as
-   scsp.c's phase lock). */
-static void *SNDLibretroConsumer(void *arg)
-{
-   const s64 period_ns =
-      (s64)SND_PERIOD_FRAMES * 1000000000LL / 44100LL;
-   struct timespec next;
-
-   (void)arg;
-   clock_gettime(CLOCK_MONOTONIC, &next);
-
-   while (consumer_run)
-   {
-      struct timespec now;
-      s64 late;
-
-      next.tv_nsec += (long)(period_ns % 1000000000LL);
-      next.tv_sec += (time_t)(period_ns / 1000000000LL);
-      if (next.tv_nsec >= 1000000000L)
-      {
-         next.tv_sec++;
-         next.tv_nsec -= 1000000000L;
-      }
-
-      while (consumer_run &&
-             clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next, NULL) == EINTR)
-         ;
-
-      clock_gettime(CLOCK_MONOTONIC, &now);
-      late = (s64)(now.tv_sec - next.tv_sec) * 1000000000LL +
-             (s64)(now.tv_nsec - next.tv_nsec);
-      if (late > 3 * period_ns)
-         next = now;
-
-      if (!consumer_run)
-         break;
-
-      SNDLibretroPeriod();
-
-      /* Outside the ring lock: the front end may block here until its device
-         drains, and the SCSP thread must never wait for that. */
-      if (submit_pcm != NULL && submit_frames > 0)
-         submit_pcm(period_buf, submit_frames);
-   }
-
-   return NULL;
-}
-
 /* Startup prefill: the ring is regulated towards stretch_target (four fields),
    but the regulator can only stretch audio that is there - starting from an
    empty ring, the consumer takes every frame the producer writes and the ring
@@ -572,63 +461,13 @@ static int snd_prefill_gate(void)
    return 1;
 }
 
-/* Caller holds ring_lock.  Returns 1 when audio must not be handed over: the
-   front end has not run a frame for pause_ms, so whatever is queued belongs to
-   a timeline that has moved on.  On the transition back it drops the backlog
-   once, so playback resumes from the current moment. */
-static int snd_pause_gate(void)
-{
-   u32 dropped, keep;
-
-   if (__atomic_load_n(&resume_pending, __ATOMIC_RELAXED))
-   {
-      /* retro_run came back after a long gap: the old end of the queue is a
-         timeline that has moved on, the newest samples are from this moment.
-         Drop the stale head, keep a small cushion. */
-      __atomic_store_n(&resume_pending, 0, __ATOMIC_RELAXED);
-      dropped = 0;
-      keep = stretch_target ? stretch_target : SND_RESUME_KEEP;
-      if (fill > keep)
-      {
-         dropped = fill - keep;
-         read_pos += dropped;
-         if (read_pos >= SND_RING_FRAMES)
-            read_pos -= SND_RING_FRAMES;
-         fill = keep;
-         stat_stale += dropped;
-      }
-      /* The SCSP keeps producing into its own output buffer while the ring is
-         full; flush that too, otherwise it refills the ring with paused-time
-         audio right after this drop. */
-      ScspFlushOutput();
-      paused = 0;
-      resume_events++;
-      prefill_done = 1;   /* the branch above already kept stretch_target frames */
-      LOG_INFO("audio: resumed, dropped %u stale frames, kept %u", dropped, fill);
-      return 0;
-   }
-   if (SNDLibretroSinceHeartbeatMs() > pause_ms)
-   {
-      if (!paused)
-      {
-         paused = 1;
-         pause_events++;
-         LOG_INFO("audio: paused (%u ms without retro_run), not draining",
-                  SNDLibretroSinceHeartbeatMs());
-      }
-      return 1;
-   }
-   paused = 0;
-   return 0;
-}
-
 /* Async path: one device period per call, the same size the standalone asks
    SDL for (sndsdl.c:371).  The caller submits it from inside the front end's
    audio callback, outside ring_lock (that call may block). */
 unsigned SNDLibretroPump(s16 *dst)
 {
    pthread_mutex_lock(&ring_lock);
-   if (snd_pause_gate() || snd_prefill_gate())
+   if (snd_prefill_gate())
    {
       memset(dst, 0, sizeof(s16) * 2 * SND_PERIOD_FRAMES);
       pthread_mutex_unlock(&ring_lock);
@@ -637,6 +476,21 @@ unsigned SNDLibretroPump(s16 *dst)
    snd_render_period(dst);
    pthread_mutex_unlock(&ring_lock);
    return SND_PERIOD_FRAMES;
+}
+
+/* How many whole periods the ring can feed right now; zero while the startup
+   cushion is still filling (the pump would only hand out silence).  The
+   synchronous path in retro_run uses it: when the front end refuses env 22 it
+   renders audio by calling retro_run, and whatever the SCSP produced since the
+   last call is handed over there. */
+unsigned SNDLibretroReadyPeriods(void)
+{
+   unsigned n;
+
+   pthread_mutex_lock(&ring_lock);
+   n = snd_prefill_gate() ? 0 : (fill / SND_PERIOD_FRAMES);
+   pthread_mutex_unlock(&ring_lock);
+   return n;
 }
 
 void SNDLibretroDropBacklog(void)
@@ -657,21 +511,6 @@ static u64 snd_now_us(void)
    return (u64)t.tv_sec * 1000000u + (u64)t.tv_nsec / 1000u;
 }
 
-void SNDLibretroHeartbeat(void)
-{
-   u64 now = snd_now_us();
-   s64 prev = __atomic_load_n(&hb_us, __ATOMIC_RELAXED);
-
-   /* A gap longer than the pause threshold means the front end was not running
-      us (menu, pause); the audio queued in between must not be played.  This is
-      detected here because the front end may simply stop calling the audio
-      callback while paused, in which case the pump never runs to notice. */
-   if (prev != 0 && (now - (u64)prev) > (u64)pause_ms * 1000u)
-      __atomic_store_n(&resume_pending, 1, __ATOMIC_RELAXED);
-
-   __atomic_store_n(&hb_us, (s64)now, __ATOMIC_RELAXED);
-}
-
 double SNDLibretroRatio(void)
 {
    double r;
@@ -682,24 +521,9 @@ double SNDLibretroRatio(void)
    return r;
 }
 
-unsigned SNDLibretroSinceHeartbeatMs(void)
-{
-   s64 hb = __atomic_load_n(&hb_us, __ATOMIC_RELAXED);
-   if (hb == 0)
-      return 0;
-   return (unsigned)((snd_now_us() - (u64)hb) / 1000u);
-}
-
-int SNDLibretroPaused(void)
-{
-   return __atomic_load_n(&paused, __ATOMIC_RELAXED);
-}
-
-unsigned SNDLibretroPauseEvents(void)  { return __atomic_load_n(&pause_events, __ATOMIC_RELAXED); }
-unsigned SNDLibretroResumeEvents(void) { return __atomic_load_n(&resume_events, __ATOMIC_RELAXED); }
-
 void SNDLibretroSnapshot(u32 *produced, u32 *consumed, u32 *dropped,
-                         u32 *underrun, unsigned *fill_frames)
+                         u32 *underrun, unsigned *fill_frames,
+                         u32 *plc_frames, u32 *fade_frames)
 {
    pthread_mutex_lock(&ring_lock);
    if (produced)
@@ -712,39 +536,11 @@ void SNDLibretroSnapshot(u32 *produced, u32 *consumed, u32 *dropped,
       *underrun = stat_underrun;
    if (fill_frames)
       *fill_frames = fill;
+   if (plc_frames)
+      *plc_frames = stat_plc;
+   if (fade_frames)
+      *fade_frames = stat_fade;
    pthread_mutex_unlock(&ring_lock);
-}
-
-int SNDLibretroStart(void (*fn)(const s16 *pcm, unsigned frames))
-{
-   if (fn == NULL || consumer_started)
-      return 0;
-
-   submit_pcm = fn;
-   consumer_run = 1;
-   if (pthread_create(&consumer_thread, NULL, SNDLibretroConsumer, NULL) != 0)
-   {
-      LOG_WARN("audio: consumer thread failed to start");
-      consumer_run = 0;
-      submit_pcm = NULL;
-      return -1;
-   }
-   consumer_started = 1;
-   LOG_INFO("audio: consumer thread up, %u-frame periods (%.2f ms)",
-            (unsigned)SND_PERIOD_FRAMES,
-            (double)SND_PERIOD_FRAMES * 1000.0 / 44100.0);
-   return 0;
-}
-
-void SNDLibretroStop(void)
-{
-   if (!consumer_started)
-      return;
-   consumer_run = 0;
-   pthread_join(consumer_thread, NULL);
-   consumer_started = 0;
-   submit_pcm = NULL;
-   LOG_INFO("audio: consumer thread stopped");
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -766,20 +562,12 @@ static int SNDLibretroInit(void)
    stat_ticks = 0;
    stat_produced = stat_consumed = stat_underrun = stat_dropped = 0;
    stat_stale = 0;
-   __atomic_store_n(&hb_us, 0, __ATOMIC_RELAXED);
    soundratio = 1.0;
    soundfrac = 0.0;
    stretch_last[0] = stretch_last[1] = 0;
    stretch_target = 735 * SND_STRETCH_TARGET_FIELDS;
    prefill_done = 0;
    prefill_deadline_us = snd_now_us() + 2000000ULL;   /* safety: 2 s */
-   paused = 0;
-   resume_pending = 0;
-   pause_events = resume_events = 0;
-   {
-      const char *pm = getenv("YAB_AUDIO_PAUSE_MS");
-      pause_ms = (pm != NULL && atoi(pm) > 0) ? (unsigned)atoi(pm) : SND_PAUSE_MS_DEFAULT;
-   }
    pthread_mutex_unlock(&ring_lock);
 
    LOG_INFO("audio: SCSP adapter, ring %u frames (%u ms), %u-frame periods",
@@ -790,8 +578,6 @@ static int SNDLibretroInit(void)
 
 static void SNDLibretroDeInit(void)
 {
-   SNDLibretroStop();
-
    pthread_mutex_lock(&ring_lock);
    free(ring);
    ring = NULL;
