@@ -277,8 +277,64 @@ static int ChtHex(const char *s, size_t len)
    return 1;
 }
 
+#ifdef __LIBRETRO__
+/* Add one chain of Action Replay codes, exactly as a libretro .cht writes it:
+   "1605C942+270F", "1605C992+967F+1605C994+0098" (a 4-digit token reuses the
+   address parsed before it), "1609207200a0" (address and value run together)
+   or the plain "1605C942 270F".  Master codes (F/B) only configure the real AR
+   cartridge and "??" tokens are placeholders: both are skipped without
+   aborting the rest of the chain, because the next code in the entry is
+   usually an independent one.  Returns the number of codes added.
+
+   Libretro-only: the front end hands the raw code string to retro_cheat_set(),
+   and this gives it the same parser CheatLoadCht() uses.  The standalone build
+   keeps its original ChtAddEntry() below untouched. */
+int CheatAddARCodeChain(const char *code, const char *desc, int enable, int group)
+{
+   char chain[8192], adr[9] = "";
+   char *tok, *rest;
+   char ar[16];
+   int codes = 0;
+
+   if (code == NULL)
+      return 0;
+
+   strncpy(chain, code, sizeof(chain) - 1);
+   chain[sizeof(chain) - 1] = 0;
+   for (tok = strtok_r(chain, "+ \t", &rest); tok; tok = strtok_r(NULL, "+ \t", &rest))
+   {
+      const char *val = tok;
+
+      if (adr[0] == 0)
+      {
+         /* some files write address and value without a separator: "1609207200a0" */
+         if (ChtHex(tok, 12)) { memcpy(adr, tok, 8); adr[8] = 0; val = tok + 8; }
+         else { snprintf(adr, sizeof(adr), "%.8s", tok); if (!ChtHex(adr, 8)) adr[0] = '?'; continue; }
+      }
+      /* "0???" and the like are placeholders to fill in; F/B = master code of the real AR cartridge */
+      if (ChtHex(adr, 8) && ChtHex(val, 4) && strchr("FfBb", adr[0]) == NULL)
+      {
+         snprintf(ar, sizeof(ar), "%s %s", adr, val);
+         if (CheatAddARCode(ar) == 0)
+         {
+            if (desc != NULL)
+               cheatlist[numcheats - 1].desc = strdup(desc);
+            cheatlist[numcheats - 1].enable = enable;
+            cheatlist[numcheats - 1].group = group;
+            codes++;
+         }
+      }
+      adr[0] = 0;
+   }
+   return codes;
+}
+#endif
+
 static int ChtAddEntry(int n, const char *desc, const char *code, int enable)
 {
+#ifdef __LIBRETRO__
+   return CheatAddARCodeChain(code, desc, enable, n) > 0;
+#else
    char chain[8192], adr[9] = "";
    char *tok, *rest;
    char ar[16];
@@ -311,6 +367,7 @@ static int ChtAddEntry(int n, const char *desc, const char *code, int enable)
       adr[0] = 0;
    }
    return codes > 0;
+#endif
 }
 
 int CheatLoadCht(const char *filename)

@@ -85,6 +85,9 @@ cheatlist_struct *CheatGetList(int *cheatnum);
 int CheatSave(const char *filename);
 int CheatLoad(const char *filename);
 int CheatLoadCht(const char *filename);
+#ifdef __LIBRETRO__
+int CheatAddARCodeChain(const char *code, const char *desc, int enable, int group);
+#endif
 void CheatEnableGroup(int group, int enable);
 
 #if defined (__cplusplus)

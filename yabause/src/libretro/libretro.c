@@ -62,6 +62,7 @@
 #include "cdbase.h"
 #include "cs2.h"      /* Cs2ForceOpenTray / Cs2ForceCloseTray (disk control) */
 #include "memory.h"   /* BupRam / FormatBackupRam: the save-RAM card */
+#include "cheat.h"    /* CheatAddARCodeChain / CheatClearCodes / CheatGetList */
 #include "cs0.h"
 #include "osdcore.h"
 #include "peripheral.h"
@@ -298,6 +299,108 @@ static int yab_disc_cmd(int eject, const char *path)
    return yab_cmd_wait_ex(YAB_CMD_DISC, NULL, 0, eject, path);
 }
 
+/* ---- cheats (libretro protocol) -----------------------------------------
+ * Both front ends parse the .cht themselves and hand the core one opaque code
+ * string per entry (the file syntax is the front end's, not ours): RetroArch
+ * calls reset() and then one set() per enabled entry when the user applies
+ * cheats; minarch calls reset() and one set() per entry (including disabled
+ * ones) right after load_game, and again when a cheat is toggled in its menu.
+ * The strings are Action Replay chains ("1605C942+270F"), which
+ * CheatAddARCodeChain() understands.
+ *
+ * The engine applies patches from the machine thread's VBlank path
+ * (CheatDoPatches(), yabause.c:939), so the front end's calls must not touch
+ * cheatlist directly.  They are staged here instead and the engine list is
+ * rebuilt in one go at the next field boundary: that is race-free and costs one
+ * field for the whole reset/set sequence, where one command round trip per call
+ * (yab_cmd_wait) would stall minarch's menu for ~16 ms per entry.  Before the
+ * machine thread exists (a front end may apply cheats right after
+ * retro_load_game) the rebuild happens inline, where nothing can race.
+ */
+typedef struct {
+   char *code;
+   int enabled;
+} yab_cheat_slot;
+
+static yab_cheat_slot *cheat_slots;
+static size_t cheat_slot_count;
+static pthread_mutex_t cheat_mtx = PTHREAD_MUTEX_INITIALIZER;
+static volatile int cheat_pending;
+static int cheat_added;   /* codes in the engine list, for the log lines */
+
+static void cheat_rebuild_locked(void)
+{
+   size_t i;
+
+   cheat_added = 0;
+   CheatClearCodes();
+   for (i = 0; i < cheat_slot_count; i++) {
+      if (cheat_slots[i].code == NULL || cheat_slots[i].code[0] == '\0')
+         continue;
+      cheat_added += CheatAddARCodeChain(cheat_slots[i].code, NULL,
+                                         cheat_slots[i].enabled, -1);
+   }
+}
+
+static void cheat_clear_slots_locked(void)
+{
+   size_t i;
+
+   for (i = 0; i < cheat_slot_count; i++) {
+      free(cheat_slots[i].code);
+      cheat_slots[i].code = NULL;
+      cheat_slots[i].enabled = 0;
+   }
+}
+
+/* Frontend thread: make the staged list the engine's, or schedule that for the
+   next field boundary when the machine thread owns the engine. */
+static void cheat_commit(void)
+{
+   if (!machine_started) {
+      int cn = 0;
+      pthread_mutex_lock(&cheat_mtx);
+      /* No engine yet (RetroArch applies cheats right after retro_load_game,
+         before the front end's hw context reset builds it): CheatAddARCode()
+         has no table to add to, so keep the staging and let
+         LibretroEngineContextReset() build the list once YabauseInit() ran. */
+      if (CheatGetList(&cn) != NULL) {
+         cheat_rebuild_locked();
+         pthread_mutex_unlock(&cheat_mtx);
+         LOG_INFO("cheats: %d code(s) applied (no machine thread)", cheat_added);
+      } else {
+         pthread_mutex_unlock(&cheat_mtx);
+         LOG_INFO("cheats: %zu slot(s) staged, engine not built yet", cheat_slot_count);
+      }
+      return;
+   }
+   __atomic_store_n(&cheat_pending, 1, __ATOMIC_RELEASE);
+}
+
+/* Machine thread, at the field boundary. */
+static void cheat_apply_pending(void)
+{
+   if (!__atomic_load_n(&cheat_pending, __ATOMIC_ACQUIRE))
+      return;
+   pthread_mutex_lock(&cheat_mtx);
+   cheat_pending = 0;
+   cheat_rebuild_locked();
+   pthread_mutex_unlock(&cheat_mtx);
+   LOG_INFO("cheats: %d code(s) applied (field boundary)", cheat_added);
+}
+
+/* LibretroEngineContextDestroy(): the machine thread has stopped and
+   YabauseDeInit() dropped the engine list, so the next game must not inherit
+   this one's slots. */
+static void cheat_reset_all(void)
+{
+   pthread_mutex_lock(&cheat_mtx);
+   cheat_clear_slots_locked();
+   cheat_pending = 0;
+   cheat_added = 0;
+   pthread_mutex_unlock(&cheat_mtx);
+}
+
 static void *machine_main(void *arg)
 {
    (void)arg;
@@ -305,6 +408,7 @@ static void *machine_main(void *arg)
    while (machine_run) {
       struct timespec m0, m1;
       machine_cmd_step();   /* save/load/reset run at the field boundary */
+      cheat_apply_pending();/* front end reset()/set() since the last field */
       if (!machine_run)
          break;
       clock_gettime(CLOCK_MONOTONIC, &m0);
@@ -1078,6 +1182,9 @@ void LibretroEngineContextReset(void)
    }
    reset_gl_state_for_frontend("after-init");
    }
+   /* Apply what the front end staged before the engine existed (see
+      cheat_commit()); CheatInit() has run, so the table is there now. */
+   cheat_commit();
    engine_up = 1;
    machine_run = 1;
    if (pthread_create(&machine_thread, NULL, machine_main, NULL) == 0)
@@ -1126,8 +1233,18 @@ void LibretroEngineContextDestroy(void)
                stv_eeprom_persist ? "read+write" : "off");
       STVDeInit();
    }
+   /* CheatDeInit() frees the table but leaves numcheats alone, and CheatInit()
+      does not reset it (all standalone code, not ours to change): clear the
+      list so the next game starts from zero instead of inheriting a count that
+      points past the fresh table. */
+   {
+      int cn = 0;
+      if (CheatGetList(&cn) != NULL)
+         CheatClearCodes();
+   }
    LOG_INFO("engine: YabauseDeInit");
    YabauseDeInit();
+   cheat_reset_all();   /* per-game: the next load must start with no cheats */
    engine_up = 0;
    state_size = 0;
    free(cmd_save_buf);
@@ -2052,12 +2169,56 @@ RETRO_API bool retro_unserialize(const void *data, size_t size)
    return yab_cmd_wait(YAB_CMD_LOAD, data, size) ? true : false;
 }
 
-RETRO_API void retro_cheat_reset(void) {}
+RETRO_API void retro_cheat_reset(void)
+{
+   pthread_mutex_lock(&cheat_mtx);
+   cheat_clear_slots_locked();
+   pthread_mutex_unlock(&cheat_mtx);
+   LOG_INFO("cheats: reset");
+   cheat_commit();
+}
+
 RETRO_API void retro_cheat_set(unsigned index, bool enabled, const char *code)
 {
-   (void)index;
-   (void)enabled;
-   (void)code;
+   char *copy = NULL;
+   size_t need;
+   yab_cheat_slot *grown;
+
+   /* RetroArch numbers the applied entries from 0 on every apply; minarch uses
+      the .cht entry number.  Both are small; cap so a broken front end cannot
+      ask for an absurd allocation. */
+   if (index >= 4096) {
+      LOG_WARN("cheats: index %u out of range, ignored", index);
+      return;
+   }
+   if (code != NULL && code[0] != '\0') {
+      copy = strdup(code);
+      if (copy == NULL)
+         return;
+   }
+
+   pthread_mutex_lock(&cheat_mtx);
+   if ((size_t)index >= cheat_slot_count) {
+      need = (size_t)index + 1;
+      grown = realloc(cheat_slots, need * sizeof(*grown));
+      if (grown == NULL) {
+         pthread_mutex_unlock(&cheat_mtx);
+         free(copy);
+         return;
+      }
+      memset(grown + cheat_slot_count, 0,
+             (need - cheat_slot_count) * sizeof(*grown));
+      cheat_slots = grown;
+      cheat_slot_count = need;
+   }
+   free(cheat_slots[index].code);
+   cheat_slots[index].code = copy;
+   cheat_slots[index].enabled = enabled ? 1 : 0;
+   pthread_mutex_unlock(&cheat_mtx);
+
+   LOG_INFO("cheats: set %u %s \"%s\"", index, enabled ? "on" : "off",
+            code != NULL ? code : "");
+   cheat_commit();
 }
 
 /* ------------------------------------------------------------------------- *
