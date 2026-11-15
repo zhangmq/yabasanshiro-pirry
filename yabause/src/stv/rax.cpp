@@ -859,6 +859,93 @@ static int             rax_running;
 static int             rax_reset_req;
 static int             rax_reset_done;
 
+/* Savestate handshake.  The worker owns the board while it executes (memories,
+   timers, host queue), so the machine thread may only read or write that state
+   while the worker is parked.  Same shape as the reset request: a flag, the
+   worker acknowledges at the top of its loop and waits to be released.  The
+   worker can be inside one run chunk (up to RAX_RUN_CHUNK cycles, well under a
+   millisecond of wall time), so the machine thread waits for the ack instead
+   of assuming the board is already quiet. */
+static int             rax_pause_req;   /* machine thread -> worker            */
+static int             rax_pause_ack;   /* worker -> machine thread: parked    */
+#define RAX_PAUSE_WAIT_US 2000000       /* 2 s: longer than any run chunk      */
+
+/* Worker side: 1 when this call parked and resumed, so the caller re-reads the
+   grant.  Called at the top of both worker loops. */
+static int rax_worker_parked(void)
+{
+#ifndef RAX_SINGLE_THREAD
+   if (!__atomic_load_n(&rax_pause_req, __ATOMIC_ACQUIRE))
+      return 0;
+   pthread_mutex_lock(&rax_mtx);
+   __atomic_store_n(&rax_pause_ack, 1, __ATOMIC_RELEASE);
+   pthread_cond_broadcast(&rax_cv);
+   while (__atomic_load_n(&rax_pause_req, __ATOMIC_ACQUIRE) &&
+          __atomic_load_n(&rax_running, __ATOMIC_RELAXED)) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      ts.tv_nsec += 1000 * 1000;                 /* no busy wait while parked */
+      if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+      pthread_cond_timedwait(&rax_cv, &rax_mtx, &ts);
+   }
+   __atomic_store_n(&rax_pause_ack, 0, __ATOMIC_RELEASE);
+   pthread_cond_broadcast(&rax_cv);
+   pthread_mutex_unlock(&rax_mtx);
+   return 1;
+#else
+   return 0;                    /* single-threaded harness: the board is ours */
+#endif
+}
+
+/* Machine side: park the worker.  Returns 1 when the board is quiescent (also
+   when there is no worker), 0 on timeout -- the caller must then not touch the
+   board, or it would read half-executed instructions. */
+static int rax_worker_pause(void)
+{
+#ifndef RAX_SINGLE_THREAD
+   int waited_us = 0;
+
+   if (!rax_thread_up)
+      return 1;
+   pthread_mutex_lock(&rax_mtx);
+   __atomic_store_n(&rax_pause_req, 1, __ATOMIC_RELEASE);
+   pthread_cond_broadcast(&rax_cv);
+   while (!__atomic_load_n(&rax_pause_ack, __ATOMIC_ACQUIRE) &&
+          waited_us < RAX_PAUSE_WAIT_US) {
+      struct timespec ts;
+      clock_gettime(CLOCK_MONOTONIC, &ts);
+      ts.tv_nsec += 200 * 1000;
+      if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+      pthread_cond_timedwait(&rax_cv, &rax_mtx, &ts);
+      waited_us += 200;
+   }
+   pthread_mutex_unlock(&rax_mtx);
+   if (!__atomic_load_n(&rax_pause_ack, __ATOMIC_ACQUIRE)) {
+      LOG_WARN("rax: worker did not park within %d us, board state left alone",
+               RAX_PAUSE_WAIT_US);
+      return 0;
+   }
+   return 1;
+#else
+   return 1;
+#endif
+}
+
+/* Machine side: release the worker.  No wait: the board belongs to this thread
+   again only until the next RaxAdvance/RaxDataWrite, and the worker's resume is
+   exactly what we want it to do. */
+static void rax_worker_resume(void)
+{
+#ifndef RAX_SINGLE_THREAD
+   if (!rax_thread_up)
+      return;
+   pthread_mutex_lock(&rax_mtx);
+   __atomic_store_n(&rax_pause_req, 0, __ATOMIC_RELEASE);
+   pthread_cond_broadcast(&rax_cv);
+   pthread_mutex_unlock(&rax_mtx);
+#endif
+}
+
 
 /* Host->DSP words, timestamped with the machine cycle they arrived at.  The
    worker delivers each one when its own clock reaches that point, so the DSP
@@ -981,6 +1068,12 @@ static void rax_run_worker(void)
 
    for (;;) {
       uint64_t target;
+
+      /* Savestate in progress: park here, between two grants, so the board is
+         exactly as the machine thread left it.  Raised only from a menu action,
+         so this costs one relaxed atomic load per chunk. */
+      if (rax_worker_parked())
+         return;
 
       if (__atomic_load_n(&rax_reset_req, __ATOMIC_RELAXED)) {
          pthread_mutex_lock(&rax_mtx);
@@ -1148,6 +1241,8 @@ static void *rax_worker_main(void *arg)
    for (;;) {
       if (!__atomic_load_n(&rax_running, __ATOMIC_RELAXED))
          break;
+      if (rax_worker_parked())
+         continue;
       if (__atomic_load_n(&rax_reset_req, __ATOMIC_RELAXED) ||
           __atomic_load_n(&rax_grant, __ATOMIC_RELAXED) >
              __atomic_load_n(&rax_done, __ATOMIC_RELAXED)) {
@@ -1878,16 +1973,271 @@ extern "C" void RaxMix(int *left, int *right, unsigned int frames)
    pthread_mutex_unlock(&rax_audio_mtx);
 }
 
-extern "C" int RaxSaveState(void *fp)
+/* ------------------------------------------------------------------------- */
+/* Savestate chunk ("RAX ", version 1)                                       */
+/*                                                                          */
+/* Everything the board reads after a load is written here: the memories the  */
+/* DSP program works in, the control registers, the two timers, the host word  */
+/* queue that has not been delivered yet, and the DAC ring together with the   */
+/* resampler state.  The DSP core's own registers go through save_state().    */
+/*                                                                          */
+/* Not stored: the 16 MiB ROM image (loaded with the cart; a state load never  */
+/* swaps carts), the diagnostic counters (rax_dbg_*), and the register-        */
+/* pointer maps inside the core (built once in start()).                      */
+/*                                                                          */
+/* Why a pause handshake: the DSP runs on its own thread.  The machine thread */
+/* calls this at a field boundary, but the worker may be in the middle of a    */
+/* run chunk, so it is parked first (rax_worker_pause) and the memories are    */
+/* only touched once it acknowledged.                                         */
+
+#define RAX_STATE_MAGIC  0x52415831u          /* "RAX1" payload follows     */
+#define RAX_STATE_EMPTY  0x80000000u          /* no payload after the magic */
+
+/* Wall time between two CLOCK_MONOTONIC samples, in milliseconds.  Only used
+   around a savestate, so a menu save can be reported for what it costs: the
+   worker park (the DSP has to finish its current run chunk) plus the copy. */
+static double rax_state_ms(const struct timespec *a, const struct timespec *b)
 {
-   (void)fp;
-   return -1;                    /* phase 2: no RAX chunk in the state format yet */
+   return (double)(b->tv_sec - a->tv_sec) * 1e3
+        + (double)(b->tv_nsec - a->tv_nsec) / 1e6;
 }
 
-extern "C" int RaxLoadState(void *fp)
+/* Field that could not be transferred (fread/fwrite short): a truncated or
+   foreign-version state must be reported, not half-applied in silence. */
+static int rax_state_bad;
+
+#define RAX_ST(field) do { \
+   if (save) { \
+      if (fwrite(&(field), sizeof(field), 1, fp) != 1) rax_state_bad++; \
+   } else { \
+      if (fread(&(field), sizeof(field), 1, fp) != 1) rax_state_bad++; \
+   } \
+} while (0)
+
+static void rax_state_io(FILE *fp, int save)
 {
-   (void)fp;
-   return -1;
+   rax_state_bad = 0;
+
+   /* Board memories (MAME rax.cpp address maps). */
+   RAX_ST(st.pram);        /* program space, 16K x 32 (24 bits used)  =  64 KiB */
+   RAX_ST(st.bank);        /* 5 data banks, 8K x 16                   =  80 KiB */
+   RAX_ST(st.iram);        /* internal data RAM 0x2000..0x3FDF        =  16 KiB */
+   RAX_ST(st.control);     /* 0x3FE0..0x3FFF                          =  64 B   */
+
+   /* Bank latches and the two host latches (MAME m_data_in/m_data_out/PF0). */
+   RAX_ST(st.rom_bank);
+   RAX_ST(st.data_bank);
+   RAX_ST(st.dmovlay);
+   RAX_ST(st.data_in);
+   RAX_ST(st.data_out);
+   RAX_ST(st.pf0);
+
+   /* SPORT0 autobuffer state: which I register indexes the DAC ring, its
+      stride and length, and where the ring started. */
+   RAX_ST(st.ireg);
+   RAX_ST(st.dac_ireg);
+   RAX_ST(st.incs);
+   RAX_ST(st.size);
+   RAX_ST(st.ireg_base);
+
+   /* The board's two timers (16.16 fixed point / whole DSP cycles). */
+   RAX_ST(st.reg_period_fp);
+   RAX_ST(st.reg_left_fp);
+   RAX_ST(st.dma_period);
+   RAX_ST(st.dma_left);
+   RAX_ST(st.dma_param);
+
+   /* Machine-time ledger: the DSP must continue exactly where the machine
+      time it was granted stopped, or the board drifts against the game. */
+   RAX_ST(st.due_acc);
+   RAX_ST(st.dsp_run);
+   RAX_ST(st.cycles_run);
+
+   /* Counters that later code reads back (dac_frames feeds the resampler
+      calibration; the host counters are what the logs compare). */
+   RAX_ST(st.bdma_count);
+   RAX_ST(st.imask_stuck);
+   RAX_ST(st.host_in);
+   RAX_ST(st.host_in16);
+   RAX_ST(st.host_delivered);
+   RAX_ST(st.host_read);
+   RAX_ST(st.cmd_bdma);
+   RAX_ST(st.dac_frames);
+   RAX_ST(st.dac_starts);
+
+   /* The DSP core: registers, stacks, DAG, IRQ latches, mask state. */
+   if (save)
+      st.cpu.save_state(fp);
+   else
+      st.cpu.load_state(fp);
+
+   /* Host words the SH-2 wrote but the DSP has not seen yet (with their
+      timestamps), so a save taken between a command and its delivery does not
+      lose the command. */
+   RAX_ST(rax_hostq_val);
+   RAX_ST(rax_hostq_cyc);
+   RAX_ST(rax_hostq_head);
+   RAX_ST(rax_hostq_tail);
+   RAX_ST(rax_lost_words);
+
+   /* Grant/ack ledger between the machine and the worker: the worker still
+      owes (grant - dsp_run) cycles after a load, exactly as it did at save. */
+   RAX_ST(rax_grant);
+
+   /* Audio side: the DAC ring the consumer reads and the resampler state, so
+      playback continues on the same waveform instead of restarting the FIFO.
+      The consumer (SCSP thread) is parked by ScspLockThread() around a
+      savestate, and the producer is parked above, but take the lock anyway:
+      this array is the one thing the two threads genuinely share. */
+   pthread_mutex_lock(&rax_audio_mtx);
+   RAX_ST(rax_fifo);
+   RAX_ST(rax_fifo_head);
+   RAX_ST(rax_fifo_fill);
+   RAX_ST(rax_fifo_pos);
+   RAX_ST(rax_step);
+   RAX_ST(rax_dac_on);
+   RAX_ST(rax_fifo_primed);
+   RAX_ST(rax_fifo_under);
+   RAX_ST(rax_pop_total);
+   RAX_ST(rax_out_total);
+   RAX_ST(rax_cal_frames);
+   RAX_ST(rax_cal_out);
+   RAX_ST(rax_step_cal);
+   pthread_mutex_unlock(&rax_audio_mtx);
+}
+
+extern "C" int RaxSaveState(void *fpv)
+{
+   FILE *fp = (FILE *)fpv;
+   uint32_t magic = RAX_STATE_MAGIC;
+   long start, end;
+   struct timespec t0, t1, t2;
+   int parked = 0;
+   double park_ms = 0.0;
+
+   if (fp == NULL)
+      return -1;
+   start = ftell(fp);
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+
+   if (st.present && st.inited) {
+      parked = rax_worker_pause();
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      park_ms = rax_state_ms(&t0, &t1);
+   }
+   if (!parked)
+      magic |= RAX_STATE_EMPTY;      /* board absent, or it would not park */
+   fwrite(&magic, sizeof(magic), 1, fp);
+
+   if (parked) {
+      rax_state_io(fp, 1);
+      rax_worker_resume();
+      if (rax_state_bad)
+         LOG_WARN("rax: state save: %d fields could not be written", rax_state_bad);
+   }
+
+   end = ftell(fp);
+   clock_gettime(CLOCK_MONOTONIC, &t2);
+   LOG_INFO("rax: state saved, %ld bytes in %.2f ms (park %.2f ms) "
+            "(dsp_run=%llu pc=%04X fifo=%u pending=%u)",
+            end - start, rax_state_ms(&t0, &t2), park_ms,
+            (unsigned long long)st.dsp_run, (unsigned)st.cpu.pc(),
+            (unsigned)rax_fifo_fill,
+            (unsigned)((rax_hostq_tail + RAX_HOSTQ - rax_hostq_head) % RAX_HOSTQ));
+   return (int)(end - start);
+}
+
+extern "C" int RaxLoadState(void *fpv)
+{
+   FILE *fp = (FILE *)fpv;
+   uint32_t magic = 0;
+   long start, end;
+   struct timespec t0, t1, t2;
+   int parked;
+
+   if (fp == NULL)
+      return -1;
+   start = ftell(fp);
+   if (fread(&magic, sizeof(magic), 1, fp) != 1)
+      return -1;
+   if ((magic & 0xFFFF0000u) != (RAX_STATE_MAGIC & 0xFFFF0000u)) {
+      LOG_WARN("rax: state chunk has magic %08X, expected %08X", (unsigned)magic,
+               (unsigned)RAX_STATE_MAGIC);
+      return -1;
+   }
+   if (magic & RAX_STATE_EMPTY) {
+      /* Written with the board absent (or when the worker could not be
+         parked): leave the current board alone, which is what the old states
+         without this chunk did anyway. */
+      LOG_WARN("rax: state carries no board payload, keeping the current board");
+      return (int)(ftell(fp) - start);
+   }
+   if (!st.present || !st.inited) {
+      LOG_WARN("rax: state has board data but this cart has no board");
+      end = ftell(fp);
+      return (int)(end - start);
+   }
+
+   /* Never restore half of it: if the worker will not park, keep the board as
+      it is (the picture/CPU state still loads, which is no worse than a state
+      written before this chunk existed). */
+   clock_gettime(CLOCK_MONOTONIC, &t0);
+   parked = rax_worker_pause();
+   clock_gettime(CLOCK_MONOTONIC, &t1);
+   if (!parked)
+      return -1;
+
+   rax_state_io(fp, 0);
+   if (rax_state_bad) {
+      /* Truncated or from a build with a different field layout: do not hand
+         the machine a half-restored board. */
+      rax_worker_resume();
+      LOG_WARN("rax: state load: %d fields could not be read, board not restored",
+               rax_state_bad);
+      return -1;
+   }
+
+   /* Derived state: the inline bank pointer the core's fast path uses, and the
+      cycles-executed ledger the worker publishes. */
+   (void)data_bank_ptr();
+   __atomic_store_n(&rax_done, st.dsp_run, __ATOMIC_RELEASE);
+
+   /* The perf probe divides by wall time since its own baseline, which belongs
+      to the pre-load timeline; start a fresh window so the next second still
+      reports. */
+   rax_perf_wall0.tv_sec = 0;
+   rax_perf_wall0.tv_nsec = 0;
+   rax_perf_next = st.dsp_run + RAX_DSP_CLOCK;
+
+   rax_worker_resume();
+
+   end = ftell(fp);
+   clock_gettime(CLOCK_MONOTONIC, &t2);
+   LOG_INFO("rax: state loaded, %ld bytes in %.2f ms (park %.2f ms) "
+            "(dsp_run=%llu pc=%04X fifo=%u pending=%u)",
+            end - start, rax_state_ms(&t0, &t2), rax_state_ms(&t0, &t1),
+            (unsigned long long)st.dsp_run, (unsigned)st.cpu.pc(),
+            (unsigned)rax_fifo_fill,
+            (unsigned)((rax_hostq_tail + RAX_HOSTQ - rax_hostq_head) % RAX_HOSTQ));
+   return (int)(end - start);
+}
+
+extern "C" int RaxStateChunkPresent(void *fpv)
+{
+   FILE *fp = (FILE *)fpv;
+   char id[4];
+   long pos;
+   int have = 0;
+
+   if (fp == NULL)
+      return 0;
+   pos = ftell(fp);
+   if (pos < 0)
+      return 0;
+   if (fread(id, 1, 4, fp) == 4)
+      have = (strncmp(id, "RAX ", 4) == 0);
+   fseek(fp, pos, SEEK_SET);      /* leave the file exactly as it was */
+   return have;
 }
 
 #ifdef RAX_TEST_TRACE

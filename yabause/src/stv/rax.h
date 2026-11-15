@@ -60,9 +60,23 @@ void RaxDataWriteEx(unsigned short data, int word16);
    board is absent or its DAC is disabled. */
 void RaxMix(int *left, int *right, unsigned int frames);
 
-/* Savestate hook (phase 2; the current memory.c format has no RAX chunk). */
-int RaxSaveState(void *fp);
-int RaxLoadState(void *fp);
+/* Savestate chunk.  `fp` is a FILE*; the payload is the whole board: program
+   and data memories, sample banks, control registers, the two timers, the host
+   command queue and the DAC ring with its resampler state (~200 KiB).  The
+   DSP core's registers go through adsp21xx_device::save_state()/load_state().
+
+   The caller (memory.c) writes the chunk header ("RAX ", version 1) and the
+   size; the RAX chunk sits right before OTHR, and states written before it
+   existed simply do not have it (RaxStateChunkPresent() lets the loader keep
+   those loadable).
+
+   Both directions park the DSP worker first: its thread owns the board during
+   a run, and reading the memories while it executes would tear the state. */
+int RaxSaveState(void *fp);      /* bytes written, or -1                    */
+int RaxLoadState(void *fp);      /* bytes read, or -1                       */
+/* 1 when the next chunk of the state file is the RAX one (restores the file
+   position either way).  Old states do not have it. */
+int RaxStateChunkPresent(void *fp);
 
 #ifdef __cplusplus
 }

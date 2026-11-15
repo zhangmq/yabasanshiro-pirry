@@ -1621,6 +1621,13 @@ void adsp21xx_device::save_state(FILE *fp) const
    YAB_ST_SAVE(self->m_mstat_mask);
    YAB_ST_SAVE(self->m_imask_mask);
    YAB_ST_SAVE(self->m_halted);
+   /* Interrupt-deferral state.  m_irq_pending is not a cache that can be
+      rebuilt on demand: a request is only sampled when it is set, so a state
+      restored with a takeable request and the flag at 0 would leave the DSP
+      waiting for an interrupt it never takes (silent board).  m_irq_depth
+      keeps the host latch from nesting inside the DSP's own handler. */
+   YAB_ST_SAVE(self->m_irq_depth);
+   YAB_ST_SAVE(self->m_irq_pending);
 }
 
 void adsp21xx_device::load_state(FILE *fp)
@@ -1673,6 +1680,8 @@ void adsp21xx_device::load_state(FILE *fp)
    YAB_ST_SAVE(self->m_mstat_mask);
    YAB_ST_SAVE(self->m_imask_mask);
    YAB_ST_SAVE(self->m_halted);
+   YAB_ST_SAVE(self->m_irq_depth);
+   YAB_ST_SAVE(self->m_irq_pending);
 }
 
 void adsp21xx_device::run(int cycles)
