@@ -117,6 +117,8 @@ set(ENGINE_SOURCES
    ${ENGINE_DIR}/stv/eeprom.c
    ${ENGINE_DIR}/stv/decrypt.c
    ${ENGINE_DIR}/stv/stvcomp.c
+   ${ENGINE_DIR}/stv/rax.cpp
+   ${ENGINE_DIR}/adsp2100/adsp2100_port.cpp
    ${ENGINE_DIR}/snddummy.c
    ${ENGINE_DIR}/sock-linux.c
    ${ENGINE_DIR}/state_save.cpp
@@ -153,6 +155,7 @@ target_include_directories(yabasanshiro_libretro PRIVATE
    ${CMAKE_CURRENT_SOURCE_DIR}
    ${ENGINE_DIR}
    ${ENGINE_DIR}/stv
+   ${ENGINE_DIR}/adsp2100
    ${ENGINE_DIR}/nanovg
    ${ENGINE_DIR}/musashi
    ${MUSASHI_GEN}

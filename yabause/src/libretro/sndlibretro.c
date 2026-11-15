@@ -50,6 +50,7 @@
 #include "scsp.h"
 #include "yabause.h"
 #include "log.h"
+#include "rax.h"
 #include "sndlibretro.h"
 
 /* sndsdl.c:368: (44100/50) * 8 frames = 160 ms. */
@@ -665,6 +666,13 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
    const s32 *srcl = (const s32 *)leftchanbuffer;
    const s32 *srcr = (const s32 *)rightchanbuffer;
    u32 i, space;
+   /* Batman Forever's RAX board: a second sound source on the same 44.1 kHz
+      timeline.  It is pulled in chunks (the engine calls this with up to a
+      whole SCSP ring segment) and resampled inside RaxMix, so it shares this
+      ring's clock, volume and mute.  Zero cost when the board is absent. */
+   static s32 rax_l[1024], rax_r[1024];
+   u32 rax_chunk = 0, rax_pos = 0;
+   const int rax_on = RaxIsPresent();
 
    pthread_mutex_lock(&ring_lock);
 
@@ -703,6 +711,22 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
             alone: it is the SCSP's own output ring, which other readers use. */
          l = (s32)(((s64)srcl[i] * volume) / SND_MAXVOLUME);
          r = (s32)(((s64)srcr[i] * volume) / SND_MAXVOLUME);
+         if (rax_on)
+         {
+            if (rax_pos >= rax_chunk)
+            {
+               u32 m = num_samples - i;
+               if (m > 1024) m = 1024;
+               memset(rax_l, 0, sizeof(s32) * m);
+               memset(rax_r, 0, sizeof(s32) * m);
+               RaxMix(rax_l, rax_r, m);
+               rax_chunk = m;
+               rax_pos = 0;
+            }
+            l += rax_l[rax_pos];
+            r += rax_r[rax_pos];
+            rax_pos++;
+         }
          if (l > 0x7FFF) l = 0x7FFF;
          else if (l < -0x8000) l = -0x8000;
          if (r > 0x7FFF) r = 0x7FFF;

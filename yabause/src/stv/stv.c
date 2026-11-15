@@ -12,6 +12,7 @@
 #endif
 
 #include "stv.h"
+#include "rax.h"
 #include "stvcomp.h"
 #include "cs0.h"
 #include "junzip.h"
@@ -210,6 +211,13 @@ Game GameList[NB_STV_GAMES]={
         GAME_WORD_BLOB, "gfx4.u12",     0x1400000, 0x0400000, 0x52d95242,
         GAME_WORD_BLOB, "gfx5.u15",     0x1800000, 0x0400000, 0xe201f830,
         GAME_WORD_BLOB, "gfx6.u18",     0x1c00000, 0x0400000, 0xc6b381a3,
+        /* Acclaim RAX sound board: 512 KiB program ROM + four 2 MiB sample
+           banks, offsets as MAME's romset region "rax". */
+        GAME_RAX_BLOB,  "350snda1.u52", 0x0000000, 0x0080000, 0x9027e7a0,
+        GAME_RAX_BLOB,  "snd0.u48",     0x0400000, 0x0200000, 0x02b1927c,
+        GAME_RAX_BLOB,  "snd1.u49",     0x0600000, 0x0200000, 0x58b18eda,
+        GAME_RAX_BLOB,  "snd2.u50",     0x0800000, 0x0200000, 0x51d626d6,
+        GAME_RAX_BLOB,  "snd3.u51",     0x0a00000, 0x0200000, 0x31af26ae,
         GAME_END, "", 0, 0, 0
     },
     BATMANFR,
@@ -2680,6 +2688,11 @@ int copyFile(JZFile *zip, void* id) {
               eeprom_start(data);
               hasEeprom = 1;
               break;
+            case GAME_RAX_BLOB:
+              /* Acclaim RAX board ROM (batmanfr): 16 MiB image of its own. */
+              RaxLoadRom(availableGames[gameId].entry->blobs[i].offset, data,
+                         availableGames[gameId].entry->blobs[i].length);
+              break;
           }
         } else LOGSTV("Error : No data read from %s\n", filename);
       }
@@ -2804,7 +2817,8 @@ char * updateGameList(const char* file, int *nbGames){
       if (GameList[i].blobs[j].type == BIOS_BLOB) {
         isBiosFound |= fileFound[i][j];
       } else {
-        if (GameList[i].blobs[j].type != EEPROM_BLOB)
+        if (GameList[i].blobs[j].type != EEPROM_BLOB &&
+            GameList[i].blobs[j].type != GAME_RAX_BLOB)
           isBlobFound &= fileFound[i][j];
       }
       j++;
@@ -2942,7 +2956,8 @@ int loadGame(const char *romset){
     if (availableGames[gameId].entry->blobs[i].type == BIOS_BLOB) {
       isBiosFound |= fileFound[gameId][i];
     } else {
-      if (availableGames[gameId].entry->blobs[i].type != EEPROM_BLOB)
+      if (availableGames[gameId].entry->blobs[i].type != EEPROM_BLOB &&
+          availableGames[gameId].entry->blobs[i].type != GAME_RAX_BLOB)
         isBlobFound &= fileFound[gameId][i];
     }
     i++;
@@ -3166,6 +3181,10 @@ int STVSingleInit(const char *gamepath, const char *biospath, const char *eeprom
     else
       STVCompDisable();
     yabsys.isSTV = 1;
+    /* Batman Forever's Acclaim RAX board: its blobs were copied by copyFile()
+       above, so the DSP can be built and reset now. */
+    if (yabsys.stvInputType == BATMANFR)
+      RaxInit();
     return 0;
   }
   return -1;
@@ -3204,6 +3223,8 @@ int STVInit(const char* romset, const char *path, const char *eepromdir, int fav
     else
       STVCompDisable();
     yabsys.isSTV = 1;
+    if (yabsys.stvInputType == BATMANFR)
+      RaxInit();
     LOGSTV("Load is ok\n");
     return 0;
   }
@@ -3212,6 +3233,7 @@ int STVInit(const char* romset, const char *path, const char *eepromdir, int fav
 }
 
 int STVDeInit(){
+  RaxShutdown();
   if (CartridgeArea == NULL || CartridgeArea->carttype != CART_ROMSTV) return 0;
   if (stv_eeprom_persist) eeprom_deinit();
   yabsys.isSTV = 0;
