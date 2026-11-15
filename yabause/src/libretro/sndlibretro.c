@@ -53,10 +53,11 @@
 #include "rax.h"
 #include "sndlibretro.h"
 
-/* The RAX board's DAC comes out ~6 dB below an SCSP title (measured -30..-34
-   dBFS RMS, -12.6 dBFS peaks on this game); see the mix point for why this is
-   a front-end gain and not a MAME-accurate one. */
-#define RAX_MIX_GAIN 2.0
+/* The RAX board's DAC comes out ~8 dB below an SCSP title (measured -30..-34
+   dBFS RMS, -12.6 dBFS peaks with unity gain on this game); see the mix point
+   for why this is a front-end gain and not a MAME-accurate one.  2.51 = +8 dB;
+   the clamp counter in the split line says if that ever runs out of headroom. */
+#define RAX_MIX_GAIN 2.51
 
 /* sndsdl.c:368: (44100/50) * 8 frames = 160 ms. */
 #define SND_RING_FRAMES   ((44100 / 50) * 8)
@@ -684,6 +685,7 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
    static int split_on = -1;
    static double split_spsc_sq, split_rax_sq;
    static unsigned split_n;
+   static unsigned split_clip;
    if (split_on < 0) {
       const char *e = getenv("AUDIO_SPLIT");
       split_on = (e && *e && *e == '0') ? 0 : 1;
@@ -760,6 +762,8 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
             }
             rax_pos++;
          }
+         if (split_on && (l > 0x7FFF || l < -0x8000 || r > 0x7FFF || r < -0x8000))
+            split_clip++;
          if (l > 0x7FFF) l = 0x7FFF;
          else if (l < -0x8000) l = -0x8000;
          if (r > 0x7FFF) r = 0x7FFF;
@@ -781,10 +785,11 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
       double b = sqrt(split_rax_sq / (double)split_n);
       /* rax_dbfs is an absolute level; the ratio only means something when
          both paths carry audio. */
-      LOG_INFO("audio split: scsp_rms=%.0f (%.1f dBFS) rax_rms=%.0f (%.1f dBFS)%s",
+      LOG_INFO("audio split: scsp_rms=%.0f (%.1f dBFS) rax_rms=%.0f (%.1f dBFS) clip=%u",
                a, a > 0.5 ? 20.0 * log10(a / 32768.0) : -99.0,
                b, b > 0.5 ? 20.0 * log10(b / 32768.0) : -99.0,
-               (a > 50.0 && b > 50.0) ? "" : "");
+               split_clip);
+      split_clip = 0;
       split_spsc_sq = split_rax_sq = 0.0;
       split_n = 0;
    }
