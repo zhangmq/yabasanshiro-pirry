@@ -376,6 +376,33 @@ static void rax_dac_irq(void)
       reg = st.cpu.dag_i((int)idx);
       st.dac_ireg = idx;
    }
+   {
+      static FILE *dumpf = NULL;
+      static long dumped;
+      static int dump_state = -1;
+      if (dump_state < 0) {
+         const char *e = getenv("RAX_DAC_DUMP");
+         dump_state = (e && *e) ? 1 : 0;
+         if (dump_state)
+            dumpf = fopen(e, "wb");
+      }
+      if (dumpf != NULL && dumped < 31572L * 40) {   /* first 40 s only */
+         static int16_t buf[512 * 2];
+         unsigned n = 0;
+         for (i = 0; i + 1 < count && n < 512; i += 2) {
+            uint32_t a = (reg + (uint32_t)incs * (uint32_t)i) & 0x3FFF;
+            uint32_t b = (a + (uint32_t)incs) & 0x3FFF;
+            buf[n * 2 + 0] = (int16_t)data_rd(NULL, a);
+            buf[n * 2 + 1] = (int16_t)data_rd(NULL, b);
+            n++;
+         }
+         if (n) {
+            fwrite(buf, sizeof(int16_t) * 2, n, dumpf);
+            fflush(dumpf);
+            dumped += (long)n;
+         }
+      }
+   }
    for (i = 0; i + 1 < count; i += 2) {
       int16_t l = (int16_t)data_rd(NULL, reg);
       int16_t r;
@@ -1617,16 +1644,30 @@ static void rax_calibrate_step(void)
 {
    uint64_t df, dout;
 
-   if (rax_out_total < rax_cal_out || rax_out_total - rax_cal_out < 44100u)
-      return;
+   if (rax_out_total < rax_cal_out || rax_out_total - rax_cal_out < 88200u)
+      return;                       /* 2 s window: long enough to be burst-free */
    df = (uint64_t)st.dac_frames - rax_cal_frames;
    dout = rax_out_total - rax_cal_out;
    rax_cal_frames = st.dac_frames;
    rax_cal_out = rax_out_total;
    if (df > 0 && dout > 0) {
       double v = (double)df / (double)dout;
-      if (v > 0.3 && v < 1.5)
-         rax_step_cal = v;
+      if (v > 0.3 && v < 1.5) {
+         if (rax_step_cal <= 0.0) {
+            /* First value: must be near the nominal ratio, otherwise the
+               window covered the start-up (DAC not producing yet) and would
+               set the step to nonsense (measured 0.50 for a second). */
+            if (rax_step > 0.0 && v > rax_step * 0.9 && v < rax_step * 1.1)
+               rax_step_cal = v;
+         } else {
+            /* Slew-limit: one misaligned window pulled the step by 8% and was
+               an audible pitch drop, so never move it more than 0.5%/window. */
+            double d = v - rax_step_cal;
+            if (d > 0.005) d = 0.005;
+            if (d < -0.005) d = -0.005;
+            rax_step_cal += d;
+         }
+      }
    }
 }
 
@@ -1638,6 +1679,48 @@ static double rax_read_step(void)
    if (trim > 1.005) trim = 1.005;
    if (base <= 0.0) return 1.0;
    return base * trim;
+}
+
+/* Resampling kernel for the 31.57 kHz DAC -> 44.1 kHz output (stereo, reads
+   the FIFO the caller already holds the lock for).
+
+   Catmull-Rom (4 taps) instead of linear interpolation.  Linear's response on
+   a 31.57 kHz source is -2.9 dB at 10 kHz and -6 dB at 14 kHz -- that is the
+   "the music has no detail" the device listener reported -- while cubic stays
+   within ~0.5 dB up to 12 kHz.  Four taps per channel per output frame is
+   still nothing next to the DSP. */
+static inline double rax_hermite(double y0, double y1, double y2, double y3, double t)
+{
+   double a = -0.5 * y0 + 1.5 * y1 - 1.5 * y2 + 0.5 * y3;
+   double b = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3;
+   double c = 0.5 * (y2 - y0);
+
+   return ((a * t + b) * t + c) * t + y1;
+}
+
+static inline void rax_fifo_get(int k, int32_t *l, int32_t *r)
+{
+   int n = (int)rax_fifo_fill;
+   unsigned idx;
+
+   if (n <= 0) { *l = 0; *r = 0; return; }
+   if (k < 0) k = 0;
+   else if (k >= n) k = n - 1;
+   idx = (rax_fifo_head + (unsigned)k) % RAX_FIFO_FRAMES;
+   *l = rax_fifo[idx * 2 + 0];
+   *r = rax_fifo[idx * 2 + 1];
+}
+
+static void rax_interp_frame(uint32_t idx, double frac, int32_t *out_l, int32_t *out_r)
+{
+   int32_t m1l, m1r, y0l, y0r, y1l, y1r, y2l, y2r;
+
+   rax_fifo_get((int)idx - 1, &m1l, &m1r);
+   rax_fifo_get((int)idx,     &y0l, &y0r);
+   rax_fifo_get((int)idx + 1, &y1l, &y1r);
+   rax_fifo_get((int)idx + 2, &y2l, &y2r);
+   *out_l = (int32_t)rax_hermite((double)m1l, (double)y0l, (double)y1l, (double)y2l, frac);
+   *out_r = (int32_t)rax_hermite((double)m1r, (double)y0r, (double)y1r, (double)y2r, frac);
 }
 
 extern "C" void RaxMix(int *left, int *right, unsigned int frames)
@@ -1679,26 +1762,17 @@ extern "C" void RaxMix(int *left, int *right, unsigned int frames)
    for (i = 0; i < frames; i++) {
       uint32_t idx = (uint32_t)rax_fifo_pos;
       double frac = rax_fifo_pos - (double)idx;
-      int32_t l0, r0, l1, r1;
+      int32_t ol, or_;
 
       if (idx >= rax_fifo_fill)
          break;                 /* short ring: the rest of this chunk is silence */
 
-      l0 = rax_fifo[((rax_fifo_head + idx) % RAX_FIFO_FRAMES) * 2 + 0];
-      r0 = rax_fifo[((rax_fifo_head + idx) % RAX_FIFO_FRAMES) * 2 + 1];
-      if (idx + 1 < rax_fifo_fill) {
-         l1 = rax_fifo[((rax_fifo_head + idx + 1) % RAX_FIFO_FRAMES) * 2 + 0];
-         r1 = rax_fifo[((rax_fifo_head + idx + 1) % RAX_FIFO_FRAMES) * 2 + 1];
-      } else {
-         l1 = l0;
-         r1 = r0;
-      }
-
-      left[i]  += (int32_t)((double)l0 + ((double)l1 - (double)l0) * frac);
-      right[i] += (int32_t)((double)r0 + ((double)r1 - (double)r0) * frac);
+      rax_interp_frame(idx, frac, &ol, &or_);
+      left[i]  += ol;
+      right[i] += or_;
 #ifdef RAX_DUMP
-      rax_dump_out[rax_dump_out_pos * 2 + 0] = (int16_t)(int32_t)((double)l0 + ((double)l1 - (double)l0) * frac);
-      rax_dump_out[rax_dump_out_pos * 2 + 1] = (int16_t)(int32_t)((double)r0 + ((double)r1 - (double)r0) * frac);
+      rax_dump_out[rax_dump_out_pos * 2 + 0] = (int16_t)ol;
+      rax_dump_out[rax_dump_out_pos * 2 + 1] = (int16_t)or_;
       rax_dump_out_pos = (rax_dump_out_pos + 1u) % RAX_DUMP_OUT_FRAMES;
 #endif
 
@@ -1796,17 +1870,11 @@ extern "C" void RaxTestRender(short *dst, unsigned frames)
    for (i = 0; i < frames; i++) {
       uint32_t idx = (uint32_t)rax_fifo_pos;
       double frac = rax_fifo_pos - (double)idx;
-      int32_t l0 = 0, r0 = 0, l1 = 0, r1 = 0;
-      if (rax_fifo_fill > 0 && idx < rax_fifo_fill) {
-         l0 = rax_fifo[((rax_fifo_head + idx) % RAX_FIFO_FRAMES) * 2 + 0];
-         r0 = rax_fifo[((rax_fifo_head + idx) % RAX_FIFO_FRAMES) * 2 + 1];
-         if (idx + 1 < rax_fifo_fill) {
-            l1 = rax_fifo[((rax_fifo_head + idx + 1) % RAX_FIFO_FRAMES) * 2 + 0];
-            r1 = rax_fifo[((rax_fifo_head + idx + 1) % RAX_FIFO_FRAMES) * 2 + 1];
-         } else { l1 = l0; r1 = r0; }
-      }
-      dst[2 * i]     = (short)((double)l0 + ((double)l1 - (double)l0) * frac);
-      dst[2 * i + 1] = (short)((double)r0 + ((double)r1 - (double)r0) * frac);
+      int32_t ol = 0, or_ = 0;
+      if (rax_fifo_fill > 0 && idx < rax_fifo_fill)
+         rax_interp_frame(idx, frac, &ol, &or_);
+      dst[2 * i]     = (short)ol;
+      dst[2 * i + 1] = (short)or_;
       rax_fifo_pos += step;
       while (rax_fifo_pos >= 1.0 && rax_fifo_fill > 0) {
          rax_fifo_head = (rax_fifo_head + 1u) % RAX_FIFO_FRAMES;

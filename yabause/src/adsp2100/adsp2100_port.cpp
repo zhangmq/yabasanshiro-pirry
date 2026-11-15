@@ -464,14 +464,70 @@ void adsp21xx_device::check_irqs()
 ***************************************************************************/
 
 
+#ifdef RAX_PROF
+/* Poor man's profiler for the interpreter.  The AArch64 generic timer read
+   costs ~1-2 cycles and ticks at 24 MHz, which is coarse (an instruction is
+   ~1 us) but fine for relative attribution over millions of instructions.
+   RAX_PROF=1 enables it; a window summary goes to stderr every 8M
+   instructions.  Buckets are the switch's top byte, i.e. the instruction
+   family. */
+static int rax_prof_on = -1;
+static uint64_t rax_prof_tab[256];
+static uint64_t rax_prof_n;
+
+static inline uint64_t rax_prof_clock(void)
+{
+#if defined(__aarch64__)
+   uint64_t v;
+   __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+   return v;
+#elif defined(__x86_64__)
+   return __builtin_ia32_rdtsc();
+#else
+   return 0;
+#endif
+}
+
+static void rax_prof_report(void)
+{
+   unsigned i, k;
+   uint64_t total = 0;
+
+   for (i = 0; i < 256; i++)
+      total += rax_prof_tab[i];
+   if (total != 0)
+      fprintf(stderr, "PROF n=%llu ticks=%llu\n",
+              (unsigned long long)rax_prof_n, (unsigned long long)total);
+   for (k = 0; k < 10 && total != 0; k++) {
+      unsigned best = 0;
+      uint64_t bv = 0;
+      for (i = 0; i < 256; i++)
+         if (rax_prof_tab[i] > bv) { bv = rax_prof_tab[i]; best = i; }
+      if (bv == 0)
+         break;
+      fprintf(stderr, "PROF %02X %5.1f%%\n", best, 100.0 * (double)bv / (double)total);
+      rax_prof_tab[best] = 0;
+   }
+}
+#endif
+
 void adsp21xx_device::execute_run()
 {
-	check_irqs();
+#ifdef RAX_PROF
+   if (rax_prof_on < 0) {
+      const char *e = getenv("RAX_PROF");
+      rax_prof_on = (e && *e && *e != '0') ? 1 : 0;
+   }
+#endif
+   check_irqs();
 
 	do
 	{
 		// debugging
 		m_ppc = m_pc;   // copy PC to previous PC
+#ifdef RAX_PROF
+		uint64_t prof_t0 = rax_prof_on ? rax_prof_clock() : 0;
+#endif
 #ifdef RAX_TRACE_MIX
 		{
 			static int pt = -1;
@@ -1304,6 +1360,13 @@ void adsp21xx_device::execute_run()
 				break;
 		}
 
+#ifdef RAX_PROF
+		if (rax_prof_on) {
+			rax_prof_tab[BIT(op, 16, 8)] += rax_prof_clock() - prof_t0;
+			if (++rax_prof_n % 8000000u == 0)
+				rax_prof_report();
+		}
+#endif
 		m_icount--;
 		if (m_board_stop >= 0 && m_icount <= m_board_stop)
 			m_icount = 0;

@@ -175,6 +175,9 @@ target_compile_definitions(yabasanshiro_libretro PRIVATE
    __LIBRETRO__ LOG_ENABLED
 )
 
+if(RAX_PROF_DIAG)
+   target_compile_definitions(yabasanshiro_libretro PRIVATE RAX_PROF)
+endif()
 target_compile_options(yabasanshiro_libretro PRIVATE -O3 -fomit-frame-pointer -fno-strict-aliasing -Wno-format-truncation -Wno-format-overflow -Wno-stringop-overflow)
 set_target_properties(yabasanshiro_libretro PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(yabasanshiro_libretro zlib_ep)
