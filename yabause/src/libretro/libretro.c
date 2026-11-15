@@ -740,7 +740,7 @@ static int  opt_videoformat_latched = VIDEOFORMATTYPE_NTSC;  /* for av_info/regi
 static int  opt_resolution_mode = 3;            /* RES_ORIGINAL */
 static int  opt_rbg_resolution_mode = 0;        /* RBG_RES_ORIGINAL */
 static int  opt_rbg_use_compute_shader = 1;
-static int  opt_texcache_persist = 0;   /* off by default: helps few games, hurts some */
+static int  opt_texcache_persist = 1;   /* on by default: the fence removed the old cost */
 static int  opt_interlace_half = 0;
 static int  opt_frameskip = 0;
 static int  opt_scsp_realtime;                  /* SCSP Timing: wall clock 68k? */
@@ -809,7 +809,7 @@ static void yab_options_read(void)
    else                                                          opt_rbg_resolution_mode = 0;
 
    opt_rbg_use_compute_shader = !opt_is("yabasanshiro_rbg_use_compute_shader", "disabled");
-   opt_texcache_persist       =  opt_is("yabasanshiro_texcache_persist", "enabled");
+   opt_texcache_persist       = !opt_is("yabasanshiro_texcache_persist", "disabled");   /* default on */
    opt_interlace_half         =  opt_is("yabasanshiro_interlace_half", "enabled");
    opt_frameskip              =  opt_is("yabasanshiro_frameskip", "auto");
    opt_scsp_realtime          =  opt_is("yabasanshiro_scsp_timing", "realtime");
@@ -1068,11 +1068,13 @@ void LibretroEngineContextReset(void)
          g_emulated_bios = 0;   /* the ST-V BIOS is real, installed by stv.c */
       /* Standalone config defaults (main.cpp): "sound dsp" = 1 -> DSP on.  The
          DSP is emulated hardware state, so it stays on.
-         Texture-cache persistence is a core option and defaults OFF: the fixed
-         savestate measurement that once made it the default (DoA in-game, 39 ->
-         55 fps) is the exception - most titles gain little, and some regress
-         because the atlas grows and the dirty-band uploads get bigger.  The
-         option ("Texture Cache Persist", enabled) turns it back on,
+         Texture-cache persistence is a core option and now defaults ON.  The
+         1.6.2-era measurement that argued for OFF (DoA attract 59.5 -> 51.2 fps)
+         was the implicit PBO map wait before every upload; 1.6.3 replaces that
+         with a fence, and the per-line raster skip only runs with the atlas
+         persistent, so on 1.6.3 every tested title is equal or faster with it on
+         (2026-11-16: DoA heavy 36.4 -> 55.4 fps, VF2 heavyB 40.1 -> 56.2,
+         Sega Rally 56.1 -> 58.9, GA/Daytona equal with ~3 ms less draw).
          YAB_TEXCACHE_PERSIST=0/1 still overrides it for A/B runs. */
       g_scsp_dsp_off = opt_scsp_dsp ? 0 : 1;   /* core option "SCSP DSP" */
       {
