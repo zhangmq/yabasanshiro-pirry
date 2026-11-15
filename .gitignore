@@ -23,3 +23,7 @@ deps/
 # Not tracked in this project (agent notes and the operator guide)
 .note*/
 AGENTS.md
+
+# Runtime output of local (standalone) runs: written to the CWD
+/cfg/
+/nvram/

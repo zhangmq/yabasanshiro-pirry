@@ -50,7 +50,14 @@
 #include "scsp.h"
 #include "yabause.h"
 #include "log.h"
+#include "rax.h"
 #include "sndlibretro.h"
+
+/* The RAX board's DAC comes out ~8 dB below an SCSP title (measured -30..-34
+   dBFS RMS, -12.6 dBFS peaks with unity gain on this game); see the mix point
+   for why this is a front-end gain and not a MAME-accurate one.  2.51 = +8 dB;
+   the clamp counter in the split line says if that ever runs out of headroom. */
+#define RAX_MIX_GAIN 2.51
 
 /* sndsdl.c:368: (44100/50) * 8 frames = 160 ms. */
 #define SND_RING_FRAMES   ((44100 / 50) * 8)
@@ -665,6 +672,24 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
    const s32 *srcl = (const s32 *)leftchanbuffer;
    const s32 *srcr = (const s32 *)rightchanbuffer;
    u32 i, space;
+   /* Batman Forever's RAX board: a second sound source on the same 44.1 kHz
+      timeline.  It is pulled in chunks (the engine calls this with up to a
+      whole SCSP ring segment) and resampled inside RaxMix, so it shares this
+      ring's clock, volume and mute.  Zero cost when the board is absent. */
+   static s32 rax_l[1024], rax_r[1024];
+   u32 rax_chunk = 0, rax_pos = 0;
+   const int rax_on = RaxIsPresent();
+   /* Split level meter: how much of what leaves this mixer is the SCSP and how
+      much is the RAX board.  "The music is quieter than the effects" is only
+      answerable with the two numbers apart.  AUDIO_SPLIT=1, once per second. */
+   static int split_on = -1;
+   static double split_spsc_sq, split_rax_sq;
+   static unsigned split_n;
+   static unsigned split_clip;
+   if (split_on < 0) {
+      const char *e = getenv("AUDIO_SPLIT");
+      split_on = (e && *e && *e == '0') ? 0 : 1;
+   }
 
    pthread_mutex_lock(&ring_lock);
 
@@ -703,6 +728,42 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
             alone: it is the SCSP's own output ring, which other readers use. */
          l = (s32)(((s64)srcl[i] * volume) / SND_MAXVOLUME);
          r = (s32)(((s64)srcr[i] * volume) / SND_MAXVOLUME);
+         if (split_on) {
+            split_spsc_sq += (double)l * (double)l + (double)r * (double)r;
+            split_n += 2;
+         }
+         if (rax_on)
+         {
+            if (rax_pos >= rax_chunk)
+            {
+               u32 m = num_samples - i;
+               if (m > 1024) m = 1024;
+               memset(rax_l, 0, sizeof(s32) * m);
+               memset(rax_r, 0, sizeof(s32) * m);
+               RaxMix(rax_l, rax_r, m);
+               rax_chunk = m;
+               rax_pos = 0;
+            }
+            /* +6 dB on the board's output.  MAME routes both the RAX and the
+               SCSP to the speaker at 1.0 (acclaim_rax_device::add_route(0,
+               "speaker", 1.0, 0) and stv.cpp m_scsp->add_route(...1.0...)), so
+               the board is simply quieter than the SCSP titles; measured here
+               at -30..-34 dBFS RMS with -12.6 dBFS peaks, i.e. 6 dB of headroom
+               before the 16-bit clamp.  Applied at the mix point (not inside
+               RaxMix) so the board's own output still compares sample for
+               sample with MAME's DAC. */
+            {
+               const double g = RAX_MIX_GAIN;
+               if (split_on)
+                  split_rax_sq += (double)rax_l[rax_pos] * g * rax_l[rax_pos] * g +
+                                  (double)rax_r[rax_pos] * g * rax_r[rax_pos] * g;
+               l += (s32)((double)rax_l[rax_pos] * g);
+               r += (s32)((double)rax_r[rax_pos] * g);
+            }
+            rax_pos++;
+         }
+         if (split_on && (l > 0x7FFF || l < -0x8000 || r > 0x7FFF || r < -0x8000))
+            split_clip++;
          if (l > 0x7FFF) l = 0x7FFF;
          else if (l < -0x8000) l = -0x8000;
          if (r > 0x7FFF) r = 0x7FFF;
@@ -718,6 +779,20 @@ static void SNDLibretroUpdateAudio(u32 *leftchanbuffer, u32 *rightchanbuffer,
    }
 
    stat_produced += num_samples;
+
+   if (split_on && split_n >= 88200u) {   /* one second of stereo samples */
+      double a = sqrt(split_spsc_sq / (double)split_n);
+      double b = sqrt(split_rax_sq / (double)split_n);
+      /* rax_dbfs is an absolute level; the ratio only means something when
+         both paths carry audio. */
+      LOG_INFO("audio split: scsp_rms=%.0f (%.1f dBFS) rax_rms=%.0f (%.1f dBFS) clip=%u",
+               a, a > 0.5 ? 20.0 * log10(a / 32768.0) : -99.0,
+               b, b > 0.5 ? 20.0 * log10(b / 32768.0) : -99.0,
+               split_clip);
+      split_clip = 0;
+      split_spsc_sq = split_rax_sq = 0.0;
+      split_n = 0;
+   }
 
    pthread_mutex_unlock(&ring_lock);
 }

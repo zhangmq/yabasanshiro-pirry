@@ -52,6 +52,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "yabause.h"
 #ifdef __LIBRETRO__
 #include "stv.h"
+#include "rax.h"
 #endif
 #include "cheat.h"
 #include "cs0.h"
@@ -560,6 +561,10 @@ void YabauseSetDecilineMode(int on) {
 //////////////////////////////////////////////////////////////////////////////
 
 void YabauseResetNoLoad(void) {
+#ifdef __LIBRETRO__
+   /* Batman Forever's RAX board resets with the machine (MAME device_reset). */
+   RaxReset();
+#endif
    SH2Reset(MSH2);
    YabauseStopSlave();
    memset(HighWram, 0, 0x100000);
@@ -1020,6 +1025,12 @@ int YabauseEmulate(void) {
            to this thread. */
         saved_m68k_cycles  += (u64)m68k_cycles_per_deciline * decilines_per_pass;
         setM68kCounter(saved_m68k_cycles);
+#endif
+#ifdef __LIBRETRO__
+        /* Batman Forever's RAX board runs on the same emulated time as the
+           SH-2: sh2cycles is what this pass actually executed, and the board
+           converts it to its own 16.67 MHz clock.  Never ahead of the host. */
+        RaxAdvance(sh2cycles);
 #endif
       }
       PROFILE_STOP("Total Emulation");

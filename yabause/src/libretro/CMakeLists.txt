@@ -117,6 +117,8 @@ set(ENGINE_SOURCES
    ${ENGINE_DIR}/stv/eeprom.c
    ${ENGINE_DIR}/stv/decrypt.c
    ${ENGINE_DIR}/stv/stvcomp.c
+   ${ENGINE_DIR}/stv/rax.cpp
+   ${ENGINE_DIR}/adsp2100/adsp2100_port.cpp
    ${ENGINE_DIR}/snddummy.c
    ${ENGINE_DIR}/sock-linux.c
    ${ENGINE_DIR}/state_save.cpp
@@ -153,6 +155,7 @@ target_include_directories(yabasanshiro_libretro PRIVATE
    ${CMAKE_CURRENT_SOURCE_DIR}
    ${ENGINE_DIR}
    ${ENGINE_DIR}/stv
+   ${ENGINE_DIR}/adsp2100
    ${ENGINE_DIR}/nanovg
    ${ENGINE_DIR}/musashi
    ${MUSASHI_GEN}
@@ -172,6 +175,9 @@ target_compile_definitions(yabasanshiro_libretro PRIVATE
    __LIBRETRO__ LOG_ENABLED
 )
 
+if(RAX_PROF_DIAG)
+   target_compile_definitions(yabasanshiro_libretro PRIVATE RAX_PROF)
+endif()
 target_compile_options(yabasanshiro_libretro PRIVATE -O3 -fomit-frame-pointer -fno-strict-aliasing -Wno-format-truncation -Wno-format-overflow -Wno-stringop-overflow)
 set_target_properties(yabasanshiro_libretro PROPERTIES POSITION_INDEPENDENT_CODE ON)
 add_dependencies(yabasanshiro_libretro zlib_ep)

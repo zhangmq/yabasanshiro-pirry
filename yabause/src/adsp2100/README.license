@@ -1,0 +1,25 @@
+The files in this directory are a port of MAME's ADSP-21xx emulation:
+
+  2100ops.hxx        copied verbatim from mame/src/devices/cpu/adsp2100/2100ops.hxx
+                     (BSD-3-Clause, copyright-holders: Aaron Giles), except that
+                     the six C++20 `std::countl_zero/one(...)` calls were renamed
+                     to `adsp_countl_zero/one(...)` so the file builds as C++17
+                     with the H700 toolchain (gcc 12, glibc 2.35).
+  adsp2100_port.cpp  port of mame/src/devices/cpu/adsp2100/adsp2100.cpp with the
+                     device framework removed (see the file header).
+  adsp2100_port.h    the class from mame/src/devices/cpu/adsp2100/adsp2100.h with
+                     MAME's device/address-space plumbing replaced.
+  mame_compat.h      the handful of MAME services those files need.
+  adsp2100_ref.h     MAME's original header, kept for reference/diffing; not compiled.
+
+License: MAME's ADSP-21xx code is BSD-3-Clause, which is compatible with this
+project's GPL-2.0 license.  The copyright notice and license text of the
+original files are kept in their headers.
+
+Verify the vendored opcode file against MAME with:
+
+  diff <(sed 's/adsp_countl_zero/std::countl_zero/g; s/adsp_countl_one/std::countl_one/g' \
+         yabause/src/adsp2100/2100ops.hxx) \
+       .notes/mame/mame-full/src/devices/cpu/adsp2100/2100ops.hxx
+
+(it must print nothing)

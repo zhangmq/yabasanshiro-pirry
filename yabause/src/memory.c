@@ -52,6 +52,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "memory.h"
 #ifdef __LIBRETRO__
 #include "peripheral.h"   /* ST-V IOGA (JAMMA) port hooks */
+#include "rax.h"          /* Batman Forever's RAX sound board (ST-V only) */
 #endif
 #include "coffelf.h"
 #include "cs0.h"
@@ -1591,6 +1592,17 @@ int YabSaveStateStream(FILE *fp)
    i += Vdp1SaveState(fp);
    i += Vdp2SaveState(fp);
 
+#ifdef __LIBRETRO__
+   /* Batman Forever's RAX sound board.  Nothing else in the state models it:
+      without this chunk a resume rolls the SH-2 back (the game's sound driver
+      believes it already started the track and never sends the command again)
+      while the DSP keeps running its own timeline, which is the "no background
+      music after resume, effects still fine" report. */
+   offset = StateWriteHeader(fp, "RAX ", 1);
+   RaxSaveState(fp);
+   i += StateFinishHeader(fp, offset);
+#endif
+
    offset = StateWriteHeader(fp, "OTHR", 1);
 
    // Other data
@@ -1843,6 +1855,27 @@ int YabLoadStateStream(FILE *fp)
       return -3;
    }
    Vdp2LoadState(fp, version, chunksize);
+
+#ifdef __LIBRETRO__
+   /* The RAX chunk only exists in states written by a core that saves the
+      board.  Older states go straight on to OTHR and stay loadable -- the board
+      then keeps whatever state it has, which is exactly the old behaviour. */
+   if (RaxStateChunkPresent(fp))
+   {
+      long rax_start;
+      if (StateCheckRetrieveHeader(fp, "RAX ", &version, &chunksize) != 0)
+      {
+         // Revert back to old state here
+         return -3;
+      }
+      rax_start = ftell(fp);
+      RaxLoadState(fp);
+      /* Honour the size the writer recorded, so a state from a build with more
+         fields cannot leave the read position inside this chunk. */
+      if (chunksize > 0)
+         fseek(fp, rax_start + chunksize, SEEK_SET);
+   }
+#endif
 
    if (StateCheckRetrieveHeader(fp, "OTHR", &version, &chunksize) != 0)
    {

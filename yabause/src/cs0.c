@@ -1049,6 +1049,8 @@ static void FASTCALL ROM16MBITCs0WriteLong(u32 addr, u32 val)
 
 
 #ifdef __LIBRETRO__
+#include "rax.h"
+#include "sh2core.h"
 /* ST-V ROM board mapped on A-bus CS0 (first 32 MiB) + CS1 (rest).
    Ported from libretro/yabause@kronos (yabause/src/sys/memory/src/cs0.c, case CART_ROMSTV). */
 /* ST-V ROM decryption: the cart drives decrypt.c through cs1; the command is
@@ -1217,6 +1219,22 @@ static void FASTCALL ROMSTVCs1WriteByte(u32 addr, u8 val)
 static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
 {
 #ifdef __LIBRETRO__
+   /* Batman Forever's RAX board answers on 0x04800000..3 (CS1 offset
+      0x800000..3).  MAME's handler is 32-bit only and takes the high half;
+      a 16-bit store at +0 lands in that high half, at +2 in the ignored low
+      half (MAME logs it). */
+   if ((addr & 0xFFFFFF) == 0x800000) {
+#ifdef RAX_DIAG_WRITEPC
+      /* Diagnostic: which SH-2 instruction talks to the sound board, and how
+         often.  Batman Forever's driver writes 15x more words here than the
+         same game in MAME does, so the PC identifies the caller. */
+      RaxTraceWritePC(0x800000u, val, SH2Core ? SH2Core->GetPC(CurrentSH2) : 0u);
+#endif
+      RaxDataWriteEx(val, 1);
+      return;
+   }
+   if ((addr & 0xFFFFFF) == 0x800002)
+      return;
    /* 315-5838 control register at 0x04200000 (bit 1 = decoder output). */
    if (STVCompIsEnabled() && (addr & 0xFFFFFF) == 0x200000) {
       STVCompSetControl(val);
@@ -1241,6 +1259,15 @@ static void FASTCALL ROMSTVCs1WriteWord(u32 addr, u16 val)
 
 static void FASTCALL ROMSTVCs1WriteLong(u32 addr, u32 val)
 {
+#ifdef __LIBRETRO__
+   /* Batman Forever's RAX sound board: one command word per 32-bit write, in
+      the high half (MAME stv.cpp batmanfr_sound_comms_w).  Without this hook
+      the store corrupts the cart image at 0x2800000. */
+   if (((addr & 0xFFFFFF) >= 0x800000) && ((addr & 0xFFFFFF) <= 0x800003)) {
+      RaxDataWrite((u16)(val >> 16));
+      return;
+   }
+#endif
    T1WriteLong(&((u8 *)CartridgeArea->rom)[0x2000000], addr & 0xFFFFFF, val);
 }
 

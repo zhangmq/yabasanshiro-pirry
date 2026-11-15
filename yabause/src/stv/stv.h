@@ -40,6 +40,7 @@ typedef enum{
   HEADER_BLOB,
   GAME_BYTE_BLOB,
   GAME_WORD_BLOB,
+  GAME_RAX_BLOB,   /* Acclaim RAX sound board ROM (batmanfr only) */
   EEPROM_BLOB,
   GAME_END
 } blobType;

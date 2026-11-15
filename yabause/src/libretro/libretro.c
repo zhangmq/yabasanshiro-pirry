@@ -1896,6 +1896,93 @@ RETRO_API void retro_reset(void)
       (void)yab_cmd_wait(YAB_CMD_RESET, NULL, 0);
 }
 
+/* ------------------------------------------------------------------------- */
+/* Savestate cycle probe (RAX_SAVETEST)                                      */
+/*                                                                          */
+/* "Resume from the menu loses the background music" has to be reproducible   */
+/* from a script, and the menu cannot be driven reliably.  This probe walks    */
+/* the exact path a menu resume takes -- retro_serialize() then, some seconds  */
+/* later, retro_unserialize() of that same buffer -- so the RAX board's       */
+/* save/load chunk is exercised end to end (command queue, machine-thread      */
+/* save, SCSP pause, board restore).                                          */
+/*                                                                          */
+/*   RAX_SAVETEST=<first-sec>,<hold-sec>,<cycles>   (default 15,8,3)          */
+/*                                                                          */
+/* Timeline: save at <first>, load <hold> seconds later, save again, ... so    */
+/* every load is a resume of a state taken <hold> seconds earlier.  Off by    */
+/* default; one allocation of the state buffer while it is on.                */
+static size_t rax_savetest_size(void);
+static int rax_savetest_save(void *data, size_t size);
+static int rax_savetest_load(const void *data, size_t size);
+
+static void rax_savetest_step(void)
+{
+   static int on = -1;
+   static double first = 15.0, hold = 8.0;
+   static int cycles = 3;
+   static struct timespec t0;
+   static void *buf;
+   static size_t buf_size;
+   static int actions;
+   double now;
+
+   if (on < 0) {
+      const char *e = getenv("RAX_SAVETEST");
+      on = 0;
+      if (e != NULL && *e != '\0' && *e != '0') {
+         if (sscanf(e, "%lf,%lf,%d", &first, &hold, &cycles) < 1 ||
+             first < 1.0 || hold < 1.0 || cycles < 1 || cycles > 20) {
+            LOG_WARN("rax: bad RAX_SAVETEST=%s, probe off", e);
+         } else {
+            on = 1;
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            LOG_INFO("rax: savetest on: save at %.0f s, then every %.0f s, %d cycles",
+                     first, hold, cycles);
+         }
+      }
+   }
+   if (!on || actions >= cycles * 2 || !engine_up)
+      return;
+
+   {
+      struct timespec t;
+      clock_gettime(CLOCK_MONOTONIC, &t);
+      now = (double)(t.tv_sec - t0.tv_sec) + (double)(t.tv_nsec - t0.tv_nsec) / 1e9;
+   }
+   if (now < first + (double)actions * hold)
+      return;
+
+   if ((actions & 1) == 0) {
+      size_t size = rax_savetest_size();
+      if (size == 0) {
+         LOG_WARN("rax: savetest: serialize size 0, probe off");
+         on = 0;
+         return;
+      }
+      if (buf == NULL) {
+         buf = malloc(size);
+         buf_size = size;
+         if (buf == NULL) {
+            LOG_WARN("rax: savetest: cannot allocate %u bytes, probe off", (unsigned)size);
+            on = 0;
+            return;
+         }
+      }
+      {
+         int ok = rax_savetest_save(buf, buf_size) ? 1 : 0;
+         LOG_INFO("rax: savetest save %d/%d ok=%d bytes=%u (%.0f s)",
+                  actions / 2 + 1, cycles, ok, (unsigned)buf_size, now);
+      }
+   } else {
+      int ok = rax_savetest_load(buf, buf_size) ? 1 : 0;
+      LOG_INFO("rax: savetest load %d/%d ok=%d (%.0f s)",
+               actions / 2 + 1, cycles, ok, now);
+   }
+   actions++;
+   if (actions >= cycles * 2)
+      LOG_INFO("rax: savetest done (%d save/load pairs)", cycles);
+}
+
 RETRO_API void retro_run(void)
 {
    /* libretro contract: poll at least once per retro_run, on this thread
@@ -1906,6 +1993,10 @@ RETRO_API void retro_run(void)
       heartbeat: the SCSP runs on the machine's clock, so a front end that stops
       calling us stops production by itself (sndlibretro.c). */
    yab_in_run = 1;
+
+   /* Diagnostic only (RAX_SAVETEST): drive the savestate path a menu resume
+      would, at a frame boundary.  No-op unless the variable is set. */
+   rax_savetest_step();
 
    if (engine_up) {
       Vdp2SetRenderThreadHere();   /* this thread renders now, not VdpProc */
@@ -2167,6 +2258,24 @@ RETRO_API bool retro_unserialize(const void *data, size_t size)
    if (!engine_up || data == NULL || size == 0)
       return false;
    return yab_cmd_wait(YAB_CMD_LOAD, data, size) ? true : false;
+}
+
+/* RAX_SAVETEST probe shims (see rax_savetest_step above): the probe sits before
+   the protocol entry points, so this is its forward edge.  Same calls, no
+   front end involved. */
+static size_t rax_savetest_size(void)
+{
+   return retro_serialize_size();
+}
+
+static int rax_savetest_save(void *data, size_t size)
+{
+   return retro_serialize(data, size) ? 1 : 0;
+}
+
+static int rax_savetest_load(const void *data, size_t size)
+{
+   return retro_unserialize(data, size) ? 1 : 0;
 }
 
 RETRO_API void retro_cheat_reset(void)
