@@ -172,8 +172,29 @@ static uint8_t  rax_fifo_primed;
 static uint32_t rax_fifo_under;   /* output frames with an empty FIFO */
 static uint64_t rax_pop_total;    /* source frames the consumer popped */
 static uint64_t rax_out_total;    /* output frames the consumer asked for */
+/* Cushion.  The consumer pops up to 1024 frames in one call and the worker can
+   be up to ~18 ms behind (the front end's frame pacing), so the ring has to
+   hold both: measured on the device, target 3072 loses no frames, 2560 loses
+   ~43 output frames per second and 2048 ~110 (1-2.5 ms of silence per second,
+   which is a tick).  3072 = 97 ms is therefore the floor, not a preference. */
 #define RAX_FIFO_PREFILL 2048u     /* ~65 ms at 31.5 kHz: start playing at this */
 #define RAX_FIFO_TARGET  3072u     /* ~97 ms: what the rate trim steers to      */
+
+/* Interpolation kernel geometry (see rax_interp_frame).  RAX_FIR_LAG is how
+   many frames of *history* the ring keeps behind the read position: the kernel
+   is symmetric around the fractional read point, so its left half needs the
+   frames before it.  Without that (LAG 0) every tap left of the read point
+   clamped to the head frame, which turned the kernel one-sided and cost
+   -2.2 dB at 10 kHz / -3.2 dB at 12 kHz (measured, firresp.sh).  The harness
+   can rebuild that old behaviour with -DRAX_FIR_LAG=0 for comparison. */
+#ifndef RAX_FIR_TAPS
+#define RAX_FIR_TAPS   64
+#endif
+#define RAX_FIR_PHASES 256
+#define RAX_FIR_HALF   (RAX_FIR_TAPS / 2 - 1)
+#ifndef RAX_FIR_LAG
+#define RAX_FIR_LAG    (RAX_FIR_HALF + 1)
+#endif
 #ifdef RAX_DUMP
 /* Last 8 seconds of the DAC stream (31.5 kHz) and of what this core contributes
    at 44.1 kHz; written at shutdown for an offline spectrum/DC analysis. */
@@ -332,7 +353,7 @@ static void rax_audio_reset(void)
    pthread_mutex_lock(&rax_audio_mtx);
    rax_fifo_head = 0;
    rax_fifo_fill = 0;
-   rax_fifo_pos = 0.0;
+   rax_fifo_pos = (double)RAX_FIR_LAG;
    rax_dac_on = 0;
    rax_fifo_primed = 0;
    rax_step = 1.0;
@@ -483,7 +504,7 @@ static void rax_dac_stop(void)
    rax_fifo_primed = 0;
    rax_fifo_head = 0;
    rax_fifo_fill = 0;
-   rax_fifo_pos = 0.0;
+   rax_fifo_pos = (double)RAX_FIR_LAG;
    pthread_mutex_unlock(&rax_audio_mtx);
    st.reg_period_fp = 0;
    st.reg_left_fp = 0;
@@ -1811,16 +1832,23 @@ static double rax_read_step(void)
 /* Resampling kernel for the 31.57 kHz DAC -> 44.1 kHz output (stereo, reads
    the FIFO the caller already holds the lock for).
 
-   Windowed-sinc polyphase FIR, 32 taps x 256 phases, Q15 coefficients built
-   once at first use.  The cubic it replaces is decent but droops early
-   (measured -1.18 dB at 10 kHz, -3.07 dB at 15 kHz); the FIR is flat to
-   12 kHz (0.0 dB), -1.0 dB at 14 kHz and -5 dB at 15 kHz, and it also
-   suppresses the images cubic leaves above the source Nyquist.  Cost is 32
-   MACs per channel per output frame (44.1k * 32 * 2 = 2.8M MAC/s), nothing
-   next to the DSP. */
-#define RAX_FIR_TAPS   32
-#define RAX_FIR_PHASES 256
-#define RAX_FIR_HALF   (RAX_FIR_TAPS / 2 - 1)
+   Windowed-sinc polyphase FIR, RAX_FIR_TAPS x 256 phases, Q15 coefficients
+   built once at first use.  Measured through this code by firresp.sh (a sine
+   per frequency, output RMS against input RMS), not from a model:
+
+     taps=64:  0.00 dB to 13 kHz, -0.27 dB at 14 kHz, -8.7 dB at 15 kHz
+     taps=32:  0.00 dB to 12 kHz, -0.19 dB at 13 kHz, -1.8 dB at 14 kHz
+
+   The taps cost 64 MACs per channel per output frame (44.1k * 64 * 2 = 5.6M
+   MAC/s); the loop keeps no per-tap bounds check, so that is about what the
+   32-tap version cost with one.
+
+   History matters more than the tap count: with RAX_FIR_LAG = 0 (the state
+   this shipped in for one round) every tap left of the read point clamped to
+   the head frame, which made the kernel one-sided and measured -1.3 dB at
+   10 kHz / -1.8 dB at 12 kHz / -3.9 dB at 15 kHz with 64 taps.  The ring now
+   keeps RAX_FIR_LAG frames behind the read position, so the kernel is the
+   symmetric one the coefficients describe. */
 
 static int16_t rax_fir[RAX_FIR_PHASES][RAX_FIR_TAPS];
 static int rax_fir_ready;
@@ -1852,25 +1880,12 @@ static void rax_fir_init(void)
    rax_fir_ready = 1;
 }
 
-static inline void rax_fifo_get(int k, int32_t *l, int32_t *r)
-{
-   int n = (int)rax_fifo_fill;
-   unsigned idx;
-
-   if (n <= 0) { *l = 0; *r = 0; return; }
-   if (k < 0) k = 0;
-   else if (k >= n) k = n - 1;
-   idx = (rax_fifo_head + (unsigned)k) % RAX_FIFO_FRAMES;
-   *l = rax_fifo[idx * 2 + 0];
-   *r = rax_fifo[idx * 2 + 1];
-}
-
 static void rax_interp_frame(uint32_t idx, double frac, int32_t *out_l, int32_t *out_r)
 {
    unsigned ph = (unsigned)(frac * (double)RAX_FIR_PHASES);
    const int16_t *c;
+   unsigned base, k;
    int32_t al = 0, ar = 0;
-   int k;
 
    if (!rax_fir_ready)
       rax_fir_init();
@@ -1878,11 +1893,16 @@ static void rax_interp_frame(uint32_t idx, double frac, int32_t *out_l, int32_t 
       ph = RAX_FIR_PHASES - 1;
    c = rax_fir[ph];
 
+   /* The caller guarantees idx >= RAX_FIR_LAG (history is in the ring) and
+      idx + RAX_FIR_TAPS - RAX_FIR_HALF <= fill (lookahead is in the ring), so
+      every tap lands inside it: the walk is one add and one mask per tap, no
+      per-tap bounds check.  This is why the 64-tap kernel costs about what the
+      32-tap one did. */
+   base = (rax_fifo_head + idx - (unsigned)RAX_FIR_HALF) % RAX_FIFO_FRAMES;
    for (k = 0; k < RAX_FIR_TAPS; k++) {
-      int32_t l, r;
-      rax_fifo_get((int)idx + k - RAX_FIR_HALF, &l, &r);
-      al += l * (int32_t)c[k];
-      ar += r * (int32_t)c[k];
+      unsigned ii = (base + k) % RAX_FIFO_FRAMES;
+      al += (int32_t)rax_fifo[ii * 2 + 0] * (int32_t)c[k];
+      ar += (int32_t)rax_fifo[ii * 2 + 1] * (int32_t)c[k];
    }
    *out_l = al >> 15;
    *out_r = ar >> 15;
@@ -1914,6 +1934,9 @@ extern "C" void RaxMix(int *left, int *right, unsigned int frames)
          return;
       }
       rax_fifo_primed = 1;
+      /* The kernel needs RAX_FIR_LAG frames of history behind the read point;
+         the ring starts at the head, so start reading that far in. */
+      rax_fifo_pos = (double)RAX_FIR_LAG;
       LOG_INFO("rax: fifo primed at %u frames", (unsigned)rax_fifo_fill);
    }
    if (rax_fifo_fill == 0) {
@@ -1929,8 +1952,17 @@ extern "C" void RaxMix(int *left, int *right, unsigned int frames)
       double frac = rax_fifo_pos - (double)idx;
       int32_t ol, or_;
 
-      if (idx >= rax_fifo_fill)
-         break;                 /* short ring: the rest of this chunk is silence */
+      /* idx is the read point; the kernel reads idx-RAX_FIR_HALF..idx+..., so
+         the ring must hold the lookahead on the right and the history on the
+         left (the latter is guaranteed by starting at RAX_FIR_LAG). */
+      if (idx + (RAX_FIR_TAPS - RAX_FIR_HALF) > rax_fifo_fill) {
+         /* Short ring: the rest of this chunk is silence, and it is counted as
+            such.  (It used to just break, which made a starved FIFO look clean
+            in the underrun counter -- the counter has to be honest when the
+            FIFO target is lowered.) */
+         rax_fifo_under += frames - i;
+         break;
+      }
 
       rax_interp_frame(idx, frac, &ol, &or_);
       left[i]  += ol;
@@ -1942,14 +1974,14 @@ extern "C" void RaxMix(int *left, int *right, unsigned int frames)
 #endif
 
       rax_fifo_pos += step;
-      while (rax_fifo_pos >= 1.0 && rax_fifo_fill > 0) {
+      while (rax_fifo_pos >= 1.0 + (double)RAX_FIR_LAG && rax_fifo_fill > 0) {
          rax_fifo_head = (rax_fifo_head + 1u) % RAX_FIFO_FRAMES;
          rax_fifo_fill--;
          rax_fifo_pos -= 1.0;
          rax_pop_total++;
       }
       if (rax_fifo_fill == 0)
-         rax_fifo_pos = 0.0;
+         rax_fifo_pos = (double)RAX_FIR_LAG;
    }
 
    /* Rate accounting: production (DAC frames) vs consumption (source frames
@@ -2291,18 +2323,19 @@ extern "C" void RaxTestRender(short *dst, unsigned frames)
       uint32_t idx = (uint32_t)rax_fifo_pos;
       double frac = rax_fifo_pos - (double)idx;
       int32_t ol = 0, or_ = 0;
-      if (rax_fifo_fill > 0 && idx < rax_fifo_fill)
+      if (rax_fifo_fill > 0 &&
+          idx + (RAX_FIR_TAPS - RAX_FIR_HALF) <= rax_fifo_fill)
          rax_interp_frame(idx, frac, &ol, &or_);
       dst[2 * i]     = (short)ol;
       dst[2 * i + 1] = (short)or_;
       rax_fifo_pos += step;
-      while (rax_fifo_pos >= 1.0 && rax_fifo_fill > 0) {
+      while (rax_fifo_pos >= 1.0 + (double)RAX_FIR_LAG && rax_fifo_fill > 0) {
          rax_fifo_head = (rax_fifo_head + 1u) % RAX_FIFO_FRAMES;
          rax_fifo_fill--;
          rax_fifo_pos -= 1.0;
       }
       if (rax_fifo_fill == 0)
-         rax_fifo_pos = 0.0;
+         rax_fifo_pos = (double)RAX_FIR_LAG;
    }
    pthread_mutex_unlock(&rax_audio_mtx);
 }
