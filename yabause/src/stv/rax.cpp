@@ -733,9 +733,28 @@ static uint16_t ctrl_rd(unsigned int off)
 static int  rax_host_peek(uint64_t *cyc);
 static void rax_deliver_due(uint64_t now);
 
+/* Where the worker's CPU goes: the interpreter call (st.cpu.run) versus the
+   board glue around it (event slicing, delivery, timers, DAC pushes).  The
+   generic timer is cheap enough to read twice per slice; slices are hundreds
+   of cycles, so this is a few thousand reads per second. */
+static inline uint64_t rax_ticks(void)
+{
+#if defined(__aarch64__)
+   uint64_t v;
+   __asm__ __volatile__("mrs %0, cntvct_el0" : "=r"(v));
+   return v;
+#elif defined(__x86_64__)
+   return __builtin_ia32_rdtsc();
+#else
+   return 0;
+#endif
+}
+static uint64_t rax_tk_exec, rax_tk_all;
+
 static void rax_run_cycles(uint32_t cycles)
 {
    const uint32_t total = cycles;
+   uint64_t tk_entry = rax_ticks();
 
    while (cycles > 0) {
       /* DSP cycle this iteration starts at.  st.dsp_run is only published by
@@ -771,7 +790,11 @@ static void rax_run_cycles(uint32_t cycles)
 #ifdef RAX_TRACE_IMASK
       adsp_evt_set_cycle(now);
 #endif
-      st.cpu.run((int)slice);
+      {
+         uint64_t tk0 = rax_ticks();
+         st.cpu.run((int)slice);
+         rax_tk_exec += rax_ticks() - tk0;
+      }
       /* execute_run() can come back early (for example when an interrupt is
          taken at the top of the loop), leaving m_icount unused.  Counting the
          requested cycles as executed would make the board clock depend on how
@@ -810,6 +833,8 @@ static void rax_run_cycles(uint32_t cycles)
          }
       }
    }
+
+   rax_tk_all += rax_ticks() - tk_entry;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -930,11 +955,18 @@ static void rax_perf_report(void)
    cpu_ms  = (double)(c.tv_sec - rax_perf_cpu0.tv_sec) * 1000.0
            + (double)(c.tv_nsec - rax_perf_cpu0.tv_nsec) / 1e6;
    dsp_ms  = (double)rax_perf_dsp * 1000.0 / (double)RAX_DSP_CLOCK;
-   LOG_INFO("rax: perf wall_ms=%.0f cpu_ms=%.0f dsp_ms=%.0f => %.2fx realtime, "
-            "%.2f of a core, lag=%llu fifo=%u under=%u",
-            wall_ms, cpu_ms, dsp_ms, dsp_ms / wall_ms, cpu_ms / wall_ms,
-            (unsigned long long)(__atomic_load_n(&rax_grant, __ATOMIC_RELAXED) - st.dsp_run),
-            (unsigned)rax_fifo_fill, (unsigned)rax_fifo_under);
+   {
+      /* Split of the worker's time: the interpreter call itself vs the board
+         glue around it.  Both counters are in generic-timer ticks (24 MHz). */
+      double tk = 24.0e3;   /* ticks per ms */
+      LOG_INFO("rax: perf wall_ms=%.0f cpu_ms=%.0f dsp_ms=%.0f => %.2fx realtime, "
+               "%.2f of a core, lag=%llu fifo=%u under=%u exec_ms=%.0f glue_ms=%.0f",
+               wall_ms, cpu_ms, dsp_ms, dsp_ms / wall_ms, cpu_ms / wall_ms,
+               (unsigned long long)(__atomic_load_n(&rax_grant, __ATOMIC_RELAXED) - st.dsp_run),
+               (unsigned)rax_fifo_fill, (unsigned)rax_fifo_under,
+               (double)rax_tk_exec / tk, (double)(rax_tk_all - rax_tk_exec) / tk);
+      rax_tk_exec = rax_tk_all = 0;
+   }
    rax_perf_wall0 = w;
    rax_perf_cpu0 = c;
    rax_perf_dsp = 0;
