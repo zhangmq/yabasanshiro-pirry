@@ -196,6 +196,7 @@ public:
    bool generate_irq(int which, int indx = 0);
    bool chiptype_is_2181() const;
    void execute_run();
+   void exec_mem_op(uint32_t op, unsigned f);
    void check_irqs();
 
 	static const int PC_STACK_DEPTH     = 16;

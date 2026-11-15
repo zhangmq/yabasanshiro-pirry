@@ -667,6 +667,18 @@ void adsp21xx_device::execute_run()
 
 		// parse the instruction
 		uint32_t temp;
+		{
+			unsigned form8 = BIT(op, 16, 8);
+			/* 0x60-0x7f is one uniform family: ALU/MAC plus one data-memory
+			   access (DAG1/DAG2, read/write) and a register operand from
+			   bits 4-7.  Running it through one handler instead of 32 case
+			   bodies keeps the hot text small; the bodies were byte for byte
+			   the same calls in a different order. */
+			if (form8 >= 0x60 && form8 <= 0x7f) {
+				exec_mem_op(op, form8 - 0x60);
+				goto inst_done;
+			}
+		}
 		switch (BIT(op, 16, 8))
 		{
 			case 0x00:
@@ -1049,86 +1061,6 @@ void adsp21xx_device::execute_run()
 				pgm_write_dag2(op, read_reg0(BIT(op, 4, 4)));
 				alu_op_af(op);
 				break;
-			case 0x60: case 0x61:
-				// 0110000x xxxxxxxx xxxxxxxx  MAC to MR with data memory read DAG1
-				mac_op_mr(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag1(op));
-				break;
-			case 0x62: case 0x63:
-				// 0110001x xxxxxxxx xxxxxxxx  ALU to AR with data memory read DAG1
-				alu_op_ar(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag1(op));
-				break;
-			case 0x64: case 0x65:
-				// 0110010x xxxxxxxx xxxxxxxx  MAC to MF with data memory read DAG1
-				mac_op_mf(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag1(op));
-				break;
-			case 0x66: case 0x67:
-				// 0110011x xxxxxxxx xxxxxxxx  ALU to AF with data memory read DAG1
-				alu_op_af(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag1(op));
-				break;
-			case 0x68: case 0x69:
-				// 0110100x xxxxxxxx xxxxxxxx  MAC to MR with data memory write DAG1
-				data_write_dag1(op, read_reg0(BIT(op, 4, 4)));
-				mac_op_mr(op);
-				break;
-			case 0x6a: case 0x6b:
-				// 0110101x xxxxxxxx xxxxxxxx  ALU to AR with data memory write DAG1
-				data_write_dag1(op, read_reg0(BIT(op, 4, 4)));
-				alu_op_ar(op);
-				break;
-			case 0x6c: case 0x6d:
-				// 0111110x xxxxxxxx xxxxxxxx  MAC to MF with data memory write DAG1
-				data_write_dag1(op, read_reg0(BIT(op, 4, 4)));
-				mac_op_mf(op);
-				break;
-			case 0x6e: case 0x6f:
-				// 0111111x xxxxxxxx xxxxxxxx  ALU to AF with data memory write DAG1
-				data_write_dag1(op, read_reg0(BIT(op, 4, 4)));
-				alu_op_af(op);
-				break;
-			case 0x70: case 0x71:
-				// 0111000x xxxxxxxx xxxxxxxx  MAC to MR with data memory read DAG2
-				mac_op_mr(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag2(op));
-				break;
-			case 0x72: case 0x73:
-				// 0111001x xxxxxxxx xxxxxxxx  ALU to AR with data memory read DAG2
-				alu_op_ar(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag2(op));
-				break;
-			case 0x74: case 0x75:
-				// 0111010x xxxxxxxx xxxxxxxx  MAC to MF with data memory read DAG2
-				mac_op_mf(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag2(op));
-				break;
-			case 0x76: case 0x77:
-				// 0111011x xxxxxxxx xxxxxxxx  ALU to AF with data memory read DAG2
-				alu_op_af(op);
-				write_reg0(BIT(op, 4, 4), data_read_dag2(op));
-				break;
-			case 0x78: case 0x79:
-				// 0111100x xxxxxxxx xxxxxxxx  MAC to MR with data memory write DAG2
-				data_write_dag2(op, read_reg0(BIT(op, 4, 4)));
-				mac_op_mr(op);
-				break;
-			case 0x7a: case 0x7b:
-				// 0111101x xxxxxxxx xxxxxxxx  ALU to AR with data memory write DAG2
-				data_write_dag2(op, read_reg0(BIT(op, 4, 4)));
-				alu_op_ar(op);
-				break;
-			case 0x7c: case 0x7d:
-				// 0111110x xxxxxxxx xxxxxxxx  MAC to MF with data memory write DAG2
-				data_write_dag2(op, read_reg0(BIT(op, 4, 4)));
-				mac_op_mf(op);
-				break;
-			case 0x7e: case 0x7f:
-				// 0111111x xxxxxxxx xxxxxxxx  ALU to AF with data memory write DAG2
-				data_write_dag2(op, read_reg0(BIT(op, 4, 4)));
-				alu_op_af(op);
-				break;
 			case 0x80: case 0x81: case 0x82: case 0x83:
 				// 100000xx xxxxxxxx xxxxxxxx  read data memory (immediate addr) to reg group 0
 				write_reg0(BIT(op, 0, 4), data_read(BIT(op, 4, 14)));
@@ -1373,11 +1305,41 @@ void adsp21xx_device::execute_run()
 				rax_prof_report();
 		}
 #endif
+inst_done:
 		m_icount--;
 		if (m_board_stop >= 0 && m_icount <= m_board_stop)
 			m_icount = 0;
 	} while (m_icount > 0);
 	m_board_stop = -1;
+}
+
+/* 011xxxxx: ALU/MAC with one data-memory access.
+   f = form - 0x60: bit4 = DAG2, bit3 = write, bits 2-1 = operation
+   (MAC->MR, ALU->AR, MAC->MF, ALU->AF).  The order of the calls is the one the
+   32 original case bodies used: the ALU/MAC first on a read, last on a write. */
+void adsp21xx_device::exec_mem_op(uint32_t op, unsigned f)
+{
+	uint32_t idx = BIT(op, 4, 4);
+
+	if (f & 8) {                    /* write */
+		uint32_t v = read_reg0(idx);
+		if (f & 16) data_write_dag2(op, v);
+		else        data_write_dag1(op, v);
+		switch ((f >> 1) & 3) {
+			case 0: mac_op_mr(op); break;
+			case 1: alu_op_ar(op); break;
+			case 2: mac_op_mf(op); break;
+			default: alu_op_af(op); break;
+		}
+	} else {                        /* read */
+		switch ((f >> 1) & 3) {
+			case 0: mac_op_mr(op); break;
+			case 1: alu_op_ar(op); break;
+			case 2: mac_op_mf(op); break;
+			default: alu_op_af(op); break;
+		}
+		write_reg0(idx, (f & 16) ? data_read_dag2(op) : data_read_dag1(op));
+	}
 }
 
 /* -------------------------------------------------------------------------
