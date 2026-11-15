@@ -22,7 +22,7 @@ multi-disc support via `.m3u`, and the extended in-game menu.
 Every fix applies to all games — there are no per-game hacks and no hidden
 runtime switches. What you build here is exactly the released emulator.
 
-Current version: **1.6.2**
+Current version: **1.6.3**
 
 ## Building
 

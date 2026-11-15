@@ -2137,52 +2137,6 @@ void scsp_check_interrupt() {
   
 }
 
-static INLINE void
-scsp_trigger_sound_interrupt (u32 id)
-{
-   u32 level;
-   level = 0;
-   if (id > 0x80) id = 0x80;
-   if (scsp.scilv0 & id) level |= 1;
-   if (scsp.scilv1 & id) level |= 2;
-   if (scsp.scilv2 & id) level |= 4;
-#if 0
-   unsigned mask_test;
-   unsigned lvmasked[3];
-   unsigned level = 0;
-
-   scsp.scipd |= id;
-
-   mask_test = scsp.scipd & scsp.scieb;
-   if (mask_test &~0xFF)
-     mask_test = (mask_test & 0xFF) | 0x80;
-
-   lvmasked[0] = (scsp.scilv0 & mask_test) << 0;
-   lvmasked[1] = (scsp.scilv1 & mask_test) << 1;
-   lvmasked[2] = (scsp.scilv2 & mask_test) << 2;
-
-   for (unsigned i = 0; i < 8; i++)
-   {
-     unsigned l = (lvmasked[0] & 0x1) | (lvmasked[1] & 0x2) | (lvmasked[2] & 0x4);
-
-     if (l > level)
-       level = l;
-
-     lvmasked[0] >>= 1;
-     lvmasked[1] >>= 1;
-     lvmasked[2] >>= 1;
-   }
-#endif
-
-#ifdef SCSP_DEBUG
-   if (id == 0x8) SCSPLOG ("scsp sound interrupt accepted %.2X lev=%d\n", id, level);
-#endif
-
-   //if(level!=0)SCSPLOG("scsp sound interrupt accepted %.2X lev=%d\n", id, level);
-   scsp.sintf (level);
-}
-
-
 void scsp_main_interrupt (u32 id)
 {
 //  if (scsp.mcipd & id) return;
@@ -2204,8 +2158,11 @@ void scsp_sound_interrupt (u32 id)
   scsp.scipd |= id;
   WRITE_THROUGH (scsp.scipd);
 
+  /* Raise the highest level of all pending, enabled interrupts, not only the
+     level of the new one: a lower timer must not override a higher one that
+     is still pending (same behaviour as Kronos). */
   if (scsp.scieb & id)
-    scsp_trigger_sound_interrupt (id);
+    scsp_check_interrupt();
 }
 
 ////////////////////////////////////////////////////////////////

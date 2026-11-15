@@ -784,7 +784,8 @@ void YglCachedQuadOffset(vdp2draw_struct * input, YglCache * cache, int cx, int 
 void YglTileLayerBegin(void);
 void YglTileQuad(vdp2draw_struct *input, YglTexture *output, YglCache *c, int cx, int cy, float sx, float sy, int cash_flg, int mode_val);
 void YglCachedQuad(vdp2draw_struct *, YglCache *);
-int YglQuadSlot(vdp2draw_struct *input, YglTexture *output, YglCache *c, u64 key);
+int YglQuadSlot(vdp2draw_struct *input, YglTexture *output, YglCache *c, u64 key, int quad_only);
+extern unsigned int g_slot_atlas_gen;   /* bumped by YglTMReset/YglTMRealloc */
 void YglRender(void);
 void YglReset(void);
 void YglShowTexture(void);

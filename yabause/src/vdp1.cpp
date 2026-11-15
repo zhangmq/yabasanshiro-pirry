@@ -235,6 +235,10 @@ extern "C" void FASTCALL Vdp1RamWriteLong(u32 addr, u32 val) {
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* Outside the render thread VIDOGLVdp1ReadFrameBuffer only reads the CPU copy of the draw buffer, so the
+   VRAM lock is not needed there. Taking it would make the emulation thread wait for the renderer on every
+   read. */
+extern "C" int YabIsRenderThread(void);
 extern "C" u8 FASTCALL Vdp1FrameBufferReadByte(u32 addr) {
    addr &= 0x3FFFF;
    //if (VIDCore->Vdp1ReadFrameBuffer && addr < 0x30000 ){
@@ -253,6 +257,7 @@ extern "C" u16 FASTCALL Vdp1FrameBufferReadWord(u32 addr) {
    addr &= 0x3FFFF;
    if (VIDCore->Vdp1ReadFrameBuffer ){
      u16 val;
+     if (!YabIsRenderThread()) { VIDCore->Vdp1ReadFrameBuffer(1, addr, &val); return val; }
      VdpLockVram();
      VIDCore->Vdp1ReadFrameBuffer(1, addr, &val);
      VdpUnLockVram();
@@ -267,6 +272,7 @@ extern "C" u32 FASTCALL Vdp1FrameBufferReadLong(u32 addr) {
    addr &= 0x3FFFF;
    if (VIDCore->Vdp1ReadFrameBuffer ){
      u32 val;
+     if (!YabIsRenderThread()) { VIDCore->Vdp1ReadFrameBuffer(2, addr, &val); return val; }
      VdpLockVram();
      VIDCore->Vdp1ReadFrameBuffer(2, addr, &val);
      VdpUnLockVram();

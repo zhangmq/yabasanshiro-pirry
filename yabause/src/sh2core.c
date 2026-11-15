@@ -2122,6 +2122,12 @@ void FRTExec(u32 cycles)
    frctemp += ((cycles + CurrentSH2->frc.leftover) >> CurrentSH2->frc.shift);
    CurrentSH2->frc.leftover = (cycles + CurrentSH2->frc.leftover) & mask;
 
+   /* Detect the overflow before a compare match A with CCLRA clears the
+      counter (as Ymir and Mednafen do). Otherwise, with OCRA=FFFF and CCLRA,
+      no OVI is raised after the first overflow, and games that build a clock
+      from (overflow count << 16 | FRC) see it jump back (DragonHeart). */
+   const int frc_overflow = (frctemp > 0xFFFF);
+
    // Check to see if there is or was a Output Compare A match
    if ((u32)((CurrentSH2->onchip.OCRA - frcold - 1) & 0xFFFF) < (frctemp - frcold))   /* also handles FRC wraparound */
    {
@@ -2152,7 +2158,7 @@ void FRTExec(u32 cycles)
    }
 
    // If FRC overflows, set overflow flag
-   if (frctemp > 0xFFFF)
+   if (frc_overflow)
    {
       // Do we need to trigger an interrupt?
       if (CurrentSH2->onchip.TIER & 0x2)
@@ -2680,7 +2686,7 @@ static int IcfAfterRaise(int syncCycle, int target_slave)
    catch-up blindly to 256 cycles even when the target CPU was already ahead, and the nested
    cycles were never credited, so the target drifted further ahead on every doorbell. Sea Bass
    Fishing hung at boot that way (target 9 cycles ahead, sent 265 cycles into the future), while
-   Last Bronx needs the catch-up. Now the target runs exactly up to the caller's position
+   Last Bronx needs the catch-up. Now the target runs up to the caller's position (at least 32 cycles, see below)
    (capped at 2048) and the cycles are credited to its next regular slice.
    The interpreter keeps the old way. */
 #ifdef DYNAREC_DEVMIYAX
@@ -2695,10 +2701,15 @@ static long long SH2DynCyclesNow(SH2_struct *context) { (void)context; return 0;
 static void SH2DynSyncCredit(SH2_struct *context, u32 n) { (void)context; (void)n; }
 static int SyncDynamic(void) { return 0; }
 #endif
+/* The target always runs at least SYNC_MIN_CYCLES, also when its clock is already level or ahead.
+   Without that it does not react to the doorbell in time, and both CPUs can end up waiting for
+   each other (Resident Evil hangs after the first door). 32 cycles are far below the blind 256 of
+   the old way that broke Sea Bass Fishing. */
+#define SYNC_MIN_CYCLES 32
 static int SyncDistance(SH2_struct *target)
 {
    long long d = SH2DynCyclesNow(CurrentSH2) - SH2DynCyclesNow(target);
-   if (d <= 0) return 0;
+   if (d < SYNC_MIN_CYCLES) d = SYNC_MIN_CYCLES;
    if (d > 2048) d = 2048;
    return (int)d;
 }

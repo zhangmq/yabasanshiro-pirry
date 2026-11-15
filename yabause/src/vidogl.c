@@ -321,6 +321,9 @@ static void Vdp2DrawRBG0(void);
 
 u32 Vdp2ColorRamGetColor(u32 colorindex, int alpha);
 static void Vdp2PatternAddrPos(vdp2draw_struct *info, int planex, int x, int planey, int y);
+/* Read mask of the per-line raster skip: VRAM pages (4 KB) read by the last raster of a fixed slot. */
+static int g_rs_mask_on = 0; static u64 g_rs_mask[2];
+#define RS_MARK(a) do { const u32 rp_ = ((u32)(a) & 0x7FFFF) >> 12; g_rs_mask[rp_ >> 6] |= 1ULL << (rp_ & 63); } while (0)
 static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x, int y, int cx, int cy, int lines);
 static INLINE void ReadVdp2ColorOffset(Vdp2 * regs, vdp2draw_struct *info, int mask);
 static INLINE u16 Vdp2ColorRamGetColorRaw(u32 colorindex);
@@ -3131,6 +3134,11 @@ static void Vdp2PatternAddrPos(vdp2draw_struct *info, int planex, int x, int pla
     info->charaddr &= 0x3FFF;
 
   info->charaddr *= 0x20; // thanks Runik
+  if (g_rs_mask_on) {   /* pages of the pattern name and of the cell data */
+    const u32 bits = (info->colornumber == 0) ? 4u : (info->colornumber == 1) ? 8u : (info->colornumber == 4) ? 32u : 16u;
+    const u32 cb = (u32)(info->patternwh * 8) * (u32)(info->patternwh * 8) * bits / 8u;
+    RS_MARK(addr); RS_MARK(addr + info->patterndatasize * 2 - 1); RS_MARK(info->charaddr); RS_MARK(info->charaddr + cb - 1);
+  }
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -7376,15 +7384,147 @@ INLINE int Vdp2CheckCharAccessPenalty(int char_access, int ptn_access) {
 //////////////////////////////////////////////////////////////////////////////
 
 
+/* Per-line raster skip (fixed slots 3 and 6, Vdp2DrawMapPerLine for NBG0/NBG1): the software raster is skipped when
+   every input is unchanged since the slot was last rastered, as the GPU texture still holds that raster.
+   Inputs: the draw parameters that the raster reads (charaddr/paladdr/addr etc. are written by the raster itself),
+   the line scroll entries it reads, the register snapshot, CRAM when special colour mode 3 reads it, the atlas
+   generation and the VRAM pages read by the last raster (content hash per page, re-hashed only when the page stamp
+   changed). The slot is rastered again after at most 60 skips. */
+static u64 RsFnv(const void *p, size_t n, u64 f) { const unsigned char *b = (const unsigned char *)p; size_t i; for (i = 0; i < n; i++) { f ^= b[i]; f *= 1099511628211ULL; } return f; }
+static u32 s_rs_pseq[128]; static u64 s_rs_phash[128]; static u32 s_rs_pgen[128]; static int s_rs_pinit = 0;
+static void RsPages(void) {
+  int p;
+  for (p = 0; p < 128; p++) { const u32 q = v2_page_seq[p];
+    if (!s_rs_pinit || q != s_rs_pseq[p]) { const u64 hh = RsFnv(Vdp2RamRender + (p << 12), 4096, 1469598103934665603ULL);
+      s_rs_pseq[p] = q; if (!s_rs_pinit || hh != s_rs_phash[p]) { s_rs_phash[p] = hh; s_rs_pgen[p]++; } } }
+  s_rs_pinit = 1;
+}
+static u64 RsSig(const vdp2draw_struct *it) {
+  u64 f = 1469598103934665603ULL;
+#define RSF(x) f = RsFnv(&it->x, sizeof(it->x), f)
+  RSF(flipfunction);
+  RSF(supplementdata);
+  RSF(cellw);
+  RSF(cellh);
+  RSF(pagewh);
+  RSF(patternwh);
+  RSF(colornumber);
+  RSF(coordincx);
+  RSF(transparencyenable);
+  RSF(specialcolormode);
+  RSF(planew);
+  RSF(planeh);
+  RSF(islinescroll);
+  RSF(coloroffset);
+  RSF(specialcode);
+  RSF(sv);
+  RSF(sh);
+  RSF(lineinc);
+  RSF(coordincy);
+  RSF(alpha);
+  RSF(char_bank);
+  RSF(specialprimode);
+  RSF(bEnWin0);
+  RSF(bEnWin1);
+  RSF(priority);
+  RSF(patterndatasize);
+  RSF(mapwh);
+  RSF(auxmode);
+  RSF(PlaneAddr);
+  RSF(maxzoom);
+  RSF(isverticalscroll);
+  RSF(id);
+  RSF(cor);
+  RSF(cog);
+  RSF(cob);
+  RSF(WindowArea0);
+  RSF(WindowArea1);
+  RSF(mosaicymask);
+  RSF(mosaicxmask);
+  RSF(linescreen);
+  RSF(lineTexture);
+  RSF(blendmode);
+  RSF(bEnSpriteWin);
+  RSF(WindowAreaSprite);
+  RSF(LogicWin);
+  RSF(linescrolltbl);
+  RSF(isbitmap);
+  if (it->isverticalscroll) { RSF(verticalscrolltbl); RSF(verticalscrollinc); }
+#undef RSF
+#define RSR(x) f = RsFnv(&fixVdp2Regs->x, sizeof(fixVdp2Regs->x), f)
+  RSR(CHCTLA);
+  RSR(CHCTLB);
+  RSR(BMPNA);
+  RSR(BMPNB);
+  RSR(MPOFN);
+  RSR(PLSZ);
+  RSR(SCRCTL);
+  RSR(ZMCTL);
+  RSR(PRINA);
+  RSR(PRINB);
+  RSR(SFPRMD);
+  RSR(SFCCMD);
+  RSR(CRAOFA);
+  RSR(BGON);
+  RSR(CCCTL);
+  RSR(SFSEL);
+  RSR(SFCODE);
+  RSR(PNCN0);
+  RSR(PNCN1);
+  RSR(MPABN0);
+  RSR(MPCDN0);
+  RSR(MPABN1);
+  RSR(MPCDN1);
+  RSR(RAMCTL);
+  RSR(VCSTA.all); RSR(LSTA0.all); RSR(LSTA1.all); RSR(VRSIZE);
+#undef RSR
+  if (it->specialcolormode == 3) f = RsFnv(Vdp2ColorRam, 0x1000, f);
+  if (it->lineinfo && it->islinescroll && it->lineinc) {
+    const int linemask = (it->lineinc == 2) ? 1 : (it->lineinc == 4) ? 3 : (it->lineinc == 8) ? 7 : 0;
+    const int ih = InterlaceHalfActive() && vdp2height >= 448; int v;
+    if (ih) { for (v = 0; v < vdp2height; v += 2) { const int idx = v / (linemask + 1); if (idx >= 0 && idx < 512) f = RsFnv(&it->lineinfo[idx], sizeof(vdp2Lineinfo), f); } }
+    else { int n = vdp2height / (linemask + 1) + 1; if (n > 512) n = 512; f = RsFnv(it->lineinfo, (size_t)n * sizeof(vdp2Lineinfo), f); }
+  }
+  { u32 live[7]; live[0] = Vdp2Regs->VRSIZE; live[1] = fixVdp2Regs->CCCTL; live[2] = (u32)Vdp2Internal.ColorMode;
+    live[3] = (u32)vdp1_interlace; live[4] = (u32)InterlaceHalfActive(); live[5] = g_slot_atlas_gen; live[6] = v2_flush_seq;
+    f = RsFnv(live, sizeof(live), f); f = RsFnv(&vdp2width, sizeof(vdp2width), f); f = RsFnv(&vdp2height, sizeof(vdp2height), f); }
+  return f;
+}
+static u64 RsGenHash(const u64 *m) { u64 f = 1469598103934665603ULL; int p;
+  for (p = 0; p < 128; p++) if (m[p >> 6] & (1ULL << (p & 63))) { f = RsFnv(&p, sizeof(p), f); f = RsFnv(&s_rs_pgen[p], 4, f); }
+  return f; }
+static struct { int valid; u64 sig; void *tm; unsigned int skips; u64 mask[2]; u64 gh; } s_rs[16];
+static void RsBefore(void) { g_rs_mask[0] = g_rs_mask[1] = 0; g_rs_mask_on = 1; }
+static void RsAfter(int pos_val, const vdp2draw_struct *info) {
+  g_rs_mask_on = 0;
+  if (info->isverticalscroll) { RS_MARK(info->verticalscrolltbl); RS_MARK(info->verticalscrolltbl + 3); }
+  s_rs[pos_val].mask[0] = g_rs_mask[0]; s_rs[pos_val].mask[1] = g_rs_mask[1]; s_rs[pos_val].gh = RsGenHash(g_rs_mask);
+}
+
 /* Fixed atlas slot per call site (see YglQuadSlot in ygles.c). If the site is needed a second time within the same
-   frame it falls back to the normal path, otherwise the second call would overwrite the content of the first. */
-static void OnewayQuad(vdp2draw_struct *it, YglTexture *tex, YglCache *c, int pos_val) {
+   frame it falls back to the normal path, otherwise the second call would overwrite the content of the first.
+   Returns 1 when the caller has to raster, 0 when the slot content is still valid (sites 3 and 6). */
+static int OnewayQuad(vdp2draw_struct *it, YglTexture *tex, YglCache *c, int pos_val) {
   if (pos_val < 0 || pos_val >= 16 || g_oneway_last[pos_val] == g_oneway_frame) {
+    if (pos_val >= 0 && pos_val < 16) s_rs[pos_val].valid = 0;
     YglQuad(it, tex, c);
-    return;
+    return 1;
   }
   g_oneway_last[pos_val] = g_oneway_frame;
-  YglQuadSlot(it, tex, c, 0xC0000000CADull ^ ((u64)(pos_val + 1) << 44));
+  {
+    const int rs = (pos_val == 3 || pos_val == 6);
+    u64 sig = 0; int quad_only = 0, r;
+    if (rs) { RsPages(); sig = RsSig(it);
+      quad_only = s_rs[pos_val].valid && s_rs[pos_val].sig == sig && s_rs[pos_val].tm == (void *)_Ygl->texture_manager
+                  && s_rs[pos_val].skips < 60 && RsGenHash(s_rs[pos_val].mask) == s_rs[pos_val].gh; }
+    r = YglQuadSlot(it, tex, c, 0xC0000000CADull ^ ((u64)(pos_val + 1) << 44), quad_only);
+    if (rs) {
+      if (r == 1) { s_rs[pos_val].skips++; return 0; }
+      s_rs[pos_val].sig = sig; s_rs[pos_val].valid = (r == 0 && tex->textdata != NULL); s_rs[pos_val].tm = (void *)_Ygl->texture_manager;
+      s_rs[pos_val].skips = 0;
+    }
+  }
+  return 1;
 }
 
 static void Vdp2DrawNBG0(void)
@@ -7791,9 +7931,9 @@ static void Vdp2DrawNBG0(void)
         infotmp.cellh = (InterlaceHalfActive() && vdp2height >= 448) ? (vdp2height >> 1) : vdp2height;
 
         infotmp.flipfunction = 0;
-        OnewayQuad(&infotmp, &texture, &tmpc, 3);
+        const int raster_needed = OnewayQuad(&infotmp, &texture, &tmpc, 3);
         EdgeScrollGate(0, 0);   /* zoom/line scroll path: not covered */
-        Vdp2DrawMapPerLine(&info, &texture);
+        if (raster_needed) { RsBefore(); Vdp2DrawMapPerLine(&info, &texture); RsAfter(3, &info); }
       }
       else {
         /* On redirection the ramp carries a constant offset (H[0]/V[0]) that the pixel path would have folded into sh/sv;
@@ -8112,9 +8252,9 @@ static void Vdp2DrawNBG1(void)
       infotmp.cellw = vdp2width;
       infotmp.cellh = (InterlaceHalfActive() && vdp2height >= 448) ? (vdp2height >> 1) : vdp2height;
       infotmp.flipfunction = 0;
-      OnewayQuad(&infotmp, &texture, &tmpc, 6);
+      const int raster_needed = OnewayQuad(&infotmp, &texture, &tmpc, 6);
       EdgeScrollGate(1, 0);   /* zoom/line scroll path: not covered */
-      Vdp2DrawMapPerLine(&info, &texture);
+      if (raster_needed) { RsBefore(); Vdp2DrawMapPerLine(&info, &texture); RsAfter(6, &info); }
     }
     else {
       //Vdp2DrawMap(&info, &texture);
