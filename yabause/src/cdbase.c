@@ -1799,7 +1799,11 @@ static int LoadCHD(const char *chd_filename, FILE *iso_file)
   u8 resultflags;
 
   if (pChdInfo != NULL) {
+    /* On a disc change, also close the previous CHD and free its hunk buffer. */
+    if (pChdInfo->chd != NULL) chd_close(pChdInfo->chd);
+    free(pChdInfo->hunk_buffer);
     free(pChdInfo);
+    pChdInfo = NULL;
   }
 
   pChdInfo = malloc(sizeof(ChdInfo));

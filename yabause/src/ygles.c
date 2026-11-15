@@ -573,8 +573,12 @@ void YglTMDeInit(YglTextureManager *tm)
 
 //////////////////////////////////////////////////////////////////////////////
 
+/* Content of fixed slots is only valid within one atlas generation. */
+unsigned int g_slot_atlas_gen = 0;
+
 void YglTMReset(YglTextureManager *tm)
 {
+  g_slot_atlas_gen++;
   tm->currentX = 0;
   tm->currentY = 0;
   tm->yMax = 0;
@@ -657,6 +661,11 @@ void YglTMReserve(YglTextureManager * tm, unsigned int w, unsigned int h){
 }
 #endif
 
+/* Without an explicit fence, glMapBufferRange on the atlas buffer waits for all GL commands queued so far
+   (including the drawing of the frame). Waiting on a fence placed right after the upload only waits for
+   the upload itself. */
+static GLsync s_upload_fence = 0;
+
 void YglTmPush(YglTextureManager *tm)
 {
   glActiveTexture(GL_TEXTURE0);
@@ -712,6 +721,9 @@ void YglTmPush(YglTextureManager *tm)
     }
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
     tm->texture = NULL;
+    /* Fence right after the atlas upload; YglTmPull waits for it before mapping again. */
+    if (s_upload_fence) glDeleteSync(s_upload_fence);
+    s_upload_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
   }
 }
 
@@ -724,6 +736,11 @@ void YglTmPull(YglTextureManager *tm, u32 flg)
     glBindTexture(GL_TEXTURE_2D, tm->textureID_in[tm->current]);
     glBindBuffer(GL_PIXEL_UNPACK_BUFFER, tm->pixelBufferID_in[tm->current]);
 
+    if (s_upload_fence) {
+      glClientWaitSync(s_upload_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 100000000ULL);   /* at most 100 ms */
+      glDeleteSync(s_upload_fence);
+      s_upload_fence = 0;
+    }
     {
       GLbitfield mf;
       /* Mapping the whole atlas is costly; INVALIDATE must not be used on the
@@ -757,6 +774,7 @@ void YglTmPull(YglTextureManager *tm, u32 flg)
 
 void YglTMRealloc(YglTextureManager *tm, unsigned int width, unsigned int height)
 {
+  g_slot_atlas_gen++;
 
   GLuint new_textureID[2];
   GLuint new_pixelBufferID[2];
@@ -1997,30 +2015,35 @@ YglProgram *YglGetProgram(YglSprite *input, int prg)
     level->uclipcurrent = input->uclipmode;
   }
 
+  /* In the merged Gouraud program only the VDP2 bit pair of the blend mode
+     matters (& 0x03): SPD and normal Gouraud polygons no longer split the batch.
+     The blend mode of a VDP1 program is not read when it is drawn. */
+  int bm_in = input->blendmode;
+  if (prg == PG_VFP1_GOURAUDSAHDING) bm_in &= 0x03;
   checkval = (float)(input->cor) / 255.0f;
   if (checkval != level->prg[level->prgcurrent].color_offset_val[0])
   {
     YglProgramChange(level, prg);
     level->prg[level->prgcurrent].id = input->id;
-    level->prg[level->prgcurrent].blendmode = input->blendmode;
+    level->prg[level->prgcurrent].blendmode = bm_in;
   }
   else if (level->prg[level->prgcurrent].prgid != prg)
   {
     YglProgramChange(level, prg);
     level->prg[level->prgcurrent].id = input->id;
-    level->prg[level->prgcurrent].blendmode = input->blendmode;
+    level->prg[level->prgcurrent].blendmode = bm_in;
   }
-  else if (level->prg[level->prgcurrent].blendmode != input->blendmode)
+  else if (level->prg[level->prgcurrent].blendmode != bm_in)
   {
     YglProgramChange(level, prg);
     level->prg[level->prgcurrent].id = input->id;
-    level->prg[level->prgcurrent].blendmode = input->blendmode;
+    level->prg[level->prgcurrent].blendmode = bm_in;
   }
   else if (input->id != level->prg[level->prgcurrent].id)
   {
     YglProgramChange(level, prg);
     level->prg[level->prgcurrent].id = input->id;
-    level->prg[level->prgcurrent].blendmode = input->blendmode;
+    level->prg[level->prgcurrent].blendmode = bm_in;
   }
   // for polygon debug
   // else if (prg == PG_VFP1_GOURAUDSAHDING ){
@@ -2188,6 +2211,7 @@ int YglTriangleGrowShading_in(YglSprite *input, YglTexture *output, float *color
   unsigned int x, y;
   YglProgram *program;
   int prg = PG_VFP1_GOURAUDSAHDING;
+  int spd = 0;
   float *pos;
   int u, v;
 
@@ -2214,7 +2238,7 @@ int YglTriangleGrowShading_in(YglSprite *input, YglTexture *output, float *color
   }
   else if (input->blendmode == VDP1_COLOR_SPD)
   {
-    prg = PG_VFP1_GOURAUDSAHDING_SPD;
+    spd = 1;   /* drawn with the normal Gouraud program, see spd_r */
   }
 
   if (input->linescreen == 1)
@@ -2254,7 +2278,9 @@ int YglTriangleGrowShading_in(YglSprite *input, YglTexture *output, float *color
     y = c->y;
   }
 
-  texv[0].r = texv[1].r = texv[2].r = texv[3].r = texv[4].r = texv[5].r = 0;    // these can stay at 0
+  /* r carries the SPD flag: the Gouraud shader keeps alpha 0 pixels when r >= 0.5 */
+  const float spd_r = (spd && prg == PG_VFP1_GOURAUDSAHDING) ? 1.0f : 0.0f;
+  texv[0].r = texv[1].r = texv[2].r = texv[3].r = texv[4].r = texv[5].r = spd_r;
   texv[0].q = texv[1].q = texv[2].q = texv[3].q = texv[4].q = texv[5].q = 1.0f; // these can stay at 0
 
   if (input->flip & 0x1)
@@ -2405,7 +2431,7 @@ int YglTriangleGrowShading_in(YglSprite *input, YglTexture *output, float *color
       ctpos[4].t = ctpos[2].t;
       ctpos[5].s = ctpos[0].s;
       ctpos[5].t = ctpos[0].t + t_step;
-      ctpos[0].r = ctpos[1].r = ctpos[2].r = ctpos[3].r = ctpos[4].r = ctpos[5].r = 0;    // these can stay at 0
+      ctpos[0].r = ctpos[1].r = ctpos[2].r = ctpos[3].r = ctpos[4].r = ctpos[5].r = spd_r;
       ctpos[0].q = ctpos[1].q = ctpos[2].q = ctpos[3].q = ctpos[4].q = ctpos[5].q = 1.0f; // these can stay at 0
 
       // ToDo: color interpolation
@@ -2484,6 +2510,7 @@ int YglQuadGrowShading_in(YglSprite *input, YglTexture *output, float *colors, Y
   float *vtxa;
   float q[4];
   int prg = PG_VFP1_GOURAUDSAHDING;
+  int spd = 0;
   float *pos;
 
   if ((input->blendmode & 0x03) == VDP2_CC_ADD)
@@ -2508,7 +2535,7 @@ int YglQuadGrowShading_in(YglSprite *input, YglTexture *output, float *colors, Y
   }
   else if (input->blendmode == VDP1_COLOR_SPD)
   {
-    prg = PG_VFP1_GOURAUDSAHDING_SPD;
+    spd = 1;   /* drawn with the normal Gouraud program, see spd_r */
   }
 
   if (input->linescreen == 1)
@@ -2608,7 +2635,9 @@ int YglQuadGrowShading_in(YglSprite *input, YglTexture *output, float *colors, Y
 
   program->currentQuad += 12;
 
-  tmp[0].r = tmp[1].r = tmp[2].r = tmp[3].r = tmp[4].r = tmp[5].r = 0; // these can stay at 0
+  /* r carries the SPD flag: the Gouraud shader keeps alpha 0 pixels when r >= 0.5 */
+  const float spd_r = (spd && prg == PG_VFP1_GOURAUDSAHDING) ? 1.0f : 0.0f;
+  tmp[0].r = tmp[1].r = tmp[2].r = tmp[3].r = tmp[4].r = tmp[5].r = spd_r;
   if (input->flip & 0x1)
   {
     tmp[0].s = tmp[3].s = tmp[5].s = (float)((x + input->w) - ATLAS_BIAS);
@@ -3203,7 +3232,7 @@ void YglCachedQuad(vdp2draw_struct *input, YglCache *cache)
    atlas position each frame (which would fill half the atlas per frame and flush the texture
    cache). Same pattern as RbgSlotAllocate (vidogl.c) for RBG. Returns like YglQuad_in;
    output->textdata points into the currently mapped slot. */
-int YglQuadSlot(vdp2draw_struct *input, YglTexture *output, YglCache *c, u64 key)
+int YglQuadSlot(vdp2draw_struct *input, YglTexture *output, YglCache *c, u64 key, int quad_only)
 {
   extern int g_texcache_persist;
   YglTextureManager *tm = _Ygl->texture_manager;
@@ -3215,6 +3244,10 @@ int YglQuadSlot(vdp2draw_struct *input, YglTexture *output, YglCache *c, u64 key
     const unsigned int sx = (unsigned int)sc.x, sy = (unsigned int)sc.y;
     r = YglQuad_in(input, NULL, &sc, 0);
     if (r < 0) return r;
+    if (quad_only) {   /* content unchanged: draw the quad only, no raster, no dirty rect, no upload */
+      output->textdata = NULL; output->w = 0;
+      return 1;
+    }
     output->w = tm->width - input->cellw;
     output->textdata = tm->texture + sy * tm->width + sx;
     if (InterlaceHalfActive()) YglTMDirtyRectXY(tm, (int)sx, (int)sy, (int)input->cellw, (int)input->cellh);

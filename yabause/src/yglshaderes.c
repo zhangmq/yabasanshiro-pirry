@@ -1408,7 +1408,7 @@ const GLchar Yglprg_vdp1_gouraudshading_idx_f[] =
 "#version 330 \n"
 #endif
 YGL_VDP1_GOURAUD_IDX_HEAD
-"  if( spriteColor.a == 0.0 ) discard;                                      \n"
+"  if( spriteColor.a == 0.0 && v_texcoord.p < 0.5 ) discard;   /* p = 1: SPD polygon */ \n"
 YGL_VDP1_GOURAUD_IDX_CORE
 "}\n";
 const GLchar * pYglprg_vdp1_gouraudshading_idx_f[] = {Yglprg_vdp1_gouraudshading_idx_f, NULL};

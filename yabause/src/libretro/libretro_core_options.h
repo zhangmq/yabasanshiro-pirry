@@ -155,7 +155,7 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
          { "enabled",  NULL },
          { NULL, NULL },
       },
-      "disabled"
+      "enabled"
    },
    {
       "yabasanshiro_interlace_half",
