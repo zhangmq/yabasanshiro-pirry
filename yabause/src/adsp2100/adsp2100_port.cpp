@@ -473,6 +473,7 @@ void adsp21xx_device::check_irqs()
    family. */
 static int rax_prof_on = -1;
 static uint64_t rax_prof_tab[256];
+static uint64_t rax_prof_cnt[256];
 static uint64_t rax_prof_n;
 
 static inline uint64_t rax_prof_clock(void)
@@ -505,8 +506,12 @@ static void rax_prof_report(void)
          if (rax_prof_tab[i] > bv) { bv = rax_prof_tab[i]; best = i; }
       if (bv == 0)
          break;
-      fprintf(stderr, "PROF %02X %5.1f%%\n", best, 100.0 * (double)bv / (double)total);
+      fprintf(stderr, "PROF %02X %5.1f%% n=%llu ticks/instr=%.1f\n", best,
+              100.0 * (double)bv / (double)total,
+              (unsigned long long)rax_prof_cnt[best],
+              rax_prof_cnt[best] ? (double)bv / (double)rax_prof_cnt[best] : 0.0);
       rax_prof_tab[best] = 0;
+      rax_prof_cnt[best] = 0;
    }
 }
 #endif
@@ -1363,6 +1368,7 @@ void adsp21xx_device::execute_run()
 #ifdef RAX_PROF
 		if (rax_prof_on) {
 			rax_prof_tab[BIT(op, 16, 8)] += rax_prof_clock() - prof_t0;
+			rax_prof_cnt[BIT(op, 16, 8)]++;
 			if (++rax_prof_n % 8000000u == 0)
 				rax_prof_report();
 		}
