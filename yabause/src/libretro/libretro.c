@@ -499,52 +499,73 @@ static retro_log_printf_t frontend_log;
 
 void *LibretroFrontFbo(void);
 
-static int game_width  = 320;         /* current native Saturn mode */
+static int game_width  = 320;         /* size the engine was last reconciled to */
 static int game_height = 224;
-static int frame_width  = 0;          /* size last reported to the front end */
+static int frame_width  = 0;          /* size published to the front end */
 static int frame_height = 0;
+static int field_width  = 0;          /* mode of the field just drawn */
+static int field_height = 0;
 
-/* Called by VIDOGLVdp2SetResolution() (vidogl.c) on the machine thread, at the
-   guest's TVMD write.  It only marks the change: the GL-side resize, the FBO pin
-   and SET_GEOMETRY must run on the frontend thread, in core_apply_resolution(). */
+/* Called by VIDOGLVdp2SetResolution() (vidogl.c) once per field, immediately
+   after SetSaturnResolution() has applied that field's TVMD, on the render
+   thread -- the same one that draws and owns the GL context.
+   This is the only place that knows what the field about to be drawn really is,
+   so the size it records is the one retro_run() publishes (video_cb and
+   SET_GEOMETRY) after that field is drawn: the front end can then never sample
+   a rectangle other than the one the picture was drawn into.  Before this, the
+   published size came from GetNativeResolution() at the top of retro_run(),
+   i.e. the PREVIOUS field's mode, and a mode switch was presented one field
+   late (a 320x224 picture sampled as if it were 704x240, or vice versa).
+   SetSaturnResolution() also derives GlWidth/GlHeight from
+   _Ygl->screen_width/height, which still describe the previous mode, so the
+   field would be squeezed into the old rectangle; install this field's size. */
 static volatile int g_mode_pending;
 void Vdp2ModeChanged(int native_w, int native_h)
 {
+   extern int GlWidth, GlHeight;
+
    if (native_w <= 0 || native_h <= 0)
       return;
-   if (native_w == game_width && native_h == game_height && !g_mode_pending)
-      return;
-   g_mode_pending = 1;
+
+   field_width  = native_w;
+   field_height = native_h;
+
+   _Ygl->screen_width  = native_w;
+   _Ygl->screen_height = native_h;
+   GlWidth  = native_w;
+   GlHeight = native_h;
+
+   if (native_w != game_width || native_h != game_height)
+      g_mode_pending = 1;
 }
 
+/* Bring the engine to the mode the VDP2 last reported.  This is the heavy half
+   (Resize() rebuilds GL objects and re-reads the framebuffer binding), so it
+   must stay outside the engine's draw stack -- and it no longer publishes
+   anything: the front end is told the size of the frame it is actually given,
+   in retro_run() right before video_cb. */
 static void core_apply_resolution(void)
 {
    int nw = 0, nh = 0, interlace = 0;
    GLuint fb;
-   struct retro_system_av_info info;
 
    if (VIDCore == NULL || VIDCore->GetNativeResolution == NULL)
       return;
    VIDCore->GetNativeResolution(&nw, &nh, &interlace);
    if (nw <= 0 || nh <= 0)
       return;
-   if (!g_mode_pending && frame_width > 0 && nw == game_width && nh == game_height)
+   if (!g_mode_pending && nw == game_width && nh == game_height)
       return;
    g_mode_pending = 0;
 
-   game_width = nw;
-   game_height = nh;
-   frame_width = nw;
-   frame_height = nh;
-
    /* on = 1, aspect = FULL: the engine must not letterbox its own frame (the
-      front end scales), and screen_width/height must follow the frame so that
+      front end scales), and screen_width/height follow the frame so that
       SetSaturnResolution() keeps GlWidth/GlHeight at the frame size. */
    fb = (GLuint)(uintptr_t)LibretroFrontFbo();
    if (fb == 0)
       return;
    glBindFramebuffer(GL_FRAMEBUFFER, fb);
-   VIDCore->Resize(0, 0, (unsigned)frame_width, (unsigned)frame_height, 1, FULL);
+   VIDCore->Resize(0, 0, (unsigned)nw, (unsigned)nh, 1, FULL);
    /* YglGLInit() inside Resize re-reads the current framebuffer binding; pin the
       front end's FBO again so the engine does not fall back to 0. */
    _Ygl->default_fbo = fb;
@@ -553,11 +574,8 @@ static void core_apply_resolution(void)
       at 320x224 internally even though the TVMD mode changed). */
    YglRebuildGramebuffer();
 
-   if (environ_cb != NULL) {
-      retro_get_system_av_info(&info);
-      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
-   }
-   LOG_INFO("resolution: %dx%d (interlace=%d)", frame_width, frame_height, interlace);
+   game_width  = nw;
+   game_height = nh;
 }
 
 
@@ -2066,6 +2084,25 @@ RETRO_API void retro_run(void)
             VIDCore->Vdp2DrawEnd() really ran (a skipped field ran VIDDummy's no-op). */
          drew = (frame_ready != ready0);
          if (drew) {
+            /* Publish the size of the field that has just been drawn, then
+               present it: the front end samples exactly the rectangle that
+               holds the picture, even when the VDP2 switched modes for this
+               very field (Vdp2ModeChanged() recorded it during the draw). */
+            if (field_width > 0 &&
+                (field_width != frame_width || field_height != frame_height)) {
+               struct retro_system_av_info info;
+               int iw = 0, ih = 0, il = 0;
+
+               frame_width  = field_width;
+               frame_height = field_height;
+               if (VIDCore != NULL && VIDCore->GetNativeResolution != NULL)
+                  VIDCore->GetNativeResolution(&iw, &ih, &il);
+               if (environ_cb != NULL) {
+                  retro_get_system_av_info(&info);
+                  environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
+               }
+               LOG_INFO("resolution: %dx%d (interlace=%d)", frame_width, frame_height, il);
+            }
             clock_gettime(CLOCK_MONOTONIC, &t1);
             frame_sent = frame_ready;
             video_cb(RETRO_HW_FRAME_BUFFER_VALID,
@@ -2711,6 +2748,17 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    stv_bios_path[0]  = '\0';
    stv_eeprom_dir[0] = '\0';
    stv_bup_path[0]   = '\0';
+
+   /* Geometry: nothing has been drawn yet, so nothing is published and the
+      engine has not been reconciled to any mode.  The first field's
+      Vdp2ModeChanged() sets field_*; retro_run() publishes it before its
+      first video_cb, so the front end never sees the 320x224 placeholder
+      once the engine is running. */
+   game_width = 320;
+   game_height = 224;
+   frame_width = frame_height = 0;
+   field_width = field_height = 0;
+   g_mode_pending = 1;
 
    if (game != NULL) {
       const char *content = game->path;
