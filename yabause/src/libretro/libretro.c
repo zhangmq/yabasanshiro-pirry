@@ -18,19 +18,14 @@
 */
 
 /*
- * PLACEHOLDER CORE — no emulation yet.
+ * libretro core entry points (H700 port).
  *
- * This exists to make the libretro side of the build real before any emulator
- * code is pulled in:
- *   - proves the .so builds, exports the retro_* ABI and loads in a front end
- *   - proves the video/audio callbacks and the LOG_ENABLED logging layer work
- *     from inside a core
- *   - gives a visible test card instead of a black screen
- *
- * It draws a 320x240 RGB565 colour bar pattern with a moving marker and emits
- * silence. Replace render_test_card()/the audio path with the engine once the
- * "standalone engine + one frame present" step starts; the API plumbing here
- * (callbacks, log sink, pixel format, geometry) is meant to survive that step.
+ * The engine is created on the front end's thread by LibretroEngineContextReset()
+ * (hw.context_reset) and runs as the "frontend consumer": the machine thread
+ * posts fields, retro_run() draws them into the front end's FBO and presents
+ * with RETRO_HW_FRAME_BUFFER_VALID.  There are no software frames, so no pixel
+ * format is ever set; geometry is published per field (Vdp2ModeChanged() ->
+ * SET_GEOMETRY + video_cb).
  */
 
 #include <math.h>
@@ -430,13 +425,11 @@ static void *machine_main(void *arg)
 }
 
 #ifdef LOG_ENABLED
-#define CORE_VERSION "1.6.2 (placeholder core)"
+#define CORE_VERSION "1.6.3 (H700 port)"
 #else
-#define CORE_VERSION "1.6.2 (placeholder core, logging off)"
+#define CORE_VERSION "1.6.3 (H700 port, logging off)"
 #endif
 
-#define TEST_W 320
-#define TEST_H 240
 #define AUDIO_FRAMES 735 /* 44100 Hz / 60 fps */
 #define FRAME_LOG_INTERVAL 60
 
@@ -579,7 +572,6 @@ static void core_apply_resolution(void)
 }
 
 
-static uint16_t *frame_buf;
 static int16_t *audio_buf;
 static unsigned frame_count;
 static unsigned frame_ready;
@@ -1289,38 +1281,6 @@ static void core_log_sink(int level, const char *line)
    }
 }
 
-static void render_test_card(void)
-{
-   static const uint16_t colors[8] = {
-       0xFFFF, /* white   */
-       0xFFE0, /* yellow  */
-       0x07FF, /* cyan    */
-       0x07E0, /* green   */
-       0xF81F, /* magenta */
-       0xF800, /* red     */
-       0x001F, /* blue    */
-       0x0000  /* black   */
-   };
-   const unsigned marker_w = 40;
-   const unsigned marker_x = (frame_count * 4) % (TEST_W - marker_w);
-   const unsigned marker_y = TEST_H * 3 / 4;
-   unsigned x, y;
-
-   for (y = 0; y < TEST_H; y++)
-   {
-      uint16_t *row = frame_buf + (size_t)y * TEST_W;
-
-      for (x = 0; x < TEST_W; x++)
-      {
-         uint16_t c = colors[(x * 8) / TEST_W];
-
-         if (y >= marker_y && y < marker_y + 16 && x >= marker_x && x < marker_x + marker_w)
-            c = 0xFFFF;
-         row[x] = c;
-      }
-   }
-}
-
 static struct retro_hw_render_callback hw;
 
 
@@ -1339,7 +1299,6 @@ static void crash_handler(int sig)
 RETRO_API void retro_set_environment(retro_environment_t cb)
 {
    struct retro_log_callback log;
-   enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
 
    environ_cb = cb;
 
@@ -1419,8 +1378,11 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
    if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw))
       LOG_WARN("front end refused SET_HW_RENDER(GLES3)");
 
-   if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
-      LOG_WARN("front end rejected RGB565; it keeps its default pixel format");
+   /* No RETRO_ENVIRONMENT_SET_PIXEL_FORMAT: it describes the software frames a
+      core hands over through video_cb, and this core only ever passes
+      RETRO_HW_FRAME_BUFFER_VALID, so the call would describe a format nothing
+      uses -- in a GL hw-render context front ends answer false and it only
+      produced a misleading "rejected RGB565" warning during their probe. */
 
    /* Core options: the protocol asks for registration as early as possible
       (retro_set_environment).  The table is v2, with the fallback chain down to
@@ -1816,23 +1778,22 @@ PerInterface_struct PERLIBRETROJoy = {
 RETRO_API void retro_init(void)
 {
    frame_count = 0;
-   frame_buf = (uint16_t*)calloc((size_t)TEST_W * TEST_H, sizeof(uint16_t));
    audio_buf = (int16_t*)calloc((size_t)AUDIO_FRAMES * 2, sizeof(int16_t));
 
-   LOG_INFO("placeholder core init: %dx%d RGB565, %d Hz stereo, %.2f fps",
-            TEST_W, TEST_H, 44100, 60.0);
+   /* Nothing here describes a video mode: the frame the front end gets is
+      whatever the engine draws into its FBO (HW render only), so the old
+      "320x240 RGB565" line described a software test card nothing ever saw. */
+   LOG_INFO("core init: %d Hz stereo", 44100);
 }
 
 RETRO_API void retro_deinit(void)
 {
-   LOG_INFO("placeholder core deinit after %u frames", frame_count);
+   LOG_INFO("core deinit after %u frames", frame_count);
    LibretroEngineContextDestroy();
    yab_in_run = 0;
    yab_input_cur = -1;
    pad_cfg_dirty = 1;
-   free(frame_buf);
    free(audio_buf);
-   frame_buf = NULL;
    audio_buf = NULL;
 }
 
@@ -2106,8 +2067,8 @@ RETRO_API void retro_run(void)
             clock_gettime(CLOCK_MONOTONIC, &t1);
             frame_sent = frame_ready;
             video_cb(RETRO_HW_FRAME_BUFFER_VALID,
-                     (unsigned)(frame_width > 0 ? frame_width : TEST_W),
-                     (unsigned)(frame_height > 0 ? frame_height : TEST_H), 0);
+                     (unsigned)(frame_width > 0 ? frame_width : game_width),
+                     (unsigned)(frame_height > 0 ? frame_height : game_height), 0);
             clock_gettime(CLOCK_MONOTONIC, &t2);
             acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
          }
@@ -2134,9 +2095,11 @@ RETRO_API void retro_run(void)
          }
       }
    } else {
+      /* No engine (no game, or the context reset has not run yet): there is no
+         frame to hand over.  The old path filled a software test card that no
+         video_cb ever presented, so it painted nothing while pretending to. */
       if (input_poll_cb != NULL)
          input_poll_cb();
-      render_test_card();
    }
 
    if (!engine_up && audio_batch_cb != NULL)
