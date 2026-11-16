@@ -821,8 +821,14 @@ static void yab_options_read(void)
    opt_rbg_use_compute_shader = !opt_is("yabasanshiro_rbg_use_compute_shader", "disabled");
    opt_texcache_persist       = !opt_is("yabasanshiro_texcache_persist", "disabled");   /* default on */
    opt_interlace_half         =  opt_is("yabasanshiro_interlace_half", "enabled");
-   opt_frameskip              =  opt_is("yabasanshiro_frameskip", "auto");
-   opt_scsp_realtime          =  opt_is("yabasanshiro_scsp_timing", "realtime");
+   /* opt_is() cannot tell "the front end has no such option" from "the value is
+      something else".  For these two the table default is NOT the else branch,
+      so a missing answer must keep the declared default instead of flipping the
+      behaviour the menu shows (auto frameskip = on, SCSP timing = realtime). */
+   v = opt_str("yabasanshiro_frameskip");
+   opt_frameskip     = (v == NULL) ? 1 : (strcmp(v, "auto")     == 0);
+   v = opt_str("yabasanshiro_scsp_timing");
+   opt_scsp_realtime = (v == NULL) ? 1 : (strcmp(v, "realtime") == 0);
 
    opt_sh2coretype = opt_is("yabasanshiro_sh2coretype", "interpreter")
                      ? SH2CORE_INTERPRETER : 3;
