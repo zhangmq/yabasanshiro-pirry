@@ -42,7 +42,6 @@
 #include <execinfo.h>
 #include <unistd.h>
 #include <time.h>
-#include <sys/stat.h>
 #include <GLES3/gl3.h>
 
 #include "yabause.h"
@@ -91,9 +90,9 @@ static void on_event_posted(void)
 
 static int engine_up;
 static const char *libretro_content_path;
-static char libretro_bup_path[512];
 static char libretro_bios_path[512];
 static char libretro_save_dir[512];
+static char libretro_bup_path[512];   /* <save>/yabasanshiro.bup (Saturn card) */
 static char libretro_system_dir[512];
 
 /* ST-V (Sega Titan Video): the content is a MAME romset zip, not a disc.  The
@@ -103,8 +102,7 @@ static int   stv_mode;
 static char *stv_game;              /* romset name; owned (STVGetSingle strdup) */
 static int   stv_rotated;           /* per-title rotation, latched at load time */
 static char  stv_bios_path[512];    /* <system>/stvbios.zip */
-static char  stv_eeprom_dir[512];   /* <save>/stv/  (per-game .nv) */
-static char  stv_bup_path[512];     /* <save>/stv/<game>.ram */
+static char  stv_eeprom_dir[512];   /* the front end's save dir (per-game .nv) */
 static char  stv_content_path[512]; /* our copy: game->path is call-scoped */
 
 /* The frontend's save-RAM slot (RETRO_MEMORY_SAVE_RAM) is the engine's backup
@@ -113,7 +111,7 @@ static char  stv_content_path[512]; /* our copy: game->path is call-scoped */
 static u8  sram_shadow[YABA_INTERNAL_BUP_SIZE];
 static int sram_apply_pending = 0; /* push shadow -> BupRam once BupRam exists */
 static void set_memory_maps(void);
-static void sram_seed_from_backup(const char *path);
+static void sram_format_fresh(void);
 static void sram_sync(void);
 /* Disk control: the front end registers the callbacks in retro_init(), so
    set_initial_image() (front end calls it before retro_load_game) can reach
@@ -183,6 +181,24 @@ extern int YabLoadStateBuffer(const void *buffer, size_t size);
 extern void Vdp2AfterLoadState(void);
 extern int stv_eeprom_persist;   /* stv.c: gates EEPROM read and write */
 static volatile int g_mode_pending;   /* defined further down; used by the state command */
+
+/* Is RETRO_MEMORY_SAVE_RAM offered to the front end right now?
+
+   It exists only between a successful retro_load_game() and retro_unload_game().
+   On ST-V the card is the front end's file (<content>.srm / <rom>.sav), and the
+   EEPROM persistence option owns the machine's NVRAM as a whole: with it off the
+   front end must not hand us a card from an earlier session either, so the slot
+   is reported as absent (NULL/0) and both ends skip the read and the write --
+   every boot gets a freshly formatted 64 KB card.  Saturn content is untouched:
+   there the same slot is the console's own backup RAM. */
+static int save_ram_visible(void)
+{
+   if (!content_loaded)
+      return 0;
+   if (stv_mode && !stv_eeprom_persist)
+      return 0;
+   return 1;
+}
 
 /* Engine work of one command.  Runs on the machine thread normally, and on the
    frontend thread when no machine thread exists (nothing can race then). */
@@ -799,7 +815,7 @@ static int  opt_cd_volume = 100;
 static int  opt_mute_cdda;                     /* ScspSetCddaMute, machine */
 static int  opt_sfx_volume = 100;
 static int  opt_stv_region = STV_REGION_EU;   /* ST-V BIOS region preference */
-static int  opt_stv_eeprom_save;                /* write <save>/stv/<game>.nv on exit? */
+static int  opt_stv_eeprom_save;                /* write <save>/<game>.nv on exit? */
 static int  opt_stv_service;                  /* Test/Service/Pause keys */
 
 /* Engine-side hooks without a header of their own. */
@@ -1150,17 +1166,19 @@ void LibretroEngineContextReset(void)
       if (stv_mode) {
          /* ST-V board: no disc and no Saturn BIOS; stv.c assembles the romset
             into the CART_ROMSTV image and installs the ST-V BIOS in BiosRom.
-            The backup RAM is the board's own 64 KB card, per game (Kronos). */
+            The backup RAM is the board's 64 KB card; it reaches the disk as
+            the frontend's save RAM (RETRO_MEMORY_SAVE_RAM -> <content>.srm),
+            so the engine gets no file of its own and starts a fresh card. */
          yinit.carttype        = CART_ROMSTV;
          yinit.cdcoretype      = CDCORE_DUMMY;
          yinit.cdpath          = NULL;
          yinit.biospath        = NULL;
          yinit.extend_backup   = 0;
-         yinit.buppath         = stv_bup_path[0] ? stv_bup_path : NULL;
+         yinit.buppath         = NULL;
          yinit.stvgamepath     = libretro_content_path;
          yinit.stvgame         = stv_game;
          yinit.stvbiospath     = stv_bios_path;
-         yinit.eepromdir       = stv_eeprom_dir;
+         yinit.eepromdir       = stv_eeprom_dir[0] ? stv_eeprom_dir : ".";
          yinit.stv_favorite_region = opt_stv_region;
          LOG_INFO("engine: ST-V mode romset=%s region=%s eeprom=%s",
                   stv_game ? stv_game : "(none)",
@@ -1335,7 +1353,7 @@ void LibretroEngineContextDestroy(void)
       audio_async_ok = 0;
    }
    if (stv_mode) {
-      /* STVDeInit() is the only path that writes <save>/stv/<game>.nv
+      /* STVDeInit() is the only path that writes <save>/<game>.nv
          (eeprom_deinit() -> T123Save()).  It must run before YabauseDeInit()
          frees the cartridge whose board owns the EEPROM, and only when the
          option asks for it: the EEPROM is machine NVRAM, not game data. */
@@ -1376,6 +1394,58 @@ static void core_log_sink(int level, const char *line)
       if ((int)level == (int)RETRO_LOG_DEBUG)
          level = (int)RETRO_LOG_INFO;
       frontend_log((enum retro_log_level)level, "%s", line);
+   }
+}
+
+/* The protocol's directories, asked of the front end through
+   RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY (BIOS and other game-agnostic files)
+   and RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY (anything the core persists for a
+   title).  Both answers belong to the front end and may follow the content
+   (RetroArch's save directory moves into the content's folder when that is how
+   it is configured), so they are resolved again at every load instead of being
+   cached from retro_set_environment.  The core never creates a directory: it
+   writes into the save directory it was given. */
+static void resolve_frontend_paths(retro_environment_t cb, int log)
+{
+   const char *save_dir = NULL;
+   const char *sys_dir  = NULL;
+   static const char *bios_names[] = { "saturn_bios.bin", "sega_101.bin",
+                                       "mpr-17933.bin", "mpr-18811-mx.ic1", NULL };
+   int i;
+
+   if (cb == NULL)
+      return;
+
+   if (cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) && save_dir != NULL) {
+      size_t n;
+      snprintf(libretro_save_dir, sizeof(libretro_save_dir), "%s", save_dir);
+      n = strlen(libretro_save_dir);
+      while (n > 1 && libretro_save_dir[n - 1] == '/')
+         libretro_save_dir[--n] = '\0';
+      /* Saturn's extended backup card (yabsys.extend_backup) is an 8 MB file the
+         engine maps write-through, so it needs a real path; it lives directly in
+         the save directory the front end gave us, next to the ST-V <game>.nv.
+         No subdirectory, and nothing is created here: the engine opens it and
+         formats it on the first run. */
+      snprintf(libretro_bup_path, sizeof(libretro_bup_path), "%s/yabasanshiro.bup",
+               libretro_save_dir);
+      if (log)
+         LOG_INFO("save directory: %s", libretro_save_dir);
+   }
+
+   if (cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sys_dir) && sys_dir != NULL) {
+      snprintf(libretro_system_dir, sizeof(libretro_system_dir), "%s", sys_dir);
+      libretro_bios_path[0] = '\0';
+      for (i = 0; bios_names[i] != NULL; i++) {
+         snprintf(libretro_bios_path, sizeof(libretro_bios_path), "%s/%s",
+                  sys_dir, bios_names[i]);
+         if (access(libretro_bios_path, R_OK) == 0)
+            break;
+         libretro_bios_path[0] = '\0';
+      }
+      if (log)
+         LOG_INFO("bios: dir=%s -> %s", sys_dir,
+                  libretro_bios_path[0] ? libretro_bios_path : "(not found, HLE)");
    }
 }
 
@@ -1432,47 +1502,10 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
                msg_iface_version >= 1 ? "SET_MESSAGE_EXT" : "SET_MESSAGE");
    }
 
-   {
-      const char *save_dir = NULL;
-      bool have_save = cb != NULL && cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir);
-      if (have_save && save_dir != NULL)
-         snprintf(libretro_save_dir, sizeof(libretro_save_dir), "%s", save_dir);
-      /* Same layout as the reference line: the Saturn card is
-         <save>/yabasanshiro/backup.bin and the ST-V EEPROM/card live in
-         <save>/stv/.  Both directories are created here because the engine
-         just fopen()s those paths; without the directory every write fails
-         silently and the card/EEPROM contents are lost on exit. */
-      if (have_save && save_dir != NULL) {
-         char dir[512];
-         snprintf(dir, sizeof(dir), "%s/yabasanshiro", save_dir);
-         (void)mkdir(dir, 0777);
-         snprintf(dir, sizeof(dir), "%s/stv", save_dir);
-         (void)mkdir(dir, 0777);
-         snprintf(libretro_bup_path, sizeof(libretro_bup_path),
-                  "%s/yabasanshiro/backup.bin", save_dir);
-      } else {
-         snprintf(libretro_bup_path, sizeof(libretro_bup_path), "yabasanshiro.bup");
-      }
-      LOG_INFO("bup path (env=%d dir=%s): %s", (int)have_save,
-               save_dir ? save_dir : "(null)", libretro_bup_path);
-
-      {
-         const char *sys_dir = NULL;
-         static const char *names[] = { "saturn_bios.bin", "sega_101.bin",
-                                        "mpr-17933.bin", "mpr-18811-mx.ic1", NULL };
-         int i;
-         if (cb != NULL && cb(RETRO_ENVIRONMENT_GET_SYSTEM_DIRECTORY, &sys_dir) && sys_dir) {
-            snprintf(libretro_system_dir, sizeof(libretro_system_dir), "%s", sys_dir);
-            for (i = 0; names[i] != NULL; i++) {
-               snprintf(libretro_bios_path, sizeof(libretro_bios_path), "%s/%s", sys_dir, names[i]);
-               if (access(libretro_bios_path, R_OK) == 0) break;
-               libretro_bios_path[0] = '\0';
-            }
-            LOG_INFO("bios: dir=%s -> %s", sys_dir,
-                     libretro_bios_path[0] ? libretro_bios_path : "(not found, HLE)");
-         }
-      }
-   }
+   /* Early answer, so the option table and the first logs have something; the
+      same query runs again at every load, when the front end's choice for this
+      content is final. */
+   resolve_frontend_paths(cb, 0);
 
    /* Core options: the protocol asks for registration as early as possible
       (retro_set_environment).  The table is v2, with the fallback chain down to
@@ -2810,24 +2843,6 @@ static int path_ext_is_zip(const char *path)
           (ext[2] == 'p' || ext[2] == 'P') && ext[3] == '\0';
 }
 
-/* <save>/stv, per-game <game>.nv (EEPROM) and <game>.ram (backup card).  The
-   directory is created here because eeprom_deinit()/the backup card save only
-   work when it exists. */
-static void stv_setup_save_dirs(void)
-{
-   const char *save = libretro_save_dir[0] ? libretro_save_dir : ".";
-
-   snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s/stv/", save);
-   if (mkdir(stv_eeprom_dir, 0777) != 0) {
-      struct stat st;
-      if (stat(stv_eeprom_dir, &st) != 0 || !S_ISDIR(st.st_mode))
-         LOG_WARN("ST-V: cannot create %s (EEPROM/backup card will not persist)",
-                  stv_eeprom_dir);
-   }
-   snprintf(stv_bup_path, sizeof(stv_bup_path), "%s%s.ram", stv_eeprom_dir,
-            stv_game != NULL ? stv_game : "stv");
-}
-
 /* Publish the Saturn work-RAM layout so the frontend can address it (cheat
    search, RetroAchievements).  Called once the engine has allocated the
    buffers: same descriptors as the reference line. */
@@ -2861,21 +2876,13 @@ static void set_memory_maps(void)
       environ_cb(RETRO_ENVIRONMENT_SET_MEMORY_MAPS, &mmap);
 }
 
-static void sram_seed_from_backup(const char *path)
+/* Start from a freshly formatted card.  The front end overlays its own file
+   (.srm / .sav) on top of this buffer right after load_game returns, so the
+   core keeps no card file of its own. */
+static void sram_format_fresh(void)
 {
-   FILE *bf = (path != NULL && path[0] != '\0') ? fopen(path, "rb") : NULL;
-   size_t n = 0;
-   if (bf)
-   {
-      n = fread(sram_shadow, 1, sizeof(sram_shadow), bf);
-      fclose(bf);
-      if (n < sizeof(sram_shadow))
-         FormatBackupRam(sram_shadow, sizeof(sram_shadow));
-   }
-   else
-      FormatBackupRam(sram_shadow, sizeof(sram_shadow));
-   LOG_INFO("backup RAM: %s (%s)", (path != NULL && path[0]) ? path : "(none)",
-            (bf && n == sizeof(sram_shadow)) ? "loaded" : "fresh card");
+   FormatBackupRam(sram_shadow, sizeof(sram_shadow));
+   LOG_INFO("backup RAM: front end SAVE_RAM (fresh card)");
    sram_apply_pending = 1;
 }
 
@@ -2927,6 +2934,10 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       return false;
    }
 
+   /* The front end owns these two directories and may have changed them for
+      this content: ask again before anything builds a path from them. */
+   resolve_frontend_paths(environ_cb, 1);
+
    /* A new load starts from scratch: drop the previous title's ST-V state. */
    content_loaded = 0;
    free(stv_game);
@@ -2936,7 +2947,6 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    stv_content_path[0] = '\0';
    stv_bios_path[0]  = '\0';
    stv_eeprom_dir[0] = '\0';
-   stv_bup_path[0]   = '\0';
 
    /* Geometry: nothing has been drawn yet, so nothing is published and the
       engine has not been reconciled to any mode.  The first field's
@@ -2977,10 +2987,20 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
          stv_rotated = STVGetRotated(romset);
          snprintf(stv_content_path, sizeof(stv_content_path), "%s", content);
          libretro_content_path = stv_content_path;
-         stv_setup_save_dirs();
+         /* The EEPROM image is <save>/<game>.nv, directly in the front end's
+            save directory: nothing to create, nothing to nest.  Trailing
+            separators are dropped so paths and logs do not double them. */
+         {
+            size_t n;
+            snprintf(stv_eeprom_dir, sizeof(stv_eeprom_dir), "%s",
+                     libretro_save_dir[0] ? libretro_save_dir : ".");
+            n = strlen(stv_eeprom_dir);
+            while (n > 1 && stv_eeprom_dir[n - 1] == '/')
+               stv_eeprom_dir[--n] = '\0';
+         }
          LOG_INFO("load_game: ST-V romset '%s' from %s (rotation=%d, eeprom=%s, "
-                  "card=%s)", stv_game, content, stv_rotated,
-                  stv_eeprom_dir, stv_bup_path);
+                  "card=frontend save RAM)", stv_game, content, stv_rotated,
+                  stv_eeprom_dir);
       } else {
          /* Content is a disc image or an .m3u playlist of them: build the disc
             list and let the engine boot its first entry.  A vertical ST-V title
@@ -3000,24 +3020,28 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       LOG_INFO("load_game: no content (placeholder)");
    }
 
-   /* Prime the SAVE_RAM shadow from the core's own backup card; the frontend
-      may then overlay its .srm on top before the first machine frame.  This has
-      to happen synchronously here: the frontend reads retro_get_memory_data()
-      right after load_game returns, and the engine is built later (context_reset
-      on the machine thread). */
-   sram_seed_from_backup(stv_mode ? stv_bup_path : libretro_bup_path);
-
-   /* ST-V EEPROM: with the option off (default) the machine starts from the
-      factory table in memory and nothing is written on exit, so a test run
-      always sees the same fresh NVRAM. */
-   if (stv_mode)
-      stv_eeprom_persist = opt_stv_eeprom_save;
+   /* Prime the SAVE_RAM shadow with a freshly formatted card; the front end
+      overlays its own file (.srm/.sav) on top before the first machine frame.
+      The core keeps no card file of its own.  This has to happen
+      synchronously here: the frontend reads retro_get_memory_data() right
+      after load_game returns, and the engine is built later (context_reset on
+      the machine thread). */
+   sram_format_fresh();
 
    /* Core options: restart-type values are latched here, before the engine is
       built.  The video standard has to be known now because the front end asks
       for retro_get_system_av_info() right after load_game returns. */
    yab_options_read();
    yab_videoformat_latch();
+
+   /* ST-V EEPROM persistence.  This has to come after yab_options_read(): the
+      engine reads it when the context reset builds the machine.  Off (the
+      default) starts from the cartridge's own factory image, or blank NVRAM
+      for a cart that ships none, and touches nothing on disk, so every boot is
+      the same fresh NVRAM.  On reads <save>/<game>.nv when it exists (the
+      operator's assignments, coin mode and bookkeeping) and writes it back on
+      a clean unload. */
+   stv_eeprom_persist = stv_mode ? opt_stv_eeprom_save : 0;
 
    /* libretro input protocol: ports, bitmask capability, descriptors. */
    yab_input_ports_init();
@@ -3059,8 +3083,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
       core's own backup card, and the front end overlays its .srm on top right
       after this call returns. */
    content_loaded = 1;
-   LOG_INFO("memory: SAVE_RAM exposed (%u bytes) while content is loaded",
-            (unsigned)sizeof(sram_shadow));
+   if (save_ram_visible())
+      LOG_INFO("memory: SAVE_RAM exposed (%u bytes) while content is loaded",
+               (unsigned)sizeof(sram_shadow));
+   else
+      LOG_INFO("memory: SAVE_RAM not exposed (ST-V persist off: the front end "
+               "neither reads nor writes a backup card)");
 
    return true;
 }
@@ -3087,7 +3115,6 @@ RETRO_API void retro_unload_game(void)
    stv_content_path[0] = '\0';
    stv_bios_path[0]  = '\0';
    stv_eeprom_dir[0] = '\0';
-   stv_bup_path[0]   = '\0';
    players = 2;
    /* The card belongs to the content that was loaded: after this call there is
       no save RAM to report, so SAVE_RAM goes back to NULL/0. */
@@ -3102,7 +3129,7 @@ RETRO_API unsigned retro_get_region(void)
 RETRO_API void *retro_get_memory_data(unsigned id)
 {
    switch (id) {
-      case RETRO_MEMORY_SAVE_RAM:   return content_loaded ? sram_shadow : NULL;
+      case RETRO_MEMORY_SAVE_RAM:   return save_ram_visible() ? sram_shadow : NULL;
       case RETRO_MEMORY_SYSTEM_RAM: return HighWram;
       default:                      return NULL;
    }
@@ -3111,7 +3138,7 @@ RETRO_API void *retro_get_memory_data(unsigned id)
 RETRO_API size_t retro_get_memory_size(unsigned id)
 {
    switch (id) {
-      case RETRO_MEMORY_SAVE_RAM:   return content_loaded ? sizeof(sram_shadow) : 0;
+      case RETRO_MEMORY_SAVE_RAM:   return save_ram_visible() ? sizeof(sram_shadow) : 0;
       /* Keep the pair consistent: no pointer means no size (HighWram exists
          only after YabauseInit / before YabauseDeInit). */
       case RETRO_MEMORY_SYSTEM_RAM: return HighWram ? 0x100000 : 0;

@@ -351,9 +351,11 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
 
    {
       "yabasanshiro_stv_eeprom_save",
-      "Save ST-V EEPROM on exit",
+      "Persist ST-V NVRAM and backup card",
       NULL,
-      "ST-V only: write <save>/stv/<game>.nv on exit.",
+      "ST-V only: keep <save>/<game>.nv (EEPROM: assignments, coin mode, "
+      "bookkeeping) and the backup card (SAVE_RAM, the front end's .srm/.sav). "
+      "Off: a fresh NVRAM and a fresh card every boot, nothing read or written.",
       NULL,
       "system",
       {
