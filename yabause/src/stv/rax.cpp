@@ -2192,7 +2192,13 @@ extern "C" int RaxLoadState(void *fpv)
    start = ftell(fp);
    if (fread(&magic, sizeof(magic), 1, fp) != 1)
       return -1;
-   if ((magic & 0xFFFF0000u) != (RAX_STATE_MAGIC & 0xFFFF0000u)) {
+   /* RAX_STATE_EMPTY sits in the same word as the magic, so it has to be
+      masked out before comparing: without this a state written while the
+      board was absent (every Saturn save, there is no board) fails the check
+      above, the chunk is dropped with a warning and the EMPTY branch below is
+      never reached. */
+   if ((magic & (0xFFFF0000u & ~RAX_STATE_EMPTY)) !=
+       (RAX_STATE_MAGIC & (0xFFFF0000u & ~RAX_STATE_EMPTY))) {
       LOG_WARN("rax: state chunk has magic %08X, expected %08X", (unsigned)magic,
                (unsigned)RAX_STATE_MAGIC);
       return -1;
@@ -2200,8 +2206,9 @@ extern "C" int RaxLoadState(void *fpv)
    if (magic & RAX_STATE_EMPTY) {
       /* Written with the board absent (or when the worker could not be
          parked): leave the current board alone, which is what the old states
-         without this chunk did anyway. */
-      LOG_WARN("rax: state carries no board payload, keeping the current board");
+         without this chunk did anyway.  Normal on Saturn, where no RAX board
+         exists at all, so it is not a warning. */
+      LOG_INFO("rax: state carries no board payload, keeping the current board");
       return (int)(ftell(fp) - start);
    }
    if (!st.present || !st.inited) {

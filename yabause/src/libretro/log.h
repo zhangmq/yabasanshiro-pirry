@@ -52,6 +52,7 @@ extern "C" {
 #define LOG_LVL_DEBUG 0
 #define LOG_LVL_INFO  1
 #define LOG_LVL_WARN  2
+#define LOG_LVL_ERROR 3
 
 /* line is NUL terminated, includes the trailing newline, and is only valid
    for the duration of the call. */
@@ -77,6 +78,9 @@ void LogPrintf(int level, const char *fmt, ...);
 #define LOG_DEBUG(...) ((void)0)
 #define LOG_INFO(...)  ((void)0)
 #define LOG_WARN(...)  ((void)0)
+/* Callers that pass their own level (log line + front end message) use the
+   function form; it has to compile away the same way. */
+#define LogPrintf(level, ...) ((void)0)
 #define LogLevelEnabled(level) 0
 
 #endif /* LOG_ENABLED */
