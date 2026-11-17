@@ -395,10 +395,10 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
    },
    {
       "yabasanshiro_service_enabled",
-      "Service Mode (ST-V)",
+      "Service Mode (ST-V) (restart)",
       NULL,
-      "ST-V only: expose the cabinet Test/Service/Pause keys "
-      "(L2/R2/L3 by default).",
+      "ST-V only: cabinet Test/Service/Pause keys (L2/R2/L3), read at the "
+      "BIOS/boot screen.",
       NULL,
       "input",
       {

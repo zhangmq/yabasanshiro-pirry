@@ -18,19 +18,14 @@
 */
 
 /*
- * PLACEHOLDER CORE — no emulation yet.
+ * libretro core entry points (H700 port).
  *
- * This exists to make the libretro side of the build real before any emulator
- * code is pulled in:
- *   - proves the .so builds, exports the retro_* ABI and loads in a front end
- *   - proves the video/audio callbacks and the LOG_ENABLED logging layer work
- *     from inside a core
- *   - gives a visible test card instead of a black screen
- *
- * It draws a 320x240 RGB565 colour bar pattern with a moving marker and emits
- * silence. Replace render_test_card()/the audio path with the engine once the
- * "standalone engine + one frame present" step starts; the API plumbing here
- * (callbacks, log sink, pixel format, geometry) is meant to survive that step.
+ * The engine is created on the front end's thread by LibretroEngineContextReset()
+ * (hw.context_reset) and runs as the "frontend consumer": the machine thread
+ * posts fields, retro_run() draws them into the front end's FBO and presents
+ * with RETRO_HW_FRAME_BUFFER_VALID.  There are no software frames, so no pixel
+ * format is ever set; geometry is published per field (Vdp2ModeChanged() ->
+ * SET_GEOMETRY + video_cb).
  */
 
 #include <math.h>
@@ -120,6 +115,10 @@ static int sram_apply_pending = 0; /* push shadow -> BupRam once BupRam exists *
 static void set_memory_maps(void);
 static void sram_seed_from_backup(const char *path);
 static void sram_sync(void);
+/* Disk control: the front end registers the callbacks in retro_init(), so
+   set_initial_image() (front end calls it before retro_load_game) can reach
+   us; the image list itself is built later, in retro_load_game(). */
+static void disk_register_interface(void);
 
 /* engine-side caller mode: retro_run drains the VDP event queue (A+token) */
 extern void Vdp2SetFrontendConsumer(int on);
@@ -166,6 +165,11 @@ static size_t cmd_load_size;
 static void *cmd_save_buf;
 static size_t cmd_save_size;
 static size_t state_size;          /* stable retro_serialize_size() */
+/* RETRO_MEMORY_SAVE_RAM exists only while content is loaded: between the
+   successful retro_load_game() and retro_unload_game().  Outside that window
+   there is nothing to hand out and the protocol wants NULL/0 ("or NULL when
+   not available"), not a pointer to a zero-filled buffer. */
+static int content_loaded;
 /* YAB_CMD_DISC payload: open the tray (path unused), or close it on this image. */
 static int cmd_disc_eject;
 static char cmd_disc_path[YAB_PATH_MAX];
@@ -218,6 +222,8 @@ static int yab_cmd_exec(int type, const void *load, size_t load_size,
          ok = 1;
       } else if (disc_path != NULL && disc_path[0] != '\0') {
          ok = (Cs2ForceCloseTray(CDCORE_ISO, disc_path) == 0) ? 1 : 0;
+      } else {
+         LOG_WARN("disc: engine tray close without a path");
       }
    }
    return ok;
@@ -430,13 +436,11 @@ static void *machine_main(void *arg)
 }
 
 #ifdef LOG_ENABLED
-#define CORE_VERSION "1.6.2 (placeholder core)"
+#define CORE_VERSION "1.6.3 (H700 port)"
 #else
-#define CORE_VERSION "1.6.2 (placeholder core, logging off)"
+#define CORE_VERSION "1.6.3 (H700 port, logging off)"
 #endif
 
-#define TEST_W 320
-#define TEST_H 240
 #define AUDIO_FRAMES 735 /* 44100 Hz / 60 fps */
 #define FRAME_LOG_INTERVAL 60
 
@@ -483,6 +487,10 @@ static retro_input_poll_t input_poll_cb;
 static retro_input_state_t input_state_cb;
 
 static retro_log_printf_t frontend_log;
+/* RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION (env 59) as answered by the
+   front end: 0 = only the legacy SET_MESSAGE, 1 = SET_MESSAGE_EXT as well
+   (libretro.h:2088-2101).  A front end that does not answer reads as 0. */
+static unsigned msg_iface_version;
 
 /* ------------------------------------------------------------------------- *
  * Resolution / geometry (libretro protocol)
@@ -499,52 +507,73 @@ static retro_log_printf_t frontend_log;
 
 void *LibretroFrontFbo(void);
 
-static int game_width  = 320;         /* current native Saturn mode */
+static int game_width  = 320;         /* size the engine was last reconciled to */
 static int game_height = 224;
-static int frame_width  = 0;          /* size last reported to the front end */
+static int frame_width  = 0;          /* size published to the front end */
 static int frame_height = 0;
+static int field_width  = 0;          /* mode of the field just drawn */
+static int field_height = 0;
 
-/* Called by VIDOGLVdp2SetResolution() (vidogl.c) on the machine thread, at the
-   guest's TVMD write.  It only marks the change: the GL-side resize, the FBO pin
-   and SET_GEOMETRY must run on the frontend thread, in core_apply_resolution(). */
+/* Called by VIDOGLVdp2SetResolution() (vidogl.c) once per field, immediately
+   after SetSaturnResolution() has applied that field's TVMD, on the render
+   thread -- the same one that draws and owns the GL context.
+   This is the only place that knows what the field about to be drawn really is,
+   so the size it records is the one retro_run() publishes (video_cb and
+   SET_GEOMETRY) after that field is drawn: the front end can then never sample
+   a rectangle other than the one the picture was drawn into.  Before this, the
+   published size came from GetNativeResolution() at the top of retro_run(),
+   i.e. the PREVIOUS field's mode, and a mode switch was presented one field
+   late (a 320x224 picture sampled as if it were 704x240, or vice versa).
+   SetSaturnResolution() also derives GlWidth/GlHeight from
+   _Ygl->screen_width/height, which still describe the previous mode, so the
+   field would be squeezed into the old rectangle; install this field's size. */
 static volatile int g_mode_pending;
 void Vdp2ModeChanged(int native_w, int native_h)
 {
+   extern int GlWidth, GlHeight;
+
    if (native_w <= 0 || native_h <= 0)
       return;
-   if (native_w == game_width && native_h == game_height && !g_mode_pending)
-      return;
-   g_mode_pending = 1;
+
+   field_width  = native_w;
+   field_height = native_h;
+
+   _Ygl->screen_width  = native_w;
+   _Ygl->screen_height = native_h;
+   GlWidth  = native_w;
+   GlHeight = native_h;
+
+   if (native_w != game_width || native_h != game_height)
+      g_mode_pending = 1;
 }
 
+/* Bring the engine to the mode the VDP2 last reported.  This is the heavy half
+   (Resize() rebuilds GL objects and re-reads the framebuffer binding), so it
+   must stay outside the engine's draw stack -- and it no longer publishes
+   anything: the front end is told the size of the frame it is actually given,
+   in retro_run() right before video_cb. */
 static void core_apply_resolution(void)
 {
    int nw = 0, nh = 0, interlace = 0;
    GLuint fb;
-   struct retro_system_av_info info;
 
    if (VIDCore == NULL || VIDCore->GetNativeResolution == NULL)
       return;
    VIDCore->GetNativeResolution(&nw, &nh, &interlace);
    if (nw <= 0 || nh <= 0)
       return;
-   if (!g_mode_pending && frame_width > 0 && nw == game_width && nh == game_height)
+   if (!g_mode_pending && nw == game_width && nh == game_height)
       return;
    g_mode_pending = 0;
 
-   game_width = nw;
-   game_height = nh;
-   frame_width = nw;
-   frame_height = nh;
-
    /* on = 1, aspect = FULL: the engine must not letterbox its own frame (the
-      front end scales), and screen_width/height must follow the frame so that
+      front end scales), and screen_width/height follow the frame so that
       SetSaturnResolution() keeps GlWidth/GlHeight at the frame size. */
    fb = (GLuint)(uintptr_t)LibretroFrontFbo();
    if (fb == 0)
       return;
    glBindFramebuffer(GL_FRAMEBUFFER, fb);
-   VIDCore->Resize(0, 0, (unsigned)frame_width, (unsigned)frame_height, 1, FULL);
+   VIDCore->Resize(0, 0, (unsigned)nw, (unsigned)nh, 1, FULL);
    /* YglGLInit() inside Resize re-reads the current framebuffer binding; pin the
       front end's FBO again so the engine does not fall back to 0. */
    _Ygl->default_fbo = fb;
@@ -553,15 +582,11 @@ static void core_apply_resolution(void)
       at 320x224 internally even though the TVMD mode changed). */
    YglRebuildGramebuffer();
 
-   if (environ_cb != NULL) {
-      retro_get_system_av_info(&info);
-      environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &info.geometry);
-   }
-   LOG_INFO("resolution: %dx%d (interlace=%d)", frame_width, frame_height, interlace);
+   game_width  = nw;
+   game_height = nh;
 }
 
 
-static uint16_t *frame_buf;
 static int16_t *audio_buf;
 static unsigned frame_count;
 static unsigned frame_ready;
@@ -606,6 +631,26 @@ static void reset_gl_state_for_frontend(const char *tag)
 void *LibretroFrontFbo(void)
 {
    return hw.get_current_framebuffer ? (void *)(uintptr_t)hw.get_current_framebuffer() : NULL;
+}
+
+/* Render target for the next field.  The front end can rebuild its FBO without
+   a context reset (window or resolution change), so the callback is asked again
+   every frame and its answer bound before anything is drawn into it -- S2:
+   "You must call this every frame as it can change every frame".  A zero answer
+   keeps the previous target: drawing into 0 would be the real backbuffer,
+   which a hw-render core must not touch. */
+static void bind_frontend_fbo(void)
+{
+   GLuint fb;
+   if (_Ygl == NULL)
+      return;
+   fb = (GLuint)(uintptr_t)LibretroFrontFbo();
+   if (fb == 0)
+      return;
+   if (fb != _Ygl->default_fbo) {
+      _Ygl->default_fbo = fb;
+   }
+   glBindFramebuffer(GL_FRAMEBUFFER, fb);
 }
 
 int LibretroHasVideo(void)
@@ -811,8 +856,14 @@ static void yab_options_read(void)
    opt_rbg_use_compute_shader = !opt_is("yabasanshiro_rbg_use_compute_shader", "disabled");
    opt_texcache_persist       = !opt_is("yabasanshiro_texcache_persist", "disabled");   /* default on */
    opt_interlace_half         =  opt_is("yabasanshiro_interlace_half", "enabled");
-   opt_frameskip              =  opt_is("yabasanshiro_frameskip", "auto");
-   opt_scsp_realtime          =  opt_is("yabasanshiro_scsp_timing", "realtime");
+   /* opt_is() cannot tell "the front end has no such option" from "the value is
+      something else".  For these two the table default is NOT the else branch,
+      so a missing answer must keep the declared default instead of flipping the
+      behaviour the menu shows (auto frameskip = on, SCSP timing = realtime). */
+   v = opt_str("yabasanshiro_frameskip");
+   opt_frameskip     = (v == NULL) ? 1 : (strcmp(v, "auto")     == 0);
+   v = opt_str("yabasanshiro_scsp_timing");
+   opt_scsp_realtime = (v == NULL) ? 1 : (strcmp(v, "realtime") == 0);
 
    opt_sh2coretype = opt_is("yabasanshiro_sh2coretype", "interpreter")
                      ? SH2CORE_INTERPRETER : 3;
@@ -988,6 +1039,61 @@ static void yab_options_apply(void)
    }
 }
 
+/* Front end message: the one call site every user-facing error goes through.
+   Two protocol shapes, chosen by what the front end answered to env 59:
+     - version >= 1: RETRO_ENVIRONMENT_SET_MESSAGE_EXT (duration in ms,
+       priority, level, target, type, progress; libretro.h:7429-7521), which the
+       protocol tells new code to prefer;
+     - version 0: the legacy RETRO_ENVIRONMENT_SET_MESSAGE (text + core frames;
+       libretro.h:795-833), which every message-capable front end must still
+       support.
+   The same text goes through the log sink first, so a message exists in one
+   copy only: a LOG_LEVEL=warn run still logs it, a front end without any
+   message interface still shows it in its log, and nothing is written twice.
+   Thread: callers are all on the front end's thread (retro_load_game, the hw
+   context reset, retro_run, the disk control callbacks) -- the thread the
+   libretro environment may be called from. */
+static void yab_osd(int level, unsigned priority, unsigned duration_ms,
+                    const char *fmt, ...)
+{
+   char text[256];
+   va_list ap;
+   double fps;
+
+   va_start(ap, fmt);
+   vsnprintf(text, sizeof(text), fmt, ap);
+   va_end(ap);
+
+   LogPrintf(level, "%s", text);
+
+   if (environ_cb == NULL || text[0] == '\0')
+      return;
+
+   if (msg_iface_version >= 1) {
+      struct retro_message_ext m;
+      memset(&m, 0, sizeof(m));
+      m.msg      = text;
+      m.duration = duration_ms;
+      m.priority = priority;
+      m.level    = (enum retro_log_level)level;
+      /* Both destinations: the OSD copy is what the player sees, the log copy
+         is what a headless run keeps (libretro.h:7315-7355). */
+      m.target   = RETRO_MESSAGE_TARGET_ALL;
+      m.type     = RETRO_MESSAGE_TYPE_NOTIFICATION;
+      m.progress = -1;   /* only RETRO_MESSAGE_TYPE_PROGRESS carries a value */
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE_EXT, &m);
+   } else {
+      struct retro_message m;
+      /* Legacy shape counts core frames, so it needs the rate av_info publishes
+         (retro_get_system_av_info): a PAL title shows the message as long as an
+         NTSC one instead of 20% longer. */
+      fps = (opt_videoformat_latched == VIDEOFORMATTYPE_PAL) ? 50.0 : 60.0;
+      m.msg    = text;
+      m.frames = (unsigned)(fps * (double)duration_ms / 1000.0 + 0.5);
+      environ_cb(RETRO_ENVIRONMENT_SET_MESSAGE, &m);
+   }
+}
+
 void LibretroEngineContextReset(void)
 {
    if (engine_up) return;
@@ -1087,7 +1193,10 @@ void LibretroEngineContextReset(void)
                      "YAB_TEXCACHE_PERSIST=%s (option wanted %d)",
                      g_texcache_persist, tp, opt_texcache_persist);
       }
-      if (YabauseInit(&yinit) != 0) { LOG_WARN("YabauseInit failed"); return; }
+      if (YabauseInit(&yinit) != 0) {
+         yab_osd(LOG_LVL_ERROR, 3, 5000, "YabauseInit failed");
+         return;
+      }
       set_memory_maps();   /* HighWram/LowWram exist only after YabauseInit() */
       if (stv_mode) {
          /* The front end may already have asked for av_info before this
@@ -1180,7 +1289,6 @@ void LibretroEngineContextReset(void)
    {
       extern void *LibretroFrontFbo(void);
       _Ygl->default_fbo = (GLuint)(uintptr_t)LibretroFrontFbo();
-      LOG_INFO("engine render target: default_fbo=%u", _Ygl->default_fbo);
    }
    reset_gl_state_for_frontend("after-init");
    }
@@ -1271,38 +1379,6 @@ static void core_log_sink(int level, const char *line)
    }
 }
 
-static void render_test_card(void)
-{
-   static const uint16_t colors[8] = {
-       0xFFFF, /* white   */
-       0xFFE0, /* yellow  */
-       0x07FF, /* cyan    */
-       0x07E0, /* green   */
-       0xF81F, /* magenta */
-       0xF800, /* red     */
-       0x001F, /* blue    */
-       0x0000  /* black   */
-   };
-   const unsigned marker_w = 40;
-   const unsigned marker_x = (frame_count * 4) % (TEST_W - marker_w);
-   const unsigned marker_y = TEST_H * 3 / 4;
-   unsigned x, y;
-
-   for (y = 0; y < TEST_H; y++)
-   {
-      uint16_t *row = frame_buf + (size_t)y * TEST_W;
-
-      for (x = 0; x < TEST_W; x++)
-      {
-         uint16_t c = colors[(x * 8) / TEST_W];
-
-         if (y >= marker_y && y < marker_y + 16 && x >= marker_x && x < marker_x + marker_w)
-            c = 0xFFFF;
-         row[x] = c;
-      }
-   }
-}
-
 static struct retro_hw_render_callback hw;
 
 
@@ -1321,7 +1397,6 @@ static void crash_handler(int sig)
 RETRO_API void retro_set_environment(retro_environment_t cb)
 {
    struct retro_log_callback log;
-   enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_RGB565;
 
    environ_cb = cb;
 
@@ -1339,21 +1414,22 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
       }
    }
 
-   memset(&hw, 0, sizeof(hw));
-   hw.context_type       = RETRO_HW_CONTEXT_OPENGLES3;
-   hw.version_major      = 3;
-   hw.version_minor      = 0;
-   hw.depth              = true;
-   hw.stencil            = true;
-   hw.bottom_left_origin = true;
-   hw.context_reset      = LibretroEngineContextReset;
-   hw.context_destroy    = LibretroEngineContextDestroy;
-
    /* Only valid from retro_set_environment() or retro_init(). */
    if (cb != NULL && cb(RETRO_ENVIRONMENT_GET_LOG_INTERFACE, &log) && log.log != NULL)
    {
       frontend_log = log.log;
       LogSetSink(core_log_sink);
+   }
+
+   /* Message interface version (env 59).  Asked once here: this is the earliest
+      covered point, before retro_load_game can fail and want to say why. */
+   {
+      unsigned ver = 0;
+      if (cb != NULL && cb(RETRO_ENVIRONMENT_GET_MESSAGE_INTERFACE_VERSION, &ver))
+         msg_iface_version = ver;
+      LOG_INFO("osd: front end message interface version %u (%s)",
+               msg_iface_version,
+               msg_iface_version >= 1 ? "SET_MESSAGE_EXT" : "SET_MESSAGE");
    }
 
    {
@@ -1397,12 +1473,6 @@ RETRO_API void retro_set_environment(retro_environment_t cb)
          }
       }
    }
-
-   if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw))
-      LOG_WARN("front end refused SET_HW_RENDER(GLES3)");
-
-   if (cb != NULL && !cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
-      LOG_WARN("front end rejected RGB565; it keeps its default pixel format");
 
    /* Core options: the protocol asks for registration as early as possible
       (retro_set_environment).  The table is v2, with the fallback chain down to
@@ -1798,24 +1868,32 @@ PerInterface_struct PERLIBRETROJoy = {
 RETRO_API void retro_init(void)
 {
    frame_count = 0;
-   frame_buf = (uint16_t*)calloc((size_t)TEST_W * TEST_H, sizeof(uint16_t));
    audio_buf = (int16_t*)calloc((size_t)AUDIO_FRAMES * 2, sizeof(int16_t));
 
-   LOG_INFO("placeholder core init: %dx%d RGB565, %d Hz stereo, %.2f fps",
-            TEST_W, TEST_H, 44100, 60.0);
+   /* Disk control belongs here, not in retro_load_game: libretro.h:6854-6856
+      warns that a core registering it in retro_load_game "may not" receive
+      set_initial_image(), which the front end calls immediately before loading
+      content (retro_disk_control_ext_callback: "Sets the disk image that will be
+      inserted ... before retro_load_game is called").  The image list stays
+      empty until retro_load_game() fills it. */
+   disk_register_interface();
+
+   /* Nothing here describes a video mode: the frame the front end gets is
+      whatever the engine draws into its FBO (HW render only), so the old
+      "320x240 RGB565" line described a software test card nothing ever saw. */
+   LOG_INFO("core init: %d Hz stereo", 44100);
 }
 
 RETRO_API void retro_deinit(void)
 {
-   LOG_INFO("placeholder core deinit after %u frames", frame_count);
+   LOG_INFO("core deinit after %u frames", frame_count);
    LibretroEngineContextDestroy();
    yab_in_run = 0;
    yab_input_cur = -1;
    pad_cfg_dirty = 1;
-   free(frame_buf);
    free(audio_buf);
-   frame_buf = NULL;
    audio_buf = NULL;
+   content_loaded = 0;
 }
 
 RETRO_API unsigned retro_api_version(void)
@@ -1844,36 +1922,55 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
    info->block_extract = true;
 }
 
+/* 0 or 1: the only rotation this core ever asks for.  ST-V titles with a
+   vertical board (the game list's ROTATED flag) render sideways; a Saturn title
+   reports 0.  Latched by retro_load_game, so it cannot change mid-session. */
+static unsigned yab_rotation(void)
+{
+   if (!stv_mode)
+      return 0;
+   return (unsigned)(yabsys.isRotated != 0 || stv_rotated);
+}
+
+/* The geometry of the frame the engine last published.  One implementation for
+   both callers: retro_get_system_av_info() (the front end asking) and the
+   per-field RETRO_ENVIRONMENT_SET_GEOMETRY in retro_run() (the mode changed).
+   Offsets, rotation and rounding live here only; a second copy in either
+   caller would be the kind of fork this project avoids. */
+static void yab_fill_geometry(struct retro_game_geometry *geom)
+{
+   memset(geom, 0, sizeof(*geom));
+   geom->base_width = (unsigned)(frame_width > 0 ? frame_width : game_width);
+   geom->base_height = (unsigned)(frame_height > 0 ? frame_height : game_height);
+   /* The front end allocates its hw-render FBO from these; understating them
+      (the old 320x240) left no room for the hi-res modes.  SET_GEOMETRY ignores
+      them, the av_info answer must carry them. */
+   geom->max_width = GEOMETRY_MAX_W;
+   geom->max_height = GEOMETRY_MAX_H;
+   /* Saturn pixels are not square: every TV mode (320/352/704 wide) is 4:3. */
+   geom->aspect_ratio = 4.0f / 3.0f;
+   /* Inverted only while rotated, so the front end's own width/height swap
+      lands on the right box. */
+   if (yab_rotation() != 0)
+      geom->aspect_ratio = 1.0f / geom->aspect_ratio;
+}
+
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->geometry.base_width = (unsigned)(frame_width > 0 ? frame_width : game_width);
-   info->geometry.base_height = (unsigned)(frame_height > 0 ? frame_height : game_height);
-   /* The front end allocates its hw-render FBO from these; understating them
-      (the old 320x240) left no room for the hi-res modes. */
-   info->geometry.max_width = GEOMETRY_MAX_W;
-   info->geometry.max_height = GEOMETRY_MAX_H;
-   /* Saturn pixels are not square: every TV mode (320/352/704 wide) is 4:3. */
-   info->geometry.aspect_ratio = 4.0f / 3.0f;
+   yab_fill_geometry(&info->geometry);
    info->timing.fps = (opt_videoformat_latched == VIDEOFORMATTYPE_PAL) ? 50.0 : 60.0;
    info->timing.sample_rate = 44100.0;
 
-   /* Vertical ST-V boards render sideways and the front end is asked to turn
-      the picture.  The command is sent unconditionally (0 included): a front
-      end keeps the last value it was handed (minarch's ma_gl_rotation is a
-      plain static), so silence would leave the previous title's rotation on.
-      The aspect ratio is inverted only while rotated, so the front end's own
-      width/height swap lands on the right box.  The latch from retro_load_game
-      covers the front ends that ask for av_info before the engine is built;
-      yabsys.isRotated (set by YabauseInit) is the authoritative value later. */
+   /* Ask the front end to turn the picture (vertical ST-V titles).  Sent
+      unconditionally, 0 included: a front end keeps the last value it was
+      handed (minarch's ma_gl_rotation is a plain static), so silence would
+      leave the previous title's rotation on.  Only here -- a per-field
+      SET_GEOMETRY must not re-announce a value that cannot change. */
    {
-      unsigned rotation = 0;
-      if (stv_mode)
-         rotation = (unsigned)(yabsys.isRotated != 0 || stv_rotated);
+      unsigned rotation = yab_rotation();
       if (environ_cb != NULL)
          environ_cb(RETRO_ENVIRONMENT_SET_ROTATION, &rotation);
-      if (rotation != 0)
-         info->geometry.aspect_ratio = 1.0f / info->geometry.aspect_ratio;
    }
 }
 
@@ -2017,6 +2114,9 @@ RETRO_API void retro_run(void)
          outside the render stack (a change is then visible one field late, which
          is what the standalone's fixed window hides anyway). */
       core_apply_resolution();
+      /* The target may have changed since the last frame even without a
+         resize, so re-ask before this frame's draw and bind the answer. */
+      bind_frontend_fbo();
       /* One call = one video frame (libretro.h:9357).  A field that autoframeskip drops
          presents nothing -- the standalone does not swap on a skipped field either -- so the
          call keeps running fields until one is actually drawn, and only that field's
@@ -2066,11 +2166,41 @@ RETRO_API void retro_run(void)
             VIDCore->Vdp2DrawEnd() really ran (a skipped field ran VIDDummy's no-op). */
          drew = (frame_ready != ready0);
          if (drew) {
+            /* Publish the size of the field that has just been drawn, then
+               present it: the front end samples exactly the rectangle that
+               holds the picture, even when the VDP2 switched modes for this
+               very field (Vdp2ModeChanged() recorded it during the draw). */
+            if (field_width > 0 &&
+                (field_width != frame_width || field_height != frame_height)) {
+               struct retro_game_geometry geom;
+               int iw = 0, ih = 0, il = 0;
+
+               frame_width  = field_width;
+               frame_height = field_height;
+               if (VIDCore != NULL && VIDCore->GetNativeResolution != NULL)
+                  VIDCore->GetNativeResolution(&iw, &ih, &il);
+               if (environ_cb != NULL) {
+                  /* The same geometry the front end would get from
+                     retro_get_system_av_info(), without that call's side
+                     effects: the rotation was announced at load and cannot
+                     change here, so it is not re-sent every mode change. */
+                  yab_fill_geometry(&geom);
+                  environ_cb(RETRO_ENVIRONMENT_SET_GEOMETRY, &geom);
+               }
+               LOG_INFO("resolution: %dx%d (interlace=%d)", frame_width, frame_height, il);
+            }
+            /* S2: hand the context back with nothing of ours bound.  The
+               engine already unbinds its program (cache-consistent), VBOs and
+               vertex attributes in render_finish, and it rebinds the texture
+               it needs at the start of every draw, so only the texture unit
+               is left to clear here. */
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, 0);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             frame_sent = frame_ready;
             video_cb(RETRO_HW_FRAME_BUFFER_VALID,
-                     (unsigned)(frame_width > 0 ? frame_width : TEST_W),
-                     (unsigned)(frame_height > 0 ? frame_height : TEST_H), 0);
+                     (unsigned)(frame_width > 0 ? frame_width : game_width),
+                     (unsigned)(frame_height > 0 ? frame_height : game_height), 0);
             clock_gettime(CLOCK_MONOTONIC, &t2);
             acc_present_ms += (t2.tv_sec - t1.tv_sec) * 1e3 + (t2.tv_nsec - t1.tv_nsec) / 1e6;
          }
@@ -2097,9 +2227,11 @@ RETRO_API void retro_run(void)
          }
       }
    } else {
+      /* No engine (no game, or the context reset has not run yet): there is no
+         frame to hand over.  The old path filled a software test card that no
+         video_cb ever presented, so it painted nothing while pretending to. */
       if (input_poll_cb != NULL)
          input_poll_cb();
-      render_test_card();
    }
 
    if (!engine_up && audio_batch_cb != NULL)
@@ -2350,8 +2482,17 @@ RETRO_API void retro_cheat_set(unsigned index, bool enabled, const char *code)
  * ------------------------------------------------------------------------- */
 #define YAB_MAX_DISKS 16
 
+/* disk_paths[] keeps what the playlist wrote, verbatim: a relative entry stays
+   relative.  get_image_path() hands that string to the front end, which records
+   it and compares it verbatim on the next load (set_initial_image), so a rename
+   or move of the whole folder keeps matching.  disk_resolved[] is the openable
+   form the engine and the emulated CD block use; it is never shown. */
 static char     disk_paths[YAB_MAX_DISKS][YAB_PATH_MAX];
+static char     disk_resolved[YAB_MAX_DISKS][YAB_PATH_MAX];
 static char     disk_labels[YAB_MAX_DISKS][YAB_PATH_MAX];
+/* Directory part of the content (the playlist's directory for an .m3u), used to
+   resolve relative entries and a disc the front end inserts while running. */
+static char     disk_content_dir[YAB_PATH_MAX];
 static unsigned disk_count;
 static unsigned disk_index;
 static unsigned disk_initial_idx;
@@ -2366,6 +2507,21 @@ static const char *disk_basename(const char *path)
 {
    const char *slash = strrchr(path, '/');
    return (slash != NULL) ? slash + 1 : path;
+}
+
+/* Openable form of one image: a relative entry is joined to the content's
+   directory, an absolute one is used as-is.  Never shown to the front end. */
+static void disk_resolve(const char *entry, char *out, size_t size)
+{
+   if (entry == NULL || entry[0] == '\0' || out == NULL || size == 0) {
+      if (out != NULL && size > 0)
+         out[0] = '\0';
+      return;
+   }
+   if (entry[0] == '/' || disk_content_dir[0] == '\0')
+      snprintf(out, size, "%s", entry);
+   else
+      snprintf(out, size, "%s%s", disk_content_dir, entry);
 }
 
 static int disk_ext_is_m3u(const char *path)
@@ -2405,16 +2561,25 @@ static void disk_set_label_from_path(unsigned idx)
 
 static bool disk_set_eject_state(bool ejected)
 {
-   if (!ejected && (disk_index >= disk_count || disk_paths[disk_index][0] == '\0'))
+   if (!ejected && (disk_index >= disk_count ||
+                    disk_resolved[disk_index][0] == '\0')) {
+      yab_osd(LOG_LVL_WARN, 2, 3000,
+              "disc: tray close refused: image %u of %u, openable path empty",
+              disk_index, disk_count);
       return false;
+   }
    /* Before the engine exists there is no CD block to move: the front end's
       request is still the initial state, so recording it is all it needs. */
    if (engine_up && !yab_disc_cmd(ejected ? 1 : 0,
-                                  ejected ? NULL : disk_paths[disk_index]))
+                                  ejected ? NULL : disk_resolved[disk_index])) {
+      yab_osd(LOG_LVL_WARN, 2, 3000,
+              "disc: tray %s failed: the engine refused the command",
+              ejected ? "eject" : "close");
       return false;
+   }
    if (!ejected)
       snprintf(content_path_buf, sizeof(content_path_buf), "%s",
-               disk_paths[disk_index]);
+               disk_resolved[disk_index]);
    disk_tray_open = ejected ? 1 : 0;
    return true;
 }
@@ -2425,6 +2590,13 @@ static unsigned disk_get_num_images(void)  { return disk_count; }
 
 static bool disk_set_image_index(unsigned index)
 {
+   /* libretro.h:6761-6763: "Can only be called while the disk tray is ejected",
+      and the return value is false when it is not. */
+   if (!disk_tray_open) {
+      yab_osd(LOG_LVL_WARN, 2, 3000,
+              "disc: set image %u refused: tray is closed", index);
+      return false;
+   }
    /* The media changes when the tray closes (disk_set_eject_state(false)); here
       only the image to insert is recorded.  index == disk_count is the front
       end's "no disc" sentinel. */
@@ -2432,8 +2604,11 @@ static bool disk_set_image_index(unsigned index)
       disk_index = index;
       return true;
    }
-   if (index >= disk_count)
+   if (index >= disk_count) {
+      yab_osd(LOG_LVL_WARN, 2, 3000,
+              "disc: set image %u refused: only %u image(s)", index, disk_count);
       return false;
+   }
    disk_index = index;
    return true;
 }
@@ -2444,10 +2619,21 @@ static bool disk_replace_image_index(unsigned index,
    if (index >= YAB_MAX_DISKS)
       return false;
 
+   /* libretro.h:6790-6794: "Virtual disk tray must be ejected when calling this." */
+   if (!disk_tray_open) {
+      yab_osd(LOG_LVL_WARN, 2, 3000,
+              "disc: replace image %u refused: tray is closed", index);
+      return false;
+   }
+
    if (info == NULL || info->path == NULL) {   /* remove this image */
       unsigned i;
-      if (index >= disk_count)
+      if (index >= disk_count) {
+         yab_osd(LOG_LVL_WARN, 2, 3000,
+                 "disc: remove image %u refused: only %u image(s)", index,
+                 disk_count);
          return false;
+      }
       for (i = index; i + 1 < disk_count; i++)
          snprintf(disk_paths[i], YAB_PATH_MAX, "%s", disk_paths[i + 1]);
       if (disk_count > 0)
@@ -2458,6 +2644,7 @@ static bool disk_replace_image_index(unsigned index,
    }
 
    snprintf(disk_paths[index], YAB_PATH_MAX, "%s", info->path);
+   disk_resolve(info->path, disk_resolved[index], YAB_PATH_MAX);
    disk_set_label_from_path(index);
    if (index >= disk_count)
       disk_count = index + 1;
@@ -2531,12 +2718,16 @@ static void disk_init_from_content(const char *content_path)
    disk_index     = 0;
    disk_tray_open = 0;
 
+   /* Base for the relative entries disk_resolve() has to make openable.  Reset
+      every load: a previous title's directory must not leak into this list. */
+   disk_content_dir[0] = '\0';
+   if (content_path != NULL && content_path[0] != '\0')
+      disk_dirname(content_path, disk_content_dir, sizeof(disk_content_dir));
+
    if (content_path != NULL && content_path[0] != '\0' &&
        disk_ext_is_m3u(content_path)) {
-      char basedir[YAB_PATH_MAX];
       char line[YAB_PATH_MAX];
       FILE *fp;
-      disk_dirname(content_path, basedir, sizeof(basedir));
       fp = fopen(content_path, "r");
       if (fp != NULL) {
          while (fgets(line, sizeof(line), fp) != NULL && disk_count < YAB_MAX_DISKS) {
@@ -2556,10 +2747,8 @@ static void disk_init_from_content(const char *content_path)
                *--end = '\0';
             if (*p == '\0')
                continue;
-            if (*p == '/')
-               snprintf(disk_paths[disk_count], YAB_PATH_MAX, "%s", p);
-            else
-               snprintf(disk_paths[disk_count], YAB_PATH_MAX, "%s%s", basedir, p);
+            snprintf(disk_paths[disk_count], YAB_PATH_MAX, "%s", p);
+            disk_resolve(p, disk_resolved[disk_count], YAB_PATH_MAX);
             disk_set_label_from_path(disk_count);
             disk_count++;
          }
@@ -2571,6 +2760,7 @@ static void disk_init_from_content(const char *content_path)
    if (disk_count == 0) {   /* single image, or an empty/unreadable playlist */
       if (content_path != NULL && content_path[0] != '\0') {
          snprintf(disk_paths[0], YAB_PATH_MAX, "%s", content_path);
+         snprintf(disk_resolved[0], YAB_PATH_MAX, "%s", content_path);
          disk_set_label_from_path(0);
          disk_count = 1;
       }
@@ -2586,14 +2776,16 @@ static void disk_init_from_content(const char *content_path)
 
    if (disk_count > 0)
       snprintf(content_path_buf, sizeof(content_path_buf), "%s",
-               disk_paths[disk_index]);
+               disk_resolved[disk_index]);
    else
       content_path_buf[0] = '\0';
 }
 
 /* env 57 says which disk-control struct the front end understands; the ext form
-   (env 58) supersedes the original one (env 13). */
-static void disk_register(void)
+   (env 58) supersedes the original one (env 13).  Called from retro_init: the
+   list is still empty here, which is fine (get_num_images() answers 0 until the
+   content is loaded). */
+static void disk_register_interface(void)
 {
    unsigned version = 0;
    if (environ_cb == NULL)
@@ -2603,8 +2795,8 @@ static void disk_register(void)
       environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_EXT_INTERFACE, &disk_ext_cb);
    else
       environ_cb(RETRO_ENVIRONMENT_SET_DISK_CONTROL_INTERFACE, &disk_cb);
-   LOG_INFO("disk: control interface registered, %u image(s), boot=%s",
-            disk_count, content_path_buf[0] ? content_path_buf : "(none)");
+   LOG_INFO("disk: control interface registered in retro_init (env 57 said %u)",
+            version);
 }
 
 /* "x.zip" (case-insensitive) */
@@ -2702,7 +2894,41 @@ static void sram_sync(void)
 
 RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
+   /* The render target's format is whatever this call answers, and the front
+      end builds the FBO before context_reset can hand it to us: RetroArch on
+      GLES gives a 32-bit RGBA8 target only to a core that asks for 32-bit,
+      else a 16-bit one the engine's 8-bit output gets quantised into.  No
+      pixels cross video_cb (it only ever passes RETRO_HW_FRAME_BUFFER_VALID),
+      so the format describes the FBO, not a frame; the deprecated 0RGB1555
+      default described neither. */
+   {
+      enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
+      if (environ_cb != NULL && !environ_cb(RETRO_ENVIRONMENT_SET_PIXEL_FORMAT, &fmt))
+         LOG_WARN("front end refused SET_PIXEL_FORMAT(XRGB8888)");
+   }
+
+   /* S1:973 and S2 put the hardware-render request in load_game, not in
+      set_environment: the front end creates the context only once the content
+      is accepted, and a front end that refuses GLES3 has to fail the load
+      here -- this core has no software frame path to fall back to. */
+   memset(&hw, 0, sizeof(hw));
+   hw.context_type       = RETRO_HW_CONTEXT_OPENGLES3;
+   hw.version_major      = 3;
+   hw.version_minor      = 0;
+   hw.depth              = true;
+   hw.stencil            = true;
+   hw.bottom_left_origin = true;
+   hw.context_reset      = LibretroEngineContextReset;
+   hw.context_destroy    = LibretroEngineContextDestroy;
+   if (environ_cb == NULL || !environ_cb(RETRO_ENVIRONMENT_SET_HW_RENDER, &hw)) {
+      yab_osd(LOG_LVL_ERROR, 3, 5000,
+              "front end refused SET_HW_RENDER(GLES3); no software path, "
+              "failing the load");
+      return false;
+   }
+
    /* A new load starts from scratch: drop the previous title's ST-V state. */
+   content_loaded = 0;
    free(stv_game);
    stv_game = NULL;
    stv_mode = 0;
@@ -2711,6 +2937,17 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    stv_bios_path[0]  = '\0';
    stv_eeprom_dir[0] = '\0';
    stv_bup_path[0]   = '\0';
+
+   /* Geometry: nothing has been drawn yet, so nothing is published and the
+      engine has not been reconciled to any mode.  The first field's
+      Vdp2ModeChanged() sets field_*; retro_run() publishes it before its
+      first video_cb, so the front end never sees the 320x224 placeholder
+      once the engine is running. */
+   game_width = 320;
+   game_height = 224;
+   frame_width = frame_height = 0;
+   field_width = field_height = 0;
+   g_mode_pending = 1;
 
    if (game != NULL) {
       const char *content = game->path;
@@ -2723,14 +2960,16 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 
          snprintf(stv_bios_path, sizeof(stv_bios_path), "%s/stvbios.zip", sysdir);
          if (access(stv_bios_path, R_OK) != 0) {
-            LOG_WARN("ST-V: %s is missing; a romset cannot be identified "
-                      "without the ST-V BIOS", stv_bios_path);
+            yab_osd(LOG_LVL_ERROR, 3, 5000,
+                    "ST-V: %s is missing; a romset cannot be identified "
+                    "without the ST-V BIOS", stv_bios_path);
             return false;
          }
          STVGetSingle(content, stv_bios_path, &romset);
          if (romset == NULL) {
-            LOG_WARN("ST-V: %s has no romset in the game list; this core does "
-                      "not read zipped Saturn images", content);
+            yab_osd(LOG_LVL_ERROR, 3, 5000,
+                    "ST-V: %s has no romset in the game list; this core does "
+                    "not read zipped Saturn images", content);
             return false;
          }
          stv_mode = 1;
@@ -2810,10 +3049,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
          LOG_INFO("audio: env62 buffer status refused");
    }
 
-   /* Disk control: the front end's disc list for this content.  An ST-V romset
-      has no disc to swap. */
+   /* Disk control: the front end's disc list for this content (the interface
+      itself was registered in retro_init).  An ST-V romset has no disc to swap. */
    if (!stv_mode)
-      disk_register();
+      LOG_INFO("disk: %u image(s), boot=%s", disk_count,
+               content_path_buf[0] ? content_path_buf : "(none)");
+
+   /* From here on the save-RAM shadow is valid: it was seeded above from the
+      core's own backup card, and the front end overlays its .srm on top right
+      after this call returns. */
+   content_loaded = 1;
+   LOG_INFO("memory: SAVE_RAM exposed (%u bytes) while content is loaded",
+            (unsigned)sizeof(sram_shadow));
 
    return true;
 }
@@ -2842,6 +3089,9 @@ RETRO_API void retro_unload_game(void)
    stv_eeprom_dir[0] = '\0';
    stv_bup_path[0]   = '\0';
    players = 2;
+   /* The card belongs to the content that was loaded: after this call there is
+      no save RAM to report, so SAVE_RAM goes back to NULL/0. */
+   content_loaded = 0;
 }
 
 RETRO_API unsigned retro_get_region(void)
@@ -2852,7 +3102,7 @@ RETRO_API unsigned retro_get_region(void)
 RETRO_API void *retro_get_memory_data(unsigned id)
 {
    switch (id) {
-      case RETRO_MEMORY_SAVE_RAM:   return sram_shadow;
+      case RETRO_MEMORY_SAVE_RAM:   return content_loaded ? sram_shadow : NULL;
       case RETRO_MEMORY_SYSTEM_RAM: return HighWram;
       default:                      return NULL;
    }
@@ -2861,8 +3111,10 @@ RETRO_API void *retro_get_memory_data(unsigned id)
 RETRO_API size_t retro_get_memory_size(unsigned id)
 {
    switch (id) {
-      case RETRO_MEMORY_SAVE_RAM:   return sizeof(sram_shadow);
-      case RETRO_MEMORY_SYSTEM_RAM: return 0x100000;
+      case RETRO_MEMORY_SAVE_RAM:   return content_loaded ? sizeof(sram_shadow) : 0;
+      /* Keep the pair consistent: no pointer means no size (HighWram exists
+         only after YabauseInit / before YabauseDeInit). */
+      case RETRO_MEMORY_SYSTEM_RAM: return HighWram ? 0x100000 : 0;
       default:                      return 0;
    }
 }

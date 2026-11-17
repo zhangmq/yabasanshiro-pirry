@@ -9102,20 +9102,21 @@ void VIDOGLVdp2SetResolution(u16 TVMD)
     break;
   }
 
+  SetSaturnResolution(width, height);
+
 #ifdef __LIBRETRO__
-  /* The window size IS the frontend frame size here, and SetSaturnResolution()
-     derives GlWidth/GlHeight from _Ygl->screen_width/height -- which would still
-     be the previous mode's value, so this field would be drawn with the old
-     viewport.  Give the port a chance to install the new size first.  The weak
-     symbol keeps the standalone linkable, but this file is libretro-only code:
-     the standalone has no such hook and must keep 1.6.2 behaviour untouched. */
+  /* SetSaturnResolution() derived GlWidth/GlHeight from _Ygl->screen_width/
+     height, which still describe the PREVIOUS mode, so the field about to be
+     drawn would use the old rectangle.  This hook runs after it: it records
+     this field's mode, installs it as the rectangle, and retro_run() publishes
+     exactly that size to the front end (video_cb / SET_GEOMETRY).  The weak
+     symbol keeps the standalone linkable: only this port needs the hook. */
   {
     extern void Vdp2ModeChanged(int w, int h) __attribute__((weak));
     if (Vdp2ModeChanged)
       Vdp2ModeChanged(width, height);
   }
 #endif
-  SetSaturnResolution(width, height);
   Vdp1SetTextureRatio(wratio, hratio);
 }
 

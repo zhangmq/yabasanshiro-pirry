@@ -38,6 +38,8 @@ static const char *level_name(int level)
 {
    switch (level)
    {
+      case LOG_LVL_ERROR:
+         return "error";
       case LOG_LVL_WARN:
          return "warn";
       case LOG_LVL_DEBUG:

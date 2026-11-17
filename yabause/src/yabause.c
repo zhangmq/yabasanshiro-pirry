@@ -53,6 +53,10 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #ifdef __LIBRETRO__
 #include "stv.h"
 #include "rax.h"
+#include "log.h"
+#if !defined(_WIN32) && !defined(WIN32)
+#include <unistd.h>   /* fileno()/ftruncate() for the backup card file */
+#endif
 #endif
 #include "cheat.h"
 #include "cs0.h"
@@ -228,7 +232,68 @@ int YabauseInit(yabauseinit_struct *init)
    yabsys.extend_backup = init->extend_backup;
    if (yabsys.extend_backup) {
      FILE * pbackup;
+#ifdef __LIBRETRO__
+     long fsize;   /* backup card file length, see the block below */
+#endif
      bupfilename = init->buppath;
+#ifdef __LIBRETRO__
+     /* libretro only.  The shared code below opens the card with "a+b",
+        so every write lands at EOF: a card whose header this emulator
+        does not recognise (e.g. one the real BIOS formatted) was
+        "formatted" on every launch, which only appended another
+        card-sized block and could never repair the header -- the Saturn
+        card file grew by 8 MB per launch.  Here the file is opened for
+        update, a non-empty file is never re-formatted (it is the
+        player's card), and the length is normalised to the card size so
+        an already bloated file shrinks on the next launch.  Standalone
+        keeps the original path; this block is the upstream candidate.
+        See .notes/CURRENT/BACKUP-BIN-GROWTH-20261117.md */
+     pbackup = fopen(bupfilename, "r+b");
+     if (pbackup == NULL) {
+       pbackup = fopen(bupfilename, "w+b");   /* no card yet: create it */
+       if (pbackup == NULL) {
+         YabSetError(YAB_ERR_CANNOTINIT, _("InternalBackup"));
+         return -1;
+       }
+     }
+
+     fseek(pbackup, 0, SEEK_END);
+     fsize = (long)ftell(pbackup);
+     if (fsize == 0) {
+       fseek(pbackup, 0, SEEK_SET);
+       FormatBackupRamFile(pbackup, tweak_backup_file_size);
+       LOG_INFO("backup: new card formatted (%u bytes)",
+                (unsigned)tweak_backup_file_size);
+     }
+     else {
+       fseek(pbackup, 0, SEEK_SET);
+       if (CheckBackupFile(pbackup) != 0)
+         LOG_INFO("backup: header is not this emulator's layout, card "
+                  "kept as-is (%ld bytes)", fsize);
+
+       if (fsize < (long)tweak_backup_file_size) {
+         ExtendBackupFile(pbackup, tweak_backup_file_size);
+         LOG_INFO("backup: card extended %ld -> %u bytes", fsize,
+                  (unsigned)tweak_backup_file_size);
+       }
+       else if (fsize > (long)tweak_backup_file_size) {
+         fflush(pbackup);
+#if defined(_WIN32) || defined(WIN32)
+         LOG_WARN("backup: card file is %ld bytes, expected %u: cannot "
+                  "shrink it on this platform", fsize,
+                  (unsigned)tweak_backup_file_size);
+#else
+         if (ftruncate(fileno(pbackup), (off_t)tweak_backup_file_size) != 0)
+           LOG_WARN("backup: cannot shrink card file %ld -> %u bytes",
+                    fsize, (unsigned)tweak_backup_file_size);
+         else
+           LOG_WARN("backup: card file shrunk %ld -> %u bytes (dropped "
+                    "blocks appended by older builds)", fsize,
+                    (unsigned)tweak_backup_file_size);
+#endif
+       }
+     }
+#else
      pbackup = fopen(bupfilename, "a+b");
      if (pbackup == NULL) {
        YabSetError(YAB_ERR_CANNOTINIT, _("InternalBackup"));
@@ -242,6 +307,7 @@ int YabauseInit(yabauseinit_struct *init)
      else {
        ExtendBackupFile(pbackup, tweak_backup_file_size);
      }
+#endif
      fclose(pbackup);
      BupRam = YabMemMap(bupfilename, tweak_backup_file_size);
      if (BupRam == NULL) {  // fall back to old version
