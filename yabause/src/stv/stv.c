@@ -19,7 +19,7 @@
 #include "yabause.h"
 #include "eeprom.h"
 
-/* 1 = read <save>/stv/<game>.nv at boot and write it on exit; 0 (default) =
+/* 1 = read <save>/<game>.nv at boot and write it on exit; 0 (default) =
    fresh in-memory NVRAM, the file is neither read nor written.  Set from the
    libretro core option yabasanshiro_stv_eeprom_save. */
 int stv_eeprom_persist = 0;
@@ -3153,6 +3153,37 @@ int STVGetRotated(const char *romset){
   return 0;
 }
 
+/* Put the EEPROM into the state the machine boots from, then honour the
+   persistence option.  The in-memory content is always built here; unless
+   persistence asks for it, nothing is read from or written to the disk.
+
+   loadGame() has already applied the cartridge's own factory image when the
+   romset carries one (EEPROM_BLOB, e.g. sss.nv); a cart without one starts
+   from blank NVRAM, which is the state MAME's zero-filled "eeprom" region
+   has.  With persistence on, a saved image -- the operator's assignments,
+   coin mode and bookkeeping -- replaces that content, and STVDeInit() writes
+   it back. */
+static void stv_eeprom_prepare(const char *eepromdir, const char *romset) {
+  char eeprom_path[4096];
+  snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
+  if (hasEeprom)
+    eeprom_set_path(eeprom_path);
+  else
+    eeprom_blank(eeprom_path);
+#ifdef __LIBRETRO__
+  if (!stv_eeprom_persist)
+    LOG_INFO("ST-V EEPROM: %s in memory only; %s neither read nor written (persist off)",
+             hasEeprom ? "cartridge factory image" : "blank NVRAM", eeprom_path);
+  else if (eeprom_load_image(eeprom_path))
+    LOG_INFO("ST-V EEPROM: saved image loaded from %s", eeprom_path);
+  else
+    LOG_INFO("ST-V EEPROM: %s in memory, no saved image at %s yet",
+             hasEeprom ? "cartridge factory image" : "blank NVRAM", eeprom_path);
+#else
+  if (stv_eeprom_persist) (void)eeprom_load_image(eeprom_path);
+#endif
+}
+
 int STVSingleInit(const char *gamepath, const char *biospath, const char *eepromdir, int favorite_region) {
   int nbGame = 0;
   char *romset = NULL;
@@ -3161,20 +3192,9 @@ int STVSingleInit(const char *gamepath, const char *biospath, const char *eeprom
   if (favorite_region != 0) stv_favorite_region = favorite_region;
   if ((gamepath == NULL) || (biospath == NULL)) return -1;
   nbGame = STVGetSingle(gamepath, biospath, &romset);
+  hasEeprom = 0;
   if (loadGame(romset) == 0) {
-    char eeprom_path[4096];
-    snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
-    if (stv_eeprom_persist) {
-      eeprom_init(eeprom_path);
-      #ifdef __LIBRETRO__
-      LOG_INFO("ST-V EEPROM: loaded from %s", eeprom_path);
-#endif
-    } else {
-      eeprom_init_fresh(eeprom_path);
-      #ifdef __LIBRETRO__
-      LOG_INFO("ST-V EEPROM: fresh in-memory NVRAM (persist off; %s neither read nor written)", eeprom_path);
-#endif
-    }
+    stv_eeprom_prepare(eepromdir, romset);
     /* DecAthlete's cart carries the 315-5838 compression/encryption chip. */
     if (strcmp(romset, "decathlt") == 0 || strcmp(romset, "decathlto") == 0)
       STVCompEnable(STVCOMP_315_5838);
@@ -3203,20 +3223,9 @@ int STVInit(const char* romset, const char *path, const char *eepromdir, int fav
 //   if (nbGames == 0) return -1;
 //   if (nbGames <= id) return -1;
 // #endif
+  hasEeprom = 0;
   if (loadGame(romset) == 0) {
-    char eeprom_path[4096];
-    snprintf(eeprom_path, sizeof(eeprom_path), "%s/%s.nv", eepromdir, romset);
-    if (stv_eeprom_persist) {
-      eeprom_init(eeprom_path);
-      #ifdef __LIBRETRO__
-      LOG_INFO("ST-V EEPROM: loaded from %s", eeprom_path);
-#endif
-    } else {
-      eeprom_init_fresh(eeprom_path);
-      #ifdef __LIBRETRO__
-      LOG_INFO("ST-V EEPROM: fresh in-memory NVRAM (persist off; %s neither read nor written)", eeprom_path);
-#endif
-    }
+    stv_eeprom_prepare(eepromdir, romset);
     /* DecAthlete's cart carries the 315-5838 compression/encryption chip. */
     if (strcmp(romset, "decathlt") == 0 || strcmp(romset, "decathlto") == 0)
       STVCompEnable(STVCOMP_315_5838);
