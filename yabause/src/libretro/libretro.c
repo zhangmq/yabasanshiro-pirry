@@ -807,6 +807,11 @@ static int  opt_frameskip = 0;
 static int  opt_scsp_realtime;                  /* SCSP Timing: wall clock 68k? */
 static int  opt_sh2coretype = 3;                /* dynarec (DYNAREC_DEVMIYAX) */
 static int  opt_addon_cart = CART_DRAM32MBIT;
+/* "Region" core option: the area the emulated SMPC reports (smpc.c: SmpcInit).
+   0 = auto, i.e. the engine's own detection (the first area code of the disc
+   header, cs2.c: Cs2GetIP).  Values are the SMPC area codes yabause uses
+   throughout: J=1 T=2 U=4 B=5 K=6 A=0xA E=0xC L=0xD. */
+static int  opt_region = 0;
 static int  opt_force_hle_bios = 0;
 static int  opt_system_language = 0;
 static int  opt_multitap[2];
@@ -887,6 +892,16 @@ static void yab_options_read(void)
    if (opt_is("yabasanshiro_addon_cart", "none"))                 opt_addon_cart = CART_NONE;
    else if (opt_is("yabasanshiro_addon_cart", "1M_extended_ram")) opt_addon_cart = CART_DRAM8MBIT;
    else                                                           opt_addon_cart = CART_DRAM32MBIT;
+
+   if (opt_is("yabasanshiro_region", "japan"))       opt_region = 0x1;
+   else if (opt_is("yabasanshiro_region", "taiwan")) opt_region = 0x2;
+   else if (opt_is("yabasanshiro_region", "usa"))    opt_region = 0x4;
+   else if (opt_is("yabasanshiro_region", "brazil")) opt_region = 0x5;
+   else if (opt_is("yabasanshiro_region", "korea"))  opt_region = 0x6;
+   else if (opt_is("yabasanshiro_region", "asia"))   opt_region = 0xA;
+   else if (opt_is("yabasanshiro_region", "europe")) opt_region = 0xC;
+   else if (opt_is("yabasanshiro_region", "latam"))  opt_region = 0xD;
+   else                                              opt_region = 0;   /* auto */
 
    opt_force_hle_bios = opt_is("yabasanshiro_force_hle_bios", "enabled");
 
@@ -1153,7 +1168,11 @@ void LibretroEngineContextReset(void)
       yinit.basetime        = 0;
       yinit.cartpath        = NULL;
       yinit.mpegpath        = NULL;
-      yinit.regionid        = 0;
+      /* Saturn area the console reports.  0 keeps the engine's own detection
+         (first area code of the disc header): a multi-area disc such as a USA
+         release typed "TUK" would then run as Taiwan, and the BIOS rejects the
+         console/disc pair.  Both VDP cores share this field. */
+      yinit.regionid        = (u8)opt_region;
       yinit.biospath        = (opt_force_hle_bios || !libretro_bios_path[0])
                               ? NULL : libretro_bios_path;   /* "Force HLE BIOS" */
       yinit.buppath         = libretro_bup_path[0] ? libretro_bup_path : NULL;
@@ -1187,6 +1206,18 @@ void LibretroEngineContextReset(void)
                   opt_stv_region == STV_REGION_TW ? "TW" : "EU",
                   stv_eeprom_dir);
       }
+      LOG_INFO("engine: region=%s (%u), bios=%s",
+               (opt_region == 0)    ? "auto" :
+               (opt_region == 0x1)  ? "Japan" :
+               (opt_region == 0x2)  ? "Taiwan" :
+               (opt_region == 0x4)  ? "USA" :
+               (opt_region == 0x5)  ? "Brazil" :
+               (opt_region == 0x6)  ? "Korea" :
+               (opt_region == 0xA)  ? "Asia" :
+               (opt_region == 0xC)  ? "Europe" :
+               (opt_region == 0xD)  ? "Latin America" : "?",
+               (unsigned)yinit.regionid,
+               (yinit.biospath != NULL) ? yinit.biospath : "(HLE)");
       g_emulated_bios = (yinit.biospath != NULL) ? 0 : 1;   /* standalone: 0 when -b */
       if (stv_mode)
          g_emulated_bios = 0;   /* the ST-V BIOS is real, installed by stv.c */

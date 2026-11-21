@@ -232,6 +232,28 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
       "4M_extended_ram"
    },
    {
+      "yabasanshiro_region",
+      "Region (restart)",
+      NULL,
+      "Area the emulated console reports. Auto takes the first area code of the disc header, "
+      "which a multi-area disc lists in an arbitrary order.",
+      NULL,
+      "system",
+      {
+         { "auto",   "Auto (from the disc)" },
+         { "japan",  "Japan" },
+         { "taiwan", "Taiwan" },
+         { "usa",    "USA" },
+         { "brazil", "Brazil" },
+         { "korea",  "Korea" },
+         { "asia",   "Asia" },
+         { "europe", "Europe" },
+         { "latam",  "Latin America" },
+         { NULL, NULL },
+      },
+      "auto"
+   },
+   {
       "yabasanshiro_force_hle_bios",
       "Force HLE BIOS (restart)",
       NULL,
