@@ -3533,9 +3533,29 @@ const char * ScuGetVectorString(u32 vec) {
 /* Pending timer interrupts are dropped at the next VBlank/HBlank edge, as in
    upstream. Needed by Leynos 2. */
 
+/* SCU DrawEnd is an asynchronous hardware event: the VDP raises it when its drawing is done.
+   Yabause raised it from Vdp1NoDraw() and from the VDP2 wait-line path, i.e. at whatever
+   instruction boundary the emulation thread happened to be at.  Some games rebuild the slave
+   CPU with a short critical section (Die Hard Trilogy's InitSlaveCPU publishes the handshake
+   flags, then restarts the slave through SMPC); an interrupt landing between those two steps
+   leaves the master waiting for an acknowledgement the slave never sends, and the game hangs
+   with a black screen.  Defer the delivery to the VBlank IN boundary, which is where the
+   hardware's frame pacing puts it anyway, and do it here so every VDP core (the shared one and
+   the libretro engine) behaves the same without duplicating the rule. */
+static int ScuDrawEndPending = 0;
+
+static INLINE void ScuSendDrawEndNow(void) {
+   SendInterrupt(0x4D, 0x2, 0x2000, 0x00002000);
+   ScuChekIntrruptDMA(6);
+}
+
 void ScuSendVBlankIN(void) {
    //ScuRemoveHBlankIN();
    ScuRemoveTimer0();
+   if (ScuDrawEndPending) {
+      ScuDrawEndPending = 0;
+      ScuSendDrawEndNow();
+   }
    SendInterrupt(0x40, 0xF, 0x0001, 0x0001);
    ScuChekIntrruptDMA(0);
 }
@@ -3693,8 +3713,8 @@ void ScuSendDMAIllegal(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void ScuSendDrawEnd(void) {
-   SendInterrupt(0x4D, 0x2, 0x2000, 0x00002000);
-   ScuChekIntrruptDMA(6);
+   /* Delivered at the VBlank IN boundary, see ScuSendVBlankIN(). */
+   ScuDrawEndPending = 1;
 }
 
 //////////////////////////////////////////////////////////////////////////////
