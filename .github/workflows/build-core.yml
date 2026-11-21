@@ -1,0 +1,72 @@
+name: build-core
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ci-build]
+    paths:
+      - 'yabause/**'
+      - 'build-libretro.sh'
+      - '.github/workflows/build-core.yml'
+
+jobs:
+  aarch64:
+    name: libretro core (aarch64)
+    runs-on: ubuntu-22.04
+    env:
+      H700_DEPS: ${{ github.workspace }}/deps-aarch64
+      YAB_DEPS_CACHE: ${{ github.workspace }}/deps
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the cross toolchain and the GL headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+            libgles2-mesa-dev libegl-dev
+
+      - name: Prepare H700_DEPS (headers + GL stubs)
+        run: |
+          set -eu
+          mkdir -p "$H700_DEPS/include" "$H700_DEPS/lib"
+          for h in GLES2 GLES3 EGL KHR; do
+            if [ -d "/usr/include/$h" ]; then cp -r "/usr/include/$h" "$H700_DEPS/include/"; fi
+          done
+          printf 'void yab_stub(void) {}\n' > "$RUNNER_TEMP/stub.c"
+          # Link-time stubs with the real SONAMEs: the device provides the real
+          # libraries, so the core records them as DT_NEEDED and resolves the
+          # EGL/GLES entry points at load time.
+          aarch64-linux-gnu-gcc -shared -fPIC -Wl,-soname,libEGL.so.1 \
+            -o "$H700_DEPS/lib/libEGL.so.1" "$RUNNER_TEMP/stub.c"
+          aarch64-linux-gnu-gcc -shared -fPIC -Wl,-soname,libmali.so.0 \
+            -o "$H700_DEPS/lib/libmali.so.0" "$RUNNER_TEMP/stub.c"
+
+      - name: Build
+        run: |
+          ./build-libretro.sh --build build-aarch64 \
+            --toolchain yabause/src/libretro/toolchains/aarch64-linux.cmake
+
+      - name: Report what was built
+        run: |
+          file build-aarch64/yabasanshiro_libretro.so
+          readelf -d build-aarch64/yabasanshiro_libretro.so | grep -E 'NEEDED|RUNPATH'
+          md5sum build-aarch64/yabasanshiro_libretro.so
+
+      - name: Stage the artifact
+        # The .so keeps its canonical name: RetroArch derives a core's id from
+        # the file name (core_info.c strips a trailing "_libretro"), so a suffix
+        # like "-h700-aarch64" would make it a different core with its own
+        # options/save directories and no .info match.  The target goes on the
+        # artifact (directory) name instead.
+        run: |
+          set -eu
+          DIST="dist/yabasanshiro_libretro-aarch64"
+          mkdir -p "$DIST"
+          cp build-aarch64/yabasanshiro_libretro.so "$DIST/"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yabasanshiro_libretro-aarch64
+          path: dist/yabasanshiro_libretro-aarch64/
+          if-no-files-found: error
