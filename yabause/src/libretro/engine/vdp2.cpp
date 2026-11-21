@@ -825,6 +825,13 @@ static int g_vdp_frontend_consumer = 0;
 static void (*g_ev_posted_hook)(void) = NULL;
 extern "C" void Vdp2SetEventPostedHook(void (*fn)(void)) { g_ev_posted_hook = fn; }
 static inline void Vdp2NotifyPosted(void) { if (g_ev_posted_hook) g_ev_posted_hook(); }
+/* Same wake-up, callable from the shared VDP1 code: vdp1.cpp posts
+   VDPEV_DIRECT_DRAW into this queue too, and in caller mode the frontend parks on
+   ev_cv, so an enqueue without this notify leaves it asleep and the machine waits
+   forever for the direct-draw token in Vdp2HBlankOUT (Die Hard Trilogy JP froze
+   that way at line 56 of a field).  In worker mode the hook is not installed and
+   this is a no-op. */
+extern "C" void Vdp2NotifyPostedC(void) { Vdp2NotifyPosted(); }
 extern "C" void Vdp2SetFrontendConsumer(int on) { g_vdp_frontend_consumer = on; }
 
 /* Release every wait the machine can be parked in when the frontend stops
