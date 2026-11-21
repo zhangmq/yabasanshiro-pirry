@@ -547,6 +547,11 @@ extern "C" void FASTCALL Vdp1WriteByte(u32 addr, u8 val) {
 
 extern YabEventQueue * vdp1_rcv_evqueue;
 extern "C" void Vdp1MarkRenderDispatched(void);
+#ifdef __LIBRETRO__
+/* In caller mode the frontend parks on a condvar and only this wake-up releases
+   it; see the definition in libretro/engine/vdp2.cpp. */
+extern "C" void Vdp2NotifyPostedC(void);
+#endif
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -597,6 +602,11 @@ extern "C" void FASTCALL Vdp1WriteWord(u32 addr, u16 val) {
         Vdp1RamSnapshot();
         YabAddEventQueue(evqueue,VDPEV_DIRECT_DRAW);
         Vdp1MarkRenderDispatched();
+#ifdef __LIBRETRO__
+        /* The worker thread waits on the queue itself, but the frontend consumer
+           sleeps on ev_cv: without this it never sees the direct-draw event. */
+        Vdp2NotifyPostedC();
+#endif
         YabThreadYield();
       }
 #else
