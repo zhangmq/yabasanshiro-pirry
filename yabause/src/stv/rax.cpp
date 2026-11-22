@@ -1,4 +1,4 @@
-/* Acclaim RAX sound board -- see rax.h and .notes/CURRENT/RAX-PLAN-20261114.md.
+/* Acclaim RAX sound board -- see rax.h for the design notes.
  *
  * MAME reference (master 2da7fb596daf, 2026-11-14):
  *   src/mame/shared/rax.cpp                 board: host latches, BDMA, timers, SPORT autobuffer
@@ -676,8 +676,8 @@ static void ctrl_wr(unsigned int off, uint16_t data)
       }
 
 #ifdef RAX_TEST_TRACE
-      /* Same line the MAME reference run printed (.notes/ref/rax-old/work/
-         mame-bdma-*.txt); only the host-side harness compiles this. */
+      /* Same line the MAME reference run printed; only the host-side harness
+         compiles this, so the format is fixed by that comparison. */
       printf("[BDMA] cyc=%llu pc=%04X type=%u dir=%u cnt=%u page=%u src=%06X dst=%04X dmovlay=%u dbank=%u rbank=%u abs=%07X\n",
              (unsigned long long)st.cycles_run, (unsigned)st.cpu.pc(),
              (unsigned)type, (unsigned)dir, (unsigned)(data & 0x3FFF), (unsigned)page,
@@ -2281,7 +2281,7 @@ extern "C" int RaxStateChunkPresent(void *fpv)
 
 #ifdef RAX_TEST_TRACE
 /* Host-side harness only: dump one memory region in MAME's `dumpd` text format
-   so it can be diffed against the reference dumps in .notes/ref/rax-old/work.
+   so it can be diffed against a reference dump taken from MAME.
    space: 0 = program (4 words/line, 8 hex digits), 1 = data space as if the
    board's current bank were selected (8 words/line, 4 hex digits). */
 extern "C" void RaxTestDump(const char *path, int space, unsigned addr, unsigned count)

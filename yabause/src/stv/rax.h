@@ -12,8 +12,7 @@
    RaxAdvance(), and the 2x DMADAC pair becomes a stereo FIFO that the SCSP
    output adapter mixes at 44.1 kHz.
 
-   Design notes (why it is shaped this way) are in
-   .notes/CURRENT/RAX-PLAN-20261114.md.  The one rule that matters: the DSP is
+   The one rule that matters: the DSP is
    clocked by the same emulated machine time as the SH-2 and never runs ahead of
    the host's command stream (the sealed first attempt failed exactly there). */
 #ifndef RAX_H

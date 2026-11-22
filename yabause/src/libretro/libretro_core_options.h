@@ -21,10 +21,10 @@
  * Core options, libretro v2 (SET_CORE_OPTIONS_V2), with the canonical
  * fallback chain down to SET_VARIABLES for old front ends.
  *
- * The option set merges two sources (see .notes/CURRENT/REQ-CORE-OPTIONS-20261111.md):
- * the pcsx-style table the h700 branch of projects/yaba carries, and the knobs the
- * standalone's in-game menu exposes.  Naming follows the libretro convention: an
- * option whose value is only read while the core (re)loads a game carries
+ * The option set merges two sources: the pcsx-style table carried over from the
+ * H700 reference port, and the knobs the standalone's in-game menu exposes.
+ * Naming follows the libretro convention: an option whose value is only read
+ * while the core (re)loads a game carries
  * "(restart)" in its name; the front end cannot restart a core by itself, the
  * text is the only signal it can show.
  *

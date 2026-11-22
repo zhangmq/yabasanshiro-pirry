@@ -818,7 +818,7 @@ extern "C" int YabIsRenderThread(void)
 }
 
 
-/* Frontend-consumer mode (A+token, see .notes/CURRENT/DESIGN-THREADMODEL.md): the front end's
+/* Frontend-consumer mode (A+token): the front end's
    thread that calls retro_run is the renderer.  It drains the same event queue the
    worker used to drain, executing exactly the same switch body. */
 static int g_vdp_frontend_consumer = 0;

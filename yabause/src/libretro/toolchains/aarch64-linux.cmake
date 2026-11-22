@@ -11,8 +11,8 @@
 # libEGL/libmali entries; the CI job generates stubs for the two libraries and
 # the device supplies the real ones at run time.
 #
-# The local development build uses .notes/tools/h700-toolchain.cmake instead: it
-# carries the harvested device sysroot and the vendor libraries.
+# A local development build can instead point at a harvested device sysroot with
+# the vendor libraries (H700_TOOLCHAIN / H700_DEPS) so nothing has to be stubbed.
 
 if(NOT YAB_MARCH)
   set(YAB_MARCH "armv8-a+crc")

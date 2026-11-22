@@ -26,7 +26,7 @@
  *   YuiRevokeOGLOnThisThread()  only the retro_run thread may touch it
  *   YuiErrorMsg()               -> front end log (fatal engine errors)
  *
- * Threading contract (see .notes/CURRENT/DESIGN-THREADMODEL.md): the renderer
+ * Threading contract: the renderer
  * runs inside retro_run on the front end's thread, in the front end's context.
  * The machine thread never touches GL.
  */
