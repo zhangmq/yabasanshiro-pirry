@@ -246,8 +246,7 @@ int YabauseInit(yabauseinit_struct *init)
         update, a non-empty file is never re-formatted (it is the
         player's card), and the length is normalised to the card size so
         an already bloated file shrinks on the next launch.  Standalone
-        keeps the original path; this block is the upstream candidate.
-        See .notes/CURRENT/BACKUP-BIN-GROWTH-20261117.md */
+        keeps the original path; this block is the upstream candidate. */
      pbackup = fopen(bupfilename, "r+b");
      if (pbackup == NULL) {
        pbackup = fopen(bupfilename, "w+b");   /* no card yet: create it */
