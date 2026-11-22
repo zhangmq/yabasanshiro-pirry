@@ -2401,7 +2401,17 @@ int getEatClock(u32 src, u32 dst) {
       return 30;
       break;
     case 0x05E00000: // VDP2 RAM
-      return 82;
+      /* A DMA word into VDP2 RAM costs one bus read plus one bus write, not the
+         82-cycle stall this used to charge.  At 82 cycles per word a 2048-word
+         ROM->VRAM tilemap copy stays in flight across hundreds of SH-2 time slices,
+         so the CPU that started it can read the plane back while it is still half
+         filled.  Final Fight Revenge builds its NBG3 name table exactly that way:
+         it starts the DMA and then adds the character base to the same plane in
+         place, so a half-filled plane makes it add the base to stale entries and
+         the background points at the wrong characters (blue stripes over the whole
+         select screen).  2 cycles keeps the transfer inside one slice, which is
+         what the bus actually costs. */
+      return 2;
       break;
     case 0x05F00000: // VDP2 REG
       return 14;
