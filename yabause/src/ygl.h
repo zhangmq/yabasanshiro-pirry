@@ -282,6 +282,14 @@ typedef struct _YglCacheHash {
 	   cached sprites would keep stale values. This generation changes only on a
 	   real register change. */
 	u32 decode_gen;
+	/* Palette dependency: for the palette color modes the decoded texel carries
+	   an alpha computed from the Color RAM entry (Vdp2GetAlpha), so a tile cached
+	   before its palette was loaded keeps a stale alpha. pal_a0..pal_a1 is the
+	   CRAM byte range whose contents were baked in; cram_gen is the CRAM page
+	   stamp generation at decode time. pal_a0 > pal_a1 means "no dependency". */
+	u32 cram_gen;
+	u16 pal_a0;
+	u16 pal_a1;
 	u8  unit;
 	u8  no_alpha0; // opaque fast path, see YglCache.no_alpha0
 } YglCacheHash;
@@ -334,6 +342,9 @@ int YglIsCached(YglTextureManager * tm, u64, YglCache *);
 void YglCacheAdd(YglTextureManager * tm, u64, YglCache *);
 void YglCacheReset(YglTextureManager * tm);
 void YglCacheSetSource(u32 srcaddr, u32 srclen, u32 srcaddr2, u32 srclen2, int unit);
+/* Called from the Color RAM write hook: stamps the touched 128-byte pages. */
+void YglCramMarkWrite(u32 addr, u32 len);
+extern u32 v2_cram_seq;
 void YglTMDirtyRect(YglTextureManager * tm, int y, int h);
 void YglTMRequestFlush(void);
 int  YglTMFlushRequested(void);
