@@ -51,6 +51,36 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include "yabause.h"
 #include <inttypes.h>
 
+#ifdef __LIBRETRO__
+/* SCU DrawEnd delivery, exposed as the yabasanshiro_vdp1_drawend core option.
+
+   0 (vdp1_time, default): raise the report as soon as the VDP1 has had the drawing time it
+   was charged, which is where the hardware raises it and what upstream 1.6.3 does.  A game
+   that paces its next command list and its frame buffer flip on DrawEnd wants this; moving
+   that report to the VBlank IN boundary collides with the higher-level VBlank IN vector, the
+   SH-2 interrupt table then merges the two and the game only gets one every two fields
+   (Batman Forever: 30 Hz logic at 60 fields/s).
+
+   1 (field_boundary): remember the report and raise it from ScuSendVBlankIN() instead.  Some
+   games rebuild the slave CPU with a short critical section (Die Hard Trilogy publishes the
+   handshake flags at 0x0027C6F0..F4 and then restarts the slave through SMPC), and their
+   DrawEnd handler takes part in that handshake: an event that lands inside the window leaves
+   the master waiting for a doorbell edge the slave never sends and the game hangs with a
+   black screen.  Measured on the device: that handshake marker is set when the report is
+   raised on 312 of 345 deliveries at the VDP1 time and on 2 of 346 at the boundary, so the
+   boundary is the mode such a game needs.  It is opt-in because it is not what the hardware
+   does and it costs frame pacing to the games described above. */
+static int ScuDrawEndPending = 0;
+static int ScuDrawEndBoundary = 0;
+
+void ScuSetDrawEndBoundary(int on)
+{
+   ScuDrawEndBoundary = on ? 1 : 0;
+   if (!ScuDrawEndBoundary)
+      ScuDrawEndPending = 0;
+}
+#endif
+
 #ifdef OPTIMIZED_DMA
 # include "cs2.h"
 # include "scsp.h"
@@ -3533,17 +3563,6 @@ const char * ScuGetVectorString(u32 vec) {
 /* Pending timer interrupts are dropped at the next VBlank/HBlank edge, as in
    upstream. Needed by Leynos 2. */
 
-/* SCU DrawEnd is an asynchronous hardware event: the VDP raises it when its drawing is done.
-   Yabause raised it from Vdp1NoDraw() and from the VDP2 wait-line path, i.e. at whatever
-   instruction boundary the emulation thread happened to be at.  Some games rebuild the slave
-   CPU with a short critical section (Die Hard Trilogy's InitSlaveCPU publishes the handshake
-   flags, then restarts the slave through SMPC); an interrupt landing between those two steps
-   leaves the master waiting for an acknowledgement the slave never sends, and the game hangs
-   with a black screen.  Defer the delivery to the VBlank IN boundary, which is where the
-   hardware's frame pacing puts it anyway, and do it here so every VDP core (the shared one and
-   the libretro engine) behaves the same without duplicating the rule. */
-static int ScuDrawEndPending = 0;
-
 static INLINE void ScuSendDrawEndNow(void) {
    SendInterrupt(0x4D, 0x2, 0x2000, 0x00002000);
    ScuChekIntrruptDMA(6);
@@ -3552,10 +3571,12 @@ static INLINE void ScuSendDrawEndNow(void) {
 void ScuSendVBlankIN(void) {
    //ScuRemoveHBlankIN();
    ScuRemoveTimer0();
+#ifdef __LIBRETRO__
    if (ScuDrawEndPending) {
       ScuDrawEndPending = 0;
       ScuSendDrawEndNow();
    }
+#endif
    SendInterrupt(0x40, 0xF, 0x0001, 0x0001);
    ScuChekIntrruptDMA(0);
 }
@@ -3713,8 +3734,17 @@ void ScuSendDMAIllegal(void) {
 //////////////////////////////////////////////////////////////////////////////
 
 void ScuSendDrawEnd(void) {
-   /* Delivered at the VBlank IN boundary, see ScuSendVBlankIN(). */
-   ScuDrawEndPending = 1;
+#ifdef __LIBRETRO__
+   /* Delivery mode chosen by the yabasanshiro_vdp1_drawend core option, see the top of this
+      file.  Deferred: remembered here and reported by ScuSendVBlankIN(); immediate: the
+      modelled drawing time has elapsed, which is where the hardware raises it. */
+   if (ScuDrawEndBoundary) {
+      ScuDrawEndPending = 1;
+      return;
+   }
+#endif
+   /* Upstream behaviour (1.6.3): report it as soon as the VDP1 raises it. */
+   ScuSendDrawEndNow();
 }
 
 //////////////////////////////////////////////////////////////////////////////

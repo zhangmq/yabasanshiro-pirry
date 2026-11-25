@@ -203,6 +203,24 @@ static struct retro_core_option_v2_definition option_defs_us[] = {
       "realtime"
    },
    {
+      "yabasanshiro_vdp1_drawend",
+      "VDP1 Draw End",
+      NULL,
+      "When the SCU reports the VDP1 draw end. vdp1_time: as soon as the VDP1 has had its drawing "
+      "time, which is where the hardware raises it and what the emulator has always done. "
+      "field_boundary: hold the report for the VBlank IN boundary, needed by games whose DrawEnd "
+      "handler takes part in a master/slave handshake (Die Hard Trilogy); it costs frame pacing to "
+      "games that pace themselves on DrawEnd.",
+      NULL,
+      "system",
+      {
+         { "vdp1_time",      "VDP1 time" },
+         { "field_boundary", "Field boundary" },
+         { NULL, NULL },
+      },
+      "vdp1_time"
+   },
+   {
       "yabasanshiro_sh2coretype",
       "SH2 Core (restart)",
       NULL,

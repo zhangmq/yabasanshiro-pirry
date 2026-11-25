@@ -324,6 +324,11 @@ extern "C" {
   void ScuSendLevel0DMAEnd(void);
   void ScuSendDMAIllegal(void);
   void ScuSendDrawEnd(void);
+#ifdef __LIBRETRO__
+/* 1 = report the VDP1 draw end at the VBlank IN boundary, 0 = at the VDP1 time.
+   libretro only: the standalone keeps the upstream delivery. */
+void ScuSetDrawEndBoundary(int on);
+#endif
   void ScuSendExternalInterrupt00(void);
   void ScuSendExternalInterrupt01(void);
   void ScuSendExternalInterrupt02(void);
