@@ -120,6 +120,7 @@ static void disk_register_interface(void);
 
 /* engine-side caller mode: retro_run drains the VDP event queue (A+token) */
 extern void Vdp2SetFrontendConsumer(int on);
+extern void ScuSetDrawEndBoundary(int on);   /* scu.h: VDP1 draw-end delivery mode */
 extern void Vdp2SetRenderThreadHere(void);
 extern void Vdp2SetEventPostedHook(void (*fn)(void));
 extern int  Vdp2ConsumeFrontendEvent(void);
@@ -877,6 +878,13 @@ static void yab_options_read(void)
    opt_rbg_use_compute_shader = !opt_is("yabasanshiro_rbg_use_compute_shader", "disabled");
    opt_texcache_persist       = !opt_is("yabasanshiro_texcache_persist", "disabled");   /* default on */
    opt_interlace_half         =  opt_is("yabasanshiro_interlace_half", "enabled");
+   {
+      /* Off by default (the report follows the VDP1, as upstream does); only a game that needs
+         the report at the VBlank IN boundary asks for it, per game. */
+      const int boundary = opt_is("yabasanshiro_vdp1_drawend", "field_boundary");
+      ScuSetDrawEndBoundary(boundary);
+      LOG_INFO("option: vdp1 draw end = %s", boundary ? "field_boundary" : "vdp1_time");
+   }
    /* opt_is() cannot tell "the front end has no such option" from "the value is
       something else".  For these two the table default is NOT the else branch,
       so a missing answer must keep the declared default instead of flipping the
