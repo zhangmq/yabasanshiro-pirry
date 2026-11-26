@@ -56,56 +56,9 @@ static __thread u32 s_src_addr = 0, s_src_len = 0, s_src_addr2 = 0, s_src_len2 =
 static __thread u32 s_src_gen = 0;
 static __thread int s_src_unit = YGL_TEXSRC_NONE;
 
-/* Color RAM invalidation: the palette color modes bake the CRAM alpha of every
-   texel at decode time (Vdp2GetAlpha in vidogl.c), while the color itself is
-   resolved by the shader from the live CRAM.  A tile decoded before its palette
-   was written therefore keeps a stale (often fully transparent) alpha.  Track
-   which 128-byte CRAM pages changed; a cache entry remembers the palette byte
-   range it baked in and the generation at decode time. */
-#define V2CRAM_PAGES 32            /* 4 KB / 128 B */
-#define V2CRAM_PAGE_BYTES 128
-u32 v2_cram_seq = 0;
-static u32 v2_cram_page_seq[V2CRAM_PAGES];
-static __thread u32 s_pal_a0 = 0, s_pal_a1 = 0xFFF;
-
-void YglCramMarkWrite(u32 addr, u32 len)
-{
-  u32 seq = __atomic_add_fetch(&v2_cram_seq, 1, __ATOMIC_RELEASE);
-  u32 a0 = addr & 0xFFF;
-  u32 a1 = (addr + (len ? len : 1) - 1) & 0xFFF;
-  u32 p;
-  if (a1 < a0) { a0 = 0; a1 = 0xFFF; }
-  for (p = a0 >> 7; p <= (a1 >> 7) && p < V2CRAM_PAGES; p++)
-    __atomic_store_n(&v2_cram_page_seq[p], seq, __ATOMIC_RELEASE);
-}
-
-
-/* 1 = no page in [a0,a1] was written after the entry was decoded. */
-static int YglCramClean(u32 a0, u32 a1, u32 gen)
-{
-  u32 p0, p1, p;
-  if (a1 < a0) return 1;                     /* no palette dependency */
-  p0 = (a0 & 0xFFF) >> 7;
-  p1 = (a1 & 0xFFF) >> 7;
-  if (p1 >= V2CRAM_PAGES) p1 = V2CRAM_PAGES - 1;
-  for (p = p0; p <= p1; p++)
-    if ((s32)(__atomic_load_n(&v2_cram_page_seq[p], __ATOMIC_ACQUIRE) - gen) > 0) return 0;
-  return 1;
-}
-
-
 
 
 void YglCacheSetSource(u32 srcaddr, u32 srclen, u32 srcaddr2, u32 srclen2, int unit) {
-  /* Palette dependency by source unit:
-     - VDP2: a tile's baked alpha comes from the CRAM entry, and some layers are
-       drawn through paths that cannot name their palette range, so every CRAM
-       write must invalidate VDP2 entries (conservative but correct).
-     - VDP1 sprites store palette indices and flags; their colours are resolved
-       by the shader from the live CRAM, so they never need a re-decode on a
-       palette write.  The same holds for the reusable SLOT textures. */
-  if (unit == YGL_TEXSRC_VDP2) { s_pal_a0 = 0; s_pal_a1 = 0xFFF; }
-  else { s_pal_a0 = 1; s_pal_a1 = 0; }
   s_src_addr = srcaddr; s_src_len = srclen;
   s_src_addr2 = srcaddr2; s_src_len2 = srclen2;
   s_src_unit = unit;
@@ -137,9 +90,6 @@ static void YglCacheStamp(YglCacheHash * e) {
   e->srcaddr2 = s_src_addr2; e->srclen2 = s_src_len2;
   e->gen = s_src_gen;
   e->unit = (u8)s_src_unit;
-  e->pal_a0 = (u16)s_pal_a0;
-  e->pal_a1 = (u16)s_pal_a1;
-  e->cram_gen = __atomic_load_n(&v2_cram_seq, __ATOMIC_ACQUIRE);
 }
 
 
@@ -206,7 +156,6 @@ static int YglIsCached_in(YglTextureManager * tm, u64 addr, YglCache * c) {
                     !YglRangeClean(at->unit, at->srcaddr2, at->srclen2, at->gen))) {
             return 0;
           }
-          if (!YglCramClean(at->pal_a0, at->pal_a1, at->cram_gen)) return 0;
           /* Priority/color calculation index are baked into the texels and
              depend on SPCTL/CCCTL. */
           if (g_decodegen_on && at->unit == YGL_TEXSRC_VDP1 &&

@@ -5474,14 +5474,6 @@ void VIDOGLOnUpdateColorRamWord(u32 addr)
   if (_Ygl == NULL)
     return;
 
-  /* A palette write can invalidate cached tiles: for the palette color modes
-     the decoded texel carries an alpha baked from the CRAM entry, so a tile
-     cached before its palette was loaded keeps the old (often fully
-     transparent) alpha forever.  Stamp the touched 128-byte CRAM pages; cache
-     entries remember the palette range they baked in and fail the lookup only
-     when one of those pages changed (yglcache.c). */
-  if (g_texcache_persist) YglCramMarkWrite(addr, 2);
-
   YabThreadLock(_Ygl->crammutex);
   Vdp2ColorRamUpdated = 1;
 
