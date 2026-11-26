@@ -5361,9 +5361,18 @@ void YglRenderDestinationAlpha(void)
         }
         break;
       case 3:
-        // ToDO: MSB color cacuration
+        /* SPCCCS == 3: the sprite ratio is selected per pixel by the MSB of the sprite colour
+           data, so a sprite that is not meant to be blended has to stay opaque. The
+           framebuffer composite has no MSB plane, but the sprite colour calculation ratio
+           index survives in the texel (bits 3-5 of the stored alpha), and a sprite whose
+           ratio register reads "top image : second image = 31 : 1" is a pixel that is drawn
+           as-is. Weighting the sprite with the destination alpha instead (blendfunc_src, as
+           the other three cases do) makes it disappear behind any VDP2 layer that stores
+           "1 : 31" in its alpha: the fighters in Dragon Ball Z - Shinbutouden vanished behind
+           the road overlay layer, which writes 0xFF - 31 * 8 = 7 there. Blending with the
+           sprite's own ratio keeps semitransparent sprites working and lets opaque ones win. */
         glEnable(GL_BLEND);
-        glBlendFuncSeparate(blendfunc_src, blendfunc_dst, GL_ONE, GL_ZERO);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ZERO);
         break;
       }
     }
