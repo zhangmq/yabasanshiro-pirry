@@ -2795,10 +2795,20 @@ static void Vdp2DrawPatternPos(vdp2draw_struct *info, YglTexture *texture, int x
 {
   /* tile lies entirely left of the boundary N: wrapped column, discard */
   if (g_es_active && x + info->patternpixelwh <= g_es_active) return;
-  /* Tile cache key: priority, alpha, palette address, character address, transparency, pattern size and color offset. */
+  /* Tile cache key: everything the decode below bakes into the texels.  The bit depth
+     (colornumber) has to be part of it: the same character address decodes to a different
+     tile in 4, 8 and 16 bit mode, so a tile decoded in one mode must never be reused in
+     another one (Golden Axe: The Duel showed the previous mode's tiles as screen filling
+     noise).  Linescreen and the special colour mode change the texels as well, and the
+     colour offset is a palette index offset in its full width, not only in its upper
+     three bits.  Only the bits above 39 are free for the extra fields. */
   u64 cacheaddr = (((u64)(info->priority&0xF))<<35) | ((u32)(info->alpha >> 3) << 27) |
     (info->paladdr << 20) | info->charaddr | info->transparencyenable |
-    ((info->patternpixelwh >> 4) << 1) | (((u64)(info->coloroffset >> 8) & 0x07) << 32);
+    ((info->patternpixelwh >> 4) << 1) |
+    ((u64)(info->colornumber & 0x07) << 40) |
+    ((u64)(info->linescreen & 0x03) << 43) |
+    ((u64)(info->specialcolormode & 0x03) << 45) |
+    ((u64)(info->coloroffset & 0x7FF) << 47);
 
   YglCache c = {0};   /* no_alpha0 has to be initialised in the cache entry */
   vdp2draw_struct tile;
