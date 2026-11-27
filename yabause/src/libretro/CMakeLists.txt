@@ -148,6 +148,7 @@ add_library(yabasanshiro_libretro SHARED
    sndlibretro.c
    log.c
    port_stubs.c
+   ygl_glproc.c
    ${ENGINE_SOURCES}
 )
 
@@ -184,8 +185,6 @@ add_dependencies(yabasanshiro_libretro zlib_ep)
 
 target_link_libraries(yabasanshiro_libretro PRIVATE
    chdr-static flac-static lzma-static crypto-static ${ZLIB_INSTALL}/lib/libz.a
-   ${H700_DEPS}/lib/libEGL.so.1
-   ${H700_DEPS}/lib/libmali.so.0
    pthread dl m)
 
 set_target_properties(yabasanshiro_libretro PROPERTIES PREFIX "" OUTPUT_NAME "yabasanshiro_libretro")

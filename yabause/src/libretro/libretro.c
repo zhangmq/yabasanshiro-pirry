@@ -1135,6 +1135,15 @@ static void yab_osd(int level, unsigned priority, unsigned duration_ms,
 
 void LibretroEngineContextReset(void)
 {
+   /* The front end's context is current here, and its callback is the only
+      thing that knows where this context's entry points live: fill the table
+      before the first GL call, which is log_gl_state() right below.  Nothing
+      here links a GL library, so an unresolved name is a log line and a failed
+      draw instead of a load-time "undefined symbol" for the whole core. */
+   int gl_missing = YglGlProcResolve(hw.get_proc_address);
+   if (gl_missing != 0)
+      LOG_WARN("engine: %d GL entry point(s) unresolved, drawing will fail",
+               gl_missing);
    if (engine_up) return;
    LOG_INFO("engine: YabauseInit (frontend consumer)");
    log_gl_state("before-init");
