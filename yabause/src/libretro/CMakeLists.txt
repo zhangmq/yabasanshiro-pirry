@@ -66,6 +66,26 @@ ExternalProject_Add(zlib_ep
              ${YAB_EP_TOOLCHAIN}
   BUILD_BYPRODUCTS ${ZLIB_INSTALL}/lib/libz.a)
 
+# The SH-2 dynarec needs one host helper library per architecture.  The define
+# below is the switch the backend headers see: AARCH64 picks the AArch64
+# numbers, DYN_BACKEND_X64 the x86-64 ones.  DYN_BACKEND_X64 is deliberately
+# not the compiler's __x86_64__: a front end that compiles the dynarec but does
+# not link dynalib_x64.S must fail in backend/dyn_backend.h, not link a JIT
+# that is built from another host's byte counts.
+#   aarch64 -> dynalib_arm64.s  (hand-written AArch64 snippets; production)
+#   x86-64  -> dynalib_x64.S    (structural helpers + generated snippets;
+#                                host testing only, see dyn_backend_x64.h)
+if("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(aarch64|arm64)")
+   set(YAB_DYN_BACKEND_DEFS AARCH64)
+   set(YAB_DYN_HELPER_ASM ${ENGINE_DIR}/sh2_dynarec_devmiyax/dynalib_arm64.s)
+elseif("${CMAKE_SYSTEM_PROCESSOR}" MATCHES "^(x86_64|amd64|AMD64|x64)")
+   set(YAB_DYN_BACKEND_DEFS DYN_BACKEND_X64)
+   set(YAB_DYN_HELPER_ASM ${ENGINE_DIR}/sh2_dynarec_devmiyax/dynalib_x64.S)
+else()
+   message(FATAL_ERROR
+      "no SH-2 dynarec helper library for ${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+
 set(ENGINE_SOURCES
    ${ENGINE_DIR}/BackupManager.cpp
    ${ENGINE_DIR}/Counter.cpp
@@ -103,7 +123,7 @@ set(ENGINE_SOURCES
    ${ENGINE_DIR}/scu.c
    ${ENGINE_DIR}/sh2_dynarec_devmiyax/DynarecSh2.cpp
    ${ENGINE_DIR}/sh2_dynarec_devmiyax/DynarecSh2CInterface.cpp
-   ${ENGINE_DIR}/sh2_dynarec_devmiyax/dynalib_arm64.s
+   ${YAB_DYN_HELPER_ASM}
    ${ENGINE_DIR}/sh2cache.c
    ${ENGINE_DIR}/sh2core.c
    ${ENGINE_DIR}/sh2d.c
@@ -167,7 +187,7 @@ target_include_directories(yabasanshiro_libretro PRIVATE
 )
 
 target_compile_definitions(yabasanshiro_libretro PRIVATE
-   AARCH64 ARCH_IS_LINUX=1 DYNAREC_DEVMIYAX=1 GCC_VERSION=12
+   ${YAB_DYN_BACKEND_DEFS} ARCH_IS_LINUX=1 DYNAREC_DEVMIYAX=1 GCC_VERSION=12
    HAVE_BUILTIN_BSWAP16=1 HAVE_BUILTIN_BSWAP32=1 HAVE_C99_VARIADIC_MACROS=1
    HAVE_FLOORF=1 HAVE_GETTIMEOFDAY=1 HAVE_LIBGL=1 HAVE_MUSASHI=1
    HAVE_STDINT_H=1 HAVE_STRCASECMP=1 HAVE_SYS_TIME_H=1 IMPROVED_SAVESTATES

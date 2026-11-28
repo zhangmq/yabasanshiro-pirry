@@ -40,6 +40,7 @@ extern "C" {
 
 #include "DynarecSh2.h"
 #include "opcodes.h"
+#include "backend/dyn_backend.h"   /* host sizes, jump snippets, cacheflush */
 #if defined(WEBINTERFACE)
 #define DEBUG_CPU
 #endif
@@ -566,60 +567,8 @@ int DynarecSh2GetDisasmebleString(string & out, u32 from, u32 to);
    call, so that a later wild jump in BiosHandleFunc() can identify the game
    block it came from. Diagnostic build only. */
 
-#if !defined(_WINDOWS)
-#if defined(__arm__)
-void cacheflush(uintptr_t begin, uintptr_t end, int flag )
-{ 
-    const int syscall = 0xf0002;
-      __asm __volatile (
-     "mov   r0, %0\n"      
-     "mov   r1, %1\n"
-     "mov   r7, %2\n"
-     "mov     r2, #0x0\n"
-     "svc     0x00000000\n"
-     :
-     : "r" (begin), "r" (end), "r" (syscall)
-     : "r0", "r1", "r7"
-    );
-}
-#elif defined(__aarch64__)
-void cacheflush(uintptr_t begin, uintptr_t end, int flag )
-{
-    // Don't rely on GCC's __clear_cache implementation, as it caches
-    // icache/dcache cache line sizes, that can vary between cores on
-    // big.LITTLE architectures.
-    uint64_t addr, ctr_el0;
-    static size_t icache_line_size = 0xffff, dcache_line_size = 0xffff;
-    size_t isize, dsize;
-
-    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr_el0));
-    isize = 4 << ((ctr_el0 >> 0) & 0xf);
-    dsize = 4 << ((ctr_el0 >> 16) & 0xf);
-
-    // use the global minimum cache line size
-    icache_line_size = isize = icache_line_size < isize ? icache_line_size : isize;
-    dcache_line_size = dsize = dcache_line_size < dsize ? dcache_line_size : dsize;
-
-    addr = (uint64_t)begin & ~(uint64_t)(dsize - 1);
-    for (; addr < (uint64_t)end; addr += dsize)
-        // use "civac" instead of "cvau", as this is the suggested workaround for
-        // Cortex-A53 errata 819472, 826319, 827319 and 824069.
-            __asm__ volatile("dc civac, %0" : : "r"(addr) : "memory");
-    __asm__ volatile("dsb ish" : : : "memory");
-
-    addr = (uint64_t)begin & ~(uint64_t)(isize - 1);
-    for (; addr < (uint64_t)end; addr += isize)
-            __asm__ volatile("ic ivau, %0" : : "r"(addr) : "memory");
-
-    __asm__ volatile("dsb ish" : : : "memory");
-    __asm__ volatile("isb" : : : "memory");
-}
-#else
-void cacheflush(uintptr_t begin, uintptr_t end, int flag ){
-  __builtin___clear_cache((void*)begin,(void*)end);
-}
-#endif
-#endif
+/* cacheflush() comes from backend/dyn_cacheflush.h (included through
+   backend/dyn_backend.h): on AArch64 it walks the caches by hand. */
 
 i_desc opcode_list[] =
 {
@@ -861,48 +810,9 @@ void DumpInstX( int i, u32 pc, u16 op  )
 
 #define opNULL			x86op_desc(0,0,0,0,0,0,0,0,0,0)
 
-#if defined(_WINDOWS)
-#define PROLOGSIZE		     27    
-#define EPILOGSIZE		      3
-#define SEPERATORSIZE	     10
-#define SEPERATORSIZE_NORMAL 7
-#define SEPERATORSIZE_DEBUG  24
-#define SEPERATORSIZE_DELAY  7
-#define SEPERATORSIZE_DELAY_SLOT  27
-#define SEPERATORSIZE_DELAY_AFTER  10 
-#define SEPERATORSIZE_DELAYD_DEBUG 34
-#define DELAYJUMPSIZE	     17
-#define DALAY_CLOCK_OFFSET 6
-#define DALAY_CLOCK_OFFSET_DEBUG 6
-#define NORMAL_CLOCK_OFFSET 6
-#define NORMAL_CLOCK_OFFSET_DEBUG 3
-#elif defined(AARCH64)
-#define PROLOGSIZE		     (11*4)    
-#define SEPERATORSIZE_NORMAL (2*4)
-#define NORMAL_CLOCK_OFFSET 4
-#define NORMAL_CLOCK_OFFSET_DEBUG 4
-#define SEPERATORSIZE_DEBUG  (18*4)
-#define SEPERATORSIZE_DELAY_SLOT  (15*4)
-#define SEPERATORSIZE_DELAY_AFTER  (12*4)
-#define DALAY_CLOCK_OFFSET (2*4)
-#define DALAY_CLOCK_OFFSET_DEBUG (10*4)
-#define SEPERATORSIZE_DELAYD_DEBUG (20*4)
-#define EPILOGSIZE		      (10*4)
-#define DELAYJUMPSIZE	     (11*4)
-#else // ARMv7
-#define PROLOGSIZE		     16    
-#define SEPERATORSIZE_NORMAL 8
-#define NORMAL_CLOCK_OFFSET 4
-#define NORMAL_CLOCK_OFFSET_DEBUG 4
-#define SEPERATORSIZE_DEBUG  36
-#define SEPERATORSIZE_DELAY_SLOT  36
-#define SEPERATORSIZE_DELAY_AFTER  20
-#define DALAY_CLOCK_OFFSET 8
-#define DALAY_CLOCK_OFFSET_DEBUG 8
-#define SEPERATORSIZE_DELAYD_DEBUG 60
-#define EPILOGSIZE		      12
-#define DELAYJUMPSIZE	     32
-#endif
+/* Host-specific sizes (PROLOGSIZE, EPILOGSIZE, the separator sizes and the
+   clock offsets) come from backend/dyn_backend.h, which is included at the top
+   of this file. */
 
 
 #define MININSTRSIZE    3
@@ -1084,17 +994,14 @@ void PageFlip(void); // "flips" the page
 /* Block chaining: the block exits (epilogue_k/PageFlip_k) and the delayed
    branch exits (seperator_delay_slot_k/_after_k) go through chain_stub. */
 
-#if defined(AARCH64)
-void internal_jmp(void);
-void internal_delay_jmp(void);
-#else
-void internal_jmp(void){ printf("nope"); }
-void internal_delay_jmp(void){ printf("nope"); }
-#endif
-int internal_jmp_size = 18*4;
-int internal_delay_jmp_size = 15*4;
-const intptr_t internal_jmp_to_offset = 4*4;
-const intptr_t internal_delay_jmp_to_offset = 4*4;
+/* The block-exit jump snippets: the backend declares them (they are part of its
+   helper library) and gives their sizes and the offset of the destination field
+   inside them.  The emitter copies a snippet into the block and patches the
+   destination there. */
+int internal_jmp_size = DYN_INTERNAL_JMP_SIZE;
+int internal_delay_jmp_size = DYN_INTERNAL_DELAY_JMP_SIZE;
+const intptr_t internal_jmp_to_offset = DYN_INTERNAL_JMP_TO_OFFSET;
+const intptr_t internal_delay_jmp_to_offset = DYN_INTERNAL_DELAY_JMP_TO_OFFSET;
  
 extern x86op_desc asm_list[];
 
@@ -1436,6 +1343,25 @@ void CompileBlocks::opcodePass(x86op_desc *op, u16 opcode, u8 *ptr)
     *(u32*)(ptr + *(op->off3)) |= ((u32)opcode & 0xfff) << 5;
   }
 
+#elif defined(DYN_BACKEND_X64)
+  /* The snippets load their operand registers through [r15+reg*4] with the
+     register number as a SIB index, so the patch is the plain register number
+     written over the imm32 of the `mov` that fills the index register. */
+  if (*(op->src) != 0xFF)
+    *(u32*)(ptr + *(op->src)) = ((u32)(opcode >> 4) & 0xf);
+
+  if (*(op->dest) != 0xFF)
+    *(u32*)(ptr + *(op->dest)) = ((u32)(opcode >> 8) & 0xf);
+
+  if (*(op->off1) != 0xFF)
+    *(u32*)(ptr + *(op->off1)) = ((u32)opcode & 0xf);
+
+  if (*(op->imm) != 0xFF)
+    *(u32*)(ptr + *(op->imm)) = ((u32)opcode & 0xff);
+
+  if (*(op->off3) != 0xFF)
+    *(u32*)(ptr + *(op->off3)) = ((u32)opcode & 0xfff);
+
 #else
 
   if (*(op->src) != 0xFF) // C
@@ -1602,7 +1528,7 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
 
     // CheckSize
     u8 delay = asm_list[i].delay;
-#if defined(AARCH64)
+#if defined(AARCH64) || defined(DYN_BACKEND_X64)
     if ( delay == 0 || delay == 0xFF) {
       calsize  = (ptr - startptr) + *asm_list[i].size + nomal_seperator_size + EPILOGSIZE;
     }else if(delay == 1 || delay == 5) {
@@ -1679,7 +1605,10 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
       else if (asm_list[i].delay == 3) {
         jumppc = addr + ((signed char)(op & 0xff) << 1) + 2;
       }
-#if defined(AARCH64)
+      /* A branch whose target has already been emitted in this block jumps
+         straight to that code instead of leaving through the block exit
+         (AArch64 and x86-64; the other hosts still use the exit path). */
+#if defined(AARCH64) || defined(DYN_BACKEND_X64)
       if ( addr_map.count(jumppc) != 0 && write_memory_counter != 0 ) {
         jumpptr = addr_map[jumppc];
         //LOG("jumpptr = %lx\n", jumpptr );
@@ -1699,7 +1628,13 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
       *counterpos |= (asm_list[i].cycle << 10);
 #else
       u8 * counterpos = ptr + *(asm_list[i].size) + nomal_seperator_counter_offset;
+#if defined(DYN_BACKEND_X64)
+      /* same `|=` as the AArch64 patch: the fragment starts at #1, so the
+         effective charge is 1|cycle (bug-for-bug, not cycle) */
+      *counterpos |= asm_list[i].cycle;
+#else
       *counterpos = asm_list[i].cycle;
+#endif
 #endif
 
       ptr += *(asm_list[i].size) + nomal_seperator_size;
@@ -1729,14 +1664,23 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         LOG("nomal jump_offset = %08X- %08X = %08X\n", jumpptr, (intptr_t)(ptr + offset + internal_jmp_to_offset), jump_offset);
         // cbnz w0,#imm(aarch64)
         //*jumppos = 0x35000000 | ((((jump_offset)>>2)&0x7FFFF)<<5);
+#if defined(DYN_BACKEND_X64)
+        /* rel32 of `jmp rel32`: relative to the end of the instruction. */
+        *jumppos = (u32)(jumpptr - (intptr_t)(ptr + offset + internal_jmp_to_offset + 4));
+#else
         *jumppos = 0x14000000 | ((jump_offset>>2)&0x3FFFFFF);
+#endif
 
 #if defined(AARCH64)
         u32 * counterpos = (u32*)(ptr + *(asm_list[i].size) + nomal_seperator_counter_offset);
         *counterpos |= ((asm_list[i].cycle) << 10);
 #else
         u8 * counterpos = ptr + *(asm_list[i].size) + nomal_seperator_counter_offset;
+#if defined(DYN_BACKEND_X64)
+        *counterpos |= asm_list[i].cycle;   /* 1|cycle, like AArch64 */
+#else
         *counterpos = asm_list[i].cycle;
+#endif
 #endif
         ptr += *(asm_list[i].size) + nomal_seperator_size + internal_jmp_size;
         write_memory_counter = 0;
@@ -1751,7 +1695,11 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         *counterpos |= (asm_list[i].cycle << 10);
 #else
         u8 * counterpos = ptr + *(asm_list[i].size) + nomal_seperator_counter_offset;
+#if defined(DYN_BACKEND_X64)
+        *counterpos |= asm_list[i].cycle;   /* 1|cycle, like AArch64 */
+#else
         *counterpos = asm_list[i].cycle;
+#endif
 #endif
         ptr += *(asm_list[i].size) + nomal_seperator_size + DELAYJUMPSIZE;
       }
@@ -1822,7 +1770,12 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
 
         LOG("delay jump_offset = %lX - %lX = %08X\n", jumpptr, (intptr_t)(ptr + offset + internal_jmp_to_offset), jump_offset);
 
+#if defined(DYN_BACKEND_X64)
+        /* rel32 of `jmp rel32`: relative to the end of the instruction. */
+        *jumppos = (u32)(jumpptr - (intptr_t)(ptr + offset + internal_delay_jmp_to_offset + 4));
+#else
         *jumppos = 0x14000000 | ((jump_offset>>2)&0x3FFFFFF);
+#endif
         // cbnz w0,#imm(aarch64)
         //*jumppos = 0x35000000 | (((jump_offset>>2)&0x7FFFF)<<5);
 #if defined(AARCH64)
@@ -1830,7 +1783,13 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         *counterpos |= (asm_list[i].cycle << 10);
 #else
         u8 * counterpos = ptr + *(asm_list[j].size) + delayslot_seperator_counter_offset;
+#if defined(DYN_BACKEND_X64)
+        /* AArch64 patches the branch's own cycle (delay slot excluded) with
+           `|=` over the fragment's #1 */
+        *counterpos |= asm_list[i].cycle;
+#else
         *counterpos = cycle;
+#endif
 #endif
         ptr += *(asm_list[j].size) + internal_delay_jmp_size;
         write_memory_counter = 0;
@@ -1845,7 +1804,11 @@ int CompileBlocks::EmmitCode(Block *page, addrs * ParentT, bool is_slave )
         *counterpos |= (asm_list[i].cycle << 10);
 #else
         u8 * counterpos = ptr + *(asm_list[j].size) + delayslot_seperator_counter_offset;
+#if defined(DYN_BACKEND_X64)
+        *counterpos |= asm_list[i].cycle;
+#else
         *counterpos = cycle;
+#endif
 #endif
         ptr += *(asm_list[j].size) + SEPERATORSIZE_DELAY_AFTER;
       }
