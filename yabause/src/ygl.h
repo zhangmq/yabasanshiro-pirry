@@ -215,6 +215,13 @@ extern PFNGLMEMORYBARRIERPROC glMemoryBarrier;
     #endif
 #endif
 
+#ifdef __LIBRETRO__
+/* The libretro core links no GL library: every entry point is a pointer that
+   the front end's get_proc_address fills.  Include only after the GL headers
+   above, because the names are redefined to those pointers. */
+#include "libretro/ygl_glproc.h"
+#endif
+
 #include <stdarg.h>
 #include <string.h>
 

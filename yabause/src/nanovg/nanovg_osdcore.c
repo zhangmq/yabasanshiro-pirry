@@ -40,6 +40,9 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #if defined(_OGLES3_)
 #include <GLES3/gl3.h>
 #include <GLES3/gl3ext.h>
+#ifdef __LIBRETRO__
+#include "libretro/ygl_glproc.h"   /* entry points are pointers, see the header */
+#endif
 #else
 #include "ygl.h"
 #endif
