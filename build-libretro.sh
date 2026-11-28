@@ -8,8 +8,8 @@
 #   --release         wipe the dependency cache first, so every source is
 #                     fetched online - this is what a release build must prove
 #   --toolchain FILE  CMake toolchain file (default: none, i.e. build with the
-#                     host compiler - only meaningful on an AArch64 Linux host,
-#                     the project hard-codes AARCH64; see yabause/src/libretro)
+#                     host compiler; the dynarec helper library follows
+#                     CMAKE_SYSTEM_PROCESSOR, see yabause/src/libretro)
 #
 # Dependencies are the SAME sources and pins the standalone uses (libchdr
 # 074ff16, zlib 5089329 = 1.2.8), see yabause/src/libretro/CMakeLists.txt.

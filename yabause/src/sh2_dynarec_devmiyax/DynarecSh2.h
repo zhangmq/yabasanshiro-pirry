@@ -21,6 +21,8 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #ifndef _DYNAREC_SH2_H_
 #define _DYNAREC_SH2_H_
 
+#include <stddef.h>   /* offsetof: the layout asserts below are self-contained */
+
 #include <list>
 #include <vector>
 #include <map>
