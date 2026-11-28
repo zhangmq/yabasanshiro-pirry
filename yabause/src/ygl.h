@@ -274,6 +274,7 @@ typedef struct _YglCacheHash {
 	u32 srcaddr2;
 	u32 srclen2;
 	u32 gen;
+	u8  bankmask;  /* character-bank mask when the texels were decoded (VDP2 only) */
 	/* The atlas texels have priority (bits 24-26), color calculation index
 	   (bits 27-29) and the shadow flag (bit 23) baked in via VDP1COLOR(). These
 	   come from the VDP2 registers SPCTL and CCCTL (vidogl.c: Vdp1ReadPriority,
@@ -334,6 +335,8 @@ int YglIsCached(YglTextureManager * tm, u64, YglCache *);
 void YglCacheAdd(YglTextureManager * tm, u64, YglCache *);
 void YglCacheReset(YglTextureManager * tm);
 void YglCacheSetSource(u32 srcaddr, u32 srclen, u32 srcaddr2, u32 srclen2, int unit);
+extern u32 g_vdp2_char_bank_mask;
+void YglCacheSetCharBankMask(u32 mask);
 void YglTMDirtyRect(YglTextureManager * tm, int y, int h);
 void YglTMRequestFlush(void);
 int  YglTMFlushRequested(void);

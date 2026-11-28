@@ -2888,6 +2888,11 @@ tl_tile_done_:
     case 3:  tsrclen = twh * twh * 2;    break;
     default: tsrclen = twh * twh * 4;    break;
     }
+    /* The decode bakes in whether the character bank is valid for this layer
+       (Vdp2DrawCell / BankInvalid); that changes without a VRAM write, so the
+       cache entry has to remember the mask it was decoded with. */
+    YglCacheSetCharBankMask((u32)(info->char_bank[0] | (info->char_bank[1] << 1) |
+                                  (info->char_bank[2] << 2) | (info->char_bank[3] << 3)));
     YglCacheSetSource(info->charaddr, tsrclen, 0, 0, YGL_TEXSRC_VDP2);
   }
 

@@ -47,6 +47,16 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301  USA
 #include <stdlib.h>
 
 int g_texcache_persist = 0;
+/* Character-bank validity of the layer currently being drawn.  Vdp2DrawCell
+   fills a tile with transparent texels when the bank that holds its character
+   address is not marked as character data for that layer (BankInvalid).  That
+   validity is an input of the decode like the VRAM content, but changing it
+   writes no VRAM, so the page stamps cannot see it; entries record the mask
+   they were decoded with and a hit requires it to match.  It is per layer:
+   each background reads a different access cycle (0x04/0x05/0x06/0x07). */
+u32 g_vdp2_char_bank_mask = 0;
+
+void YglCacheSetCharBankMask(u32 mask) { g_vdp2_char_bank_mask = mask; }
 /* Bumped whenever SPCTL or CCCTL change (see ygl.h); cached VDP1 textures
    from an older generation are not reused. */
 u32 g_vdp1_decode_gen = 1;
@@ -54,6 +64,7 @@ int g_decodegen_on = 1;
 
 static __thread u32 s_src_addr = 0, s_src_len = 0, s_src_addr2 = 0, s_src_len2 = 0;
 static __thread u32 s_src_gen = 0;
+static __thread u32 s_src_bankmask = 0;
 static __thread int s_src_unit = YGL_TEXSRC_NONE;
 
 
@@ -65,6 +76,7 @@ void YglCacheSetSource(u32 srcaddr, u32 srclen, u32 srcaddr2, u32 srclen2, int u
   if (unit == YGL_TEXSRC_VDP1) s_src_gen = v1_wseq;
   else if (unit == YGL_TEXSRC_VDP2) s_src_gen = v2_wseq;
   else s_src_gen = 0;
+  s_src_bankmask = (unit == YGL_TEXSRC_VDP2) ? g_vdp2_char_bank_mask : 0;
 }
 
 static int YglRangeClean(int unit, u32 srcaddr, u32 srclen, u32 gen) {
@@ -89,6 +101,7 @@ static void YglCacheStamp(YglCacheHash * e) {
   e->srcaddr = s_src_addr; e->srclen = s_src_len;
   e->srcaddr2 = s_src_addr2; e->srclen2 = s_src_len2;
   e->gen = s_src_gen;
+  e->bankmask = (u8)s_src_bankmask;
   e->unit = (u8)s_src_unit;
 }
 
@@ -154,6 +167,13 @@ static int YglIsCached_in(YglTextureManager * tm, u64 addr, YglCache * c) {
           else if (!YglRangeClean(at->unit, at->srcaddr, at->srclen, at->gen) ||
                    (at->srclen2 != 0 &&
                     !YglRangeClean(at->unit, at->srcaddr2, at->srclen2, at->gen))) {
+            return 0;
+          }
+          /* A tile decoded while its character bank was not marked as character
+             data is all transparent; the access pattern writes no VRAM, so only
+             this mask compare can tell that it has become valid (Groove on
+             Fight: the portrait row of the select screen). */
+          if (at->unit == YGL_TEXSRC_VDP2 && at->bankmask != (u8)g_vdp2_char_bank_mask) {
             return 0;
           }
           /* Priority/color calculation index are baked into the texels and
