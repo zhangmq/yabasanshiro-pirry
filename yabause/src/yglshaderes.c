@@ -263,6 +263,23 @@ int Ygl_cleanupVdp1CommonParam(void * p){
  * ----------------------------------------------------------------------------------*/
 YglFbFetchMode g_yglFbFetchMode = YGL_FBFETCH_OFF;
 
+/* Exact token match in the GL_EXTENSIONS string.  A plain strstr() is wrong:
+   drivers also advertise GL_ARM_shader_framebuffer_fetch_depth_stencil and
+   GL_EXT_shader_framebuffer_fetch_non_coherent, and those prefix matches made
+   the core pick a shader variant whose extension the compiler then rejects. */
+static int Ygl_HasExtension(const char *ext, const char *name)
+{
+  size_t n;
+  if (ext == NULL || name == NULL) return 0;
+  n = strlen(name);
+  for (;;) {
+    ext = strstr(ext, name);
+    if (ext == NULL) return 0;
+    if (ext[n] == '\0' || ext[n] == ' ' || ext[n] == '\t' || ext[n] == '\n') return 1;
+    ext += n;
+  }
+}
+
 void Ygl_DetectFbFetch(void)
 {
   g_yglFbFetchMode = YGL_FBFETCH_OFF;
@@ -275,12 +292,11 @@ void Ygl_DetectFbFetch(void)
     /* Use ARM fetch when the GPU reports GL_ARM_shader_framebuffer_fetch,
            otherwise the u_fbo path is used. Saves a glMemoryBarrier + glFlush per
            half-transparent/shadow batch (Ygl_uniformVdp1CommonParam). */
-    const GLubyte *ext = glGetString(GL_EXTENSIONS);
-    const int fb_arm = (ext && strstr((const char*)ext, "GL_ARM_shader_framebuffer_fetch")) ? 1 : 0;
-    const int fb_ext = (ext && strstr((const char*)ext, "GL_EXT_shader_framebuffer_fetch")) ? 1 : 0;
-    const int v = fb_arm ? 1 : 0;   /* ARM fetch whenever the GPU reports it */
-    if (v == 1 && fb_arm) g_yglFbFetchMode = YGL_FBFETCH_ARM;
-    else if (v == 2 && fb_ext) g_yglFbFetchMode = YGL_FBFETCH_EXT;
+    const char *ext = (const char *)glGetString(GL_EXTENSIONS);
+    if (Ygl_HasExtension(ext, "GL_ARM_shader_framebuffer_fetch"))
+      g_yglFbFetchMode = YGL_FBFETCH_ARM;
+    else if (Ygl_HasExtension(ext, "GL_EXT_shader_framebuffer_fetch"))
+      g_yglFbFetchMode = YGL_FBFETCH_EXT;
   }
 }
 
